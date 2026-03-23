@@ -24,9 +24,6 @@
           <Directory Id="INSTALLFOLDER" Name="Dataplicity CLI" />
         </Directory>
       </Directory>
-      <Directory Id="ProgramMenuFolder">
-        <Directory Id="ApplicationProgramsFolder" Name="Dataplicity CLI" />
-      </Directory>
     </Directory>
 
     <DirectoryRef Id="INSTALLFOLDER">
@@ -43,22 +40,8 @@
       </Component>
     </DirectoryRef>
 
-    <DirectoryRef Id="ApplicationProgramsFolder">
-      <Component Id="StartMenuShortcut" Guid="0A5C2B1F-17A6-4F6D-8E58-7A8A06A0E3E6">
-        <Shortcut
-          Id="StartMenuShortcutId"
-          Name="Dataplicity CLI"
-          Description="Dataplicity CLI"
-          Target="[INSTALLFOLDER]dataplicity.exe"
-          WorkingDirectory="INSTALLFOLDER" />
-        <RemoveFolder Id="RemoveApplicationProgramsFolder" On="uninstall" />
-        <RegistryValue Root="HKLM" Key="Software\Dataplicity\DataplicityCLI" Name="installed" Type="integer" Value="1" KeyPath="yes" />
-      </Component>
-    </DirectoryRef>
-
     <Feature Id="ProductFeature" Title="Dataplicity CLI" Level="1">
       <ComponentRef Id="MainExecutable" />
-      <ComponentRef Id="StartMenuShortcut" />
     </Feature>
 
     <UIRef Id="WixUI_Minimal" />
