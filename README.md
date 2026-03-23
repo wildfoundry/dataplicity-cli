@@ -45,10 +45,10 @@ Use an organisation API key:
 dataplicity auth api-key set
 ```
 
-List organisations:
+Show organisation:
 
 ```
-dataplicity orgs list
+dataplicity org show
 ```
 
 List developer devices:
@@ -78,7 +78,7 @@ dataplicity devices remote-file <device-hash> --path /etc/os-release --output ./
 Output JSON for scripting:
 
 ```
-dataplicity --json orgs list
+dataplicity --json org show
 ```
 
 ## Notes
