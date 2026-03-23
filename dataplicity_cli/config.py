@@ -6,6 +6,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+try:
+    from platformdirs import user_config_dir
+except Exception:  # pragma: no cover
+    user_config_dir = None
+
 DEFAULT_BASE_URL = "https://api.prelude.dataplicity.com"
 
 
@@ -13,14 +18,18 @@ def _config_root() -> Path:
     override = os.getenv("DATAPLICITY_CONFIG_DIR") or os.getenv("DP_CONFIG_DIR")
     if override:
         return Path(override).expanduser()
+    if user_config_dir:
+        # Use OS-native locations (e.g. %APPDATA% on Windows, ~/Library/Application Support on macOS).
+        # This is already app-scoped.
+        return Path(user_config_dir("dataplicity", "Dataplicity"))
     xdg_home = os.getenv("XDG_CONFIG_HOME")
     if xdg_home:
-        return Path(xdg_home).expanduser()
-    return Path.home() / ".config"
+        return Path(xdg_home).expanduser() / "dataplicity"
+    return Path.home() / ".config" / "dataplicity"
 
 
 def default_config_path() -> Path:
-    return _config_root() / "dataplicity" / "cli.json"
+    return _config_root() / "cli.json"
 
 
 @dataclass

@@ -4,18 +4,35 @@ A command line interface for Dataplicity (OEM/developer workflows).
 
 ## Install
 
-### macOS (via brew + pipx)
+### macOS (no Python required)
+
+Download the latest `.pkg` from [GitHub Releases](https://github.com/wildfoundry/dataplicity-cli/releases) and install it. It installs `dataplicity` into `/usr/local/bin`.
 
 ```
-brew install pipx
-pipx install dataplicity-cli
+dataplicity --help
 ```
 
-### Linux (pipx recommended)
+### macOS (Homebrew, recommended for devs)
 
 ```
-python3 -m pip install --user pipx
-python3 -m pipx ensurepath
+brew tap wildfoundry/tap
+brew install dataplicity-cli
+dataplicity --help
+```
+
+### Windows (no Python required)
+
+Download the latest `.msi` from [GitHub Releases](https://github.com/wildfoundry/dataplicity-cli/releases) and install it. It installs `dataplicity.exe` and adds it to `PATH`.
+
+```
+dataplicity --help
+```
+
+### Python (developer install)
+
+If you do have Python available and prefer `pipx`:
+
+```
 pipx install dataplicity-cli
 ```
 
