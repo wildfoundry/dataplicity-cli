@@ -1,0 +1,23 @@
+__pycache__/
+*.py[cod]
+
+.DS_Store
+
+# Local virtualenvs
+.venv/
+venv/
+
+# PyInstaller / release byproducts (never commit)
+dist/
+release/
+pyinstaller-dist/
+pyinstaller-build/
+tmp-release/
+
+*.msi
+*.pkg
+*.cab
+*.wixobj
+*.wixpdb
+*.exe
+
