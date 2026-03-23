@@ -28,3 +28,45 @@ jobs:
       - name: Help smoke
         run: python -m dataplicity_cli --help
 
+  no-artifacts-tracked:
+    name: No build artifacts tracked
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Fail if build byproducts are tracked
+        shell: bash
+        run: |
+          python - <<'PY'
+          import subprocess, sys
+
+          files = subprocess.check_output(["git", "ls-files"], text=True).splitlines()
+          forbidden_prefixes = (
+              "dist/",
+              "release/",
+              "pyinstaller-dist/",
+              "pyinstaller-build/",
+              "tmp-release/",
+          )
+          forbidden_suffixes = (
+              ".msi",
+              ".pkg",
+              ".cab",
+              ".wixobj",
+              ".wixpdb",
+              ".exe",
+          )
+
+          bad = [
+              f
+              for f in files
+              if f.startswith(forbidden_prefixes) or f.endswith(forbidden_suffixes)
+          ]
+          if bad:
+              sys.stderr.write("Forbidden build/release artifacts are tracked in git:\n")
+              sys.stderr.write("\n".join(bad) + "\n")
+              sys.exit(1)
+          print("OK: no forbidden artifacts tracked")
+          PY
+

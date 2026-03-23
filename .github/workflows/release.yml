@@ -48,18 +48,21 @@ jobs:
         if: runner.os == 'macOS'
         shell: bash
         run: |
-          pyinstaller --noconfirm --clean --onefile --name dataplicity --target-architecture "${{ matrix.macos_arch }}" dataplicity_cli/__main__.py
+          pyinstaller --noconfirm --clean --onefile --name dataplicity \
+            --target-architecture "${{ matrix.macos_arch }}" \
+            --workpath pyinstaller-build --distpath pyinstaller-dist \
+            dataplicity_cli/__main__.py
 
       - name: Build standalone binary (Windows)
         if: runner.os == 'Windows'
-        run: pyinstaller --noconfirm --clean --onefile --name dataplicity dataplicity_cli/__main__.py
+        run: pyinstaller --noconfirm --clean --onefile --name dataplicity --workpath pyinstaller-build --distpath pyinstaller-dist dataplicity_cli/__main__.py
 
       - name: Build macOS tarball (for Homebrew)
         if: runner.os == 'macOS'
         shell: bash
         run: |
           mkdir -p dist release
-          tar -C dist -czf "dist/dataplicity-cli-${VERSION}-macos-${{ matrix.macos_arch }}.tar.gz" dataplicity
+          tar -C pyinstaller-dist -czf "dist/dataplicity-cli-${VERSION}-macos-${{ matrix.macos_arch }}.tar.gz" dataplicity
 
       - name: Build macOS pkg
         if: runner.os == 'macOS'

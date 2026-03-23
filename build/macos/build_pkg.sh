@@ -10,8 +10,9 @@ ARCH="${2:-}"
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 DIST_DIR="${ROOT_DIR}/dist"
+PYI_DIST_DIR="${ROOT_DIR}/pyinstaller-dist"
 
-BIN="${DIST_DIR}/dataplicity"
+BIN="${PYI_DIST_DIR}/dataplicity"
 if [[ ! -f "${BIN}" ]]; then
   echo "Expected binary at ${BIN}. Build it first (pyinstaller)." >&2
   exit 1

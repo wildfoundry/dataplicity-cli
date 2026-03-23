@@ -7,15 +7,17 @@ $ErrorActionPreference = "Stop"
 
 $Root = Resolve-Path (Join-Path $PSScriptRoot "..\..")
 $Dist = Join-Path $Root "dist"
+$PyiDist = Join-Path $Root "pyinstaller-dist"
 $Wxs = Join-Path $PSScriptRoot "DataplicityCLI.wxs"
 $OutMsi = Join-Path $Dist ("dataplicity-cli-{0}-windows-x64.msi" -f $Version)
 
-$Exe = Join-Path $Dist "dataplicity.exe"
+$Exe = Join-Path $PyiDist "dataplicity.exe"
 if (!(Test-Path $Exe)) {
   throw "Expected $Exe. Build it first (pyinstaller)."
 }
 
 New-Item -ItemType Directory -Force -Path $Dist | Out-Null
+Copy-Item $Exe (Join-Path $Dist "dataplicity.exe") -Force
 
 # WiX v3 tools are expected to be on PATH (candle.exe, light.exe)
 $parts = $Version.Split(".")
