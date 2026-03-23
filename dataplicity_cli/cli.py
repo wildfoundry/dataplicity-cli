@@ -26,7 +26,6 @@ config_app = typer.Typer(help="Configuration commands")
 api_app = typer.Typer(help="Raw API commands")
 
 app.add_typer(auth_app, name="auth")
-app.add_typer(orgs_app, name="orgs")
 app.add_typer(orgs_app, name="org")
 app.add_typer(devices_app, name="devices")
 app.add_typer(config_app, name="config")
@@ -326,34 +325,6 @@ def auth_status(ctx: typer.Context) -> None:
     table.add_column("Value")
     for key, value in payload.items():
         table.add_row(key, str(value))
-    state.console.print(table)
-
-
-@orgs_app.command("list")
-def orgs_list(ctx: typer.Context) -> None:
-    state = _ctx(ctx)
-    _require_auth(state)
-    response = state.api.get("/api/v1/organisations/")
-    if not response.ok:
-        message = response.text or "Unable to list organisations"
-        if state.json_output:
-            _print_json({"ok": False, "detail": message})
-        else:
-            _show_error(state.console, message)
-        raise typer.Exit(code=1)
-
-    payload = response.data or []
-    if state.json_output:
-        _print_json(payload)
-        return
-
-    orgs = _extract_orgs(payload)
-    state.console.print("[yellow]Note:[/yellow] Users are typically in a single organisation. Prefer `dataplicity org show`.")
-    table = Table(title="Organisations")
-    table.add_column("Hash")
-    table.add_column("Name")
-    for org in orgs:
-        table.add_row(str(org.get("hash_id") or org.get("hash") or ""), str(org.get("name") or ""))
     state.console.print(table)
 
 
