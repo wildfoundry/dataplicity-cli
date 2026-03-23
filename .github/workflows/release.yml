@@ -58,7 +58,7 @@ jobs:
         if: runner.os == 'macOS'
         shell: bash
         run: |
-          mkdir -p dist
+          mkdir -p dist release
           tar -C dist -czf "dist/dataplicity-cli-${VERSION}-macos-${{ matrix.macos_arch }}.tar.gz" dataplicity
 
       - name: Build macOS pkg
@@ -66,6 +66,19 @@ jobs:
         run: |
           chmod +x build/macos/build_pkg.sh
           ./build/macos/build_pkg.sh "${VERSION}" "${{ matrix.macos_arch }}"
+
+      - name: Stage macOS release artifacts
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          mkdir -p release
+          cp "dist/dataplicity-cli-${VERSION}-macos-${{ matrix.macos_arch }}.pkg" release/
+          cp "dist/dataplicity-cli-${VERSION}-macos-${{ matrix.macos_arch }}.tar.gz" release/
+          python build/generate_checksums.py \
+            --dist-dir release \
+            --output "SHA256SUMS-macos-${{ matrix.macos_arch }}.txt" \
+            --file "dataplicity-cli-${VERSION}-macos-${{ matrix.macos_arch }}.pkg" \
+            --file "dataplicity-cli-${VERSION}-macos-${{ matrix.macos_arch }}.tar.gz"
 
       - name: Install WiX
         if: runner.os == 'Windows'
@@ -77,14 +90,22 @@ jobs:
         run: |
           ./build/windows/build_msi.ps1 -Version "${env:VERSION}"
 
-      - name: Generate checksums
-        run: python build/generate_checksums.py
+      - name: Stage Windows release artifacts
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path release | Out-Null
+          Copy-Item "dist/dataplicity-cli-${env:VERSION}-windows-x64.msi" release/
+          python build/generate_checksums.py `
+            --dist-dir release `
+            --output "SHA256SUMS-windows-x64.txt" `
+            --file "dataplicity-cli-${env:VERSION}-windows-x64.msi"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.name }}
-          path: dist/*
+          path: release/*
 
   release:
     name: Publish GitHub Release
