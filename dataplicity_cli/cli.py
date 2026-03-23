@@ -27,6 +27,7 @@ api_app = typer.Typer(help="Raw API commands")
 
 app.add_typer(auth_app, name="auth")
 app.add_typer(orgs_app, name="orgs")
+app.add_typer(orgs_app, name="org")
 app.add_typer(devices_app, name="devices")
 app.add_typer(config_app, name="config")
 app.add_typer(api_app, name="api")
@@ -346,12 +347,61 @@ def orgs_list(ctx: typer.Context) -> None:
         _print_json(payload)
         return
 
+    orgs = _extract_orgs(payload)
+    state.console.print("[yellow]Note:[/yellow] Users are typically in a single organisation. Prefer `dataplicity org show`.")
     table = Table(title="Organisations")
     table.add_column("Hash")
     table.add_column("Name")
-    for org in payload if isinstance(payload, list) else []:
+    for org in orgs:
         table.add_row(str(org.get("hash_id") or org.get("hash") or ""), str(org.get("name") or ""))
     state.console.print(table)
+
+
+def _extract_orgs(payload: Any) -> List[Dict[str, Any]]:
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+    if isinstance(payload, dict):
+        for key in ("results", "organisations", "organizations"):
+            items = payload.get(key)
+            if isinstance(items, list):
+                return [item for item in items if isinstance(item, dict)]
+    return []
+
+
+@orgs_app.command("show")
+def orgs_show(ctx: typer.Context) -> None:
+    state = _ctx(ctx)
+    _require_auth(state)
+    response = state.api.get("/api/v1/organisations/")
+    if not response.ok:
+        message = response.text or "Unable to fetch organisation"
+        if state.json_output:
+            _print_json({"ok": False, "detail": message})
+        else:
+            _show_error(state.console, message)
+        raise typer.Exit(code=1)
+
+    orgs = _extract_orgs(response.data or [])
+    if not orgs:
+        message = "No organisation found for this user."
+        if state.json_output:
+            _print_json({"ok": False, "detail": message})
+        else:
+            _show_error(state.console, message)
+        raise typer.Exit(code=2)
+
+    org = orgs[0]
+    if state.json_output:
+        _print_json(org)
+        return
+
+    table = Table(title="Organisation")
+    table.add_column("Hash")
+    table.add_column("Name")
+    table.add_row(str(org.get("hash_id") or org.get("hash") or ""), str(org.get("name") or ""))
+    state.console.print(table)
+    if len(orgs) > 1:
+        state.console.print(f"[yellow]Warning:[/yellow] API returned {len(orgs)} organisations; showing the first.")
 
 
 @devices_app.command("list")
