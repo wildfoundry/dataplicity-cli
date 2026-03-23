@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Product
+    Id="*"
+    Name="Dataplicity CLI"
+    Manufacturer="Dataplicity"
+    Version="$(var.Version)"
+    UpgradeCode="B3C5A6C2-3D42-4E6B-9E2E-4F7B3D3C2A10">
+
+    <Package
+      InstallerVersion="500"
+      Compressed="yes"
+      InstallScope="perMachine" />
+
+    <MajorUpgrade DowngradeErrorMessage="A newer version of Dataplicity CLI is already installed." />
+    <MediaTemplate />
+
+    <Property Id="WIXUI_INSTALLDIR" Value="INSTALLFOLDER" />
+
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="ProgramFilesFolder">
+        <Directory Id="ManufacturerFolder" Name="Dataplicity">
+          <Directory Id="INSTALLFOLDER" Name="Dataplicity CLI" />
+        </Directory>
+      </Directory>
+      <Directory Id="ProgramMenuFolder">
+        <Directory Id="ApplicationProgramsFolder" Name="Dataplicity CLI" />
+      </Directory>
+    </Directory>
+
+    <DirectoryRef Id="INSTALLFOLDER">
+      <Component Id="MainExecutable" Guid="B2C7E7C3-9A4C-4C7E-A2E6-8DDB0F3A1E1B">
+        <File Id="DataplicityExe" Source="dist\dataplicity.exe" KeyPath="yes" />
+        <Environment
+          Id="PathEntry"
+          Name="PATH"
+          Value="[INSTALLFOLDER]"
+          Permanent="no"
+          Part="last"
+          Action="set"
+          System="yes" />
+      </Component>
+    </DirectoryRef>
+
+    <DirectoryRef Id="ApplicationProgramsFolder">
+      <Component Id="StartMenuShortcut" Guid="0A5C2B1F-17A6-4F6D-8E58-7A8A06A0E3E6">
+        <Shortcut
+          Id="StartMenuShortcutId"
+          Name="Dataplicity CLI"
+          Description="Dataplicity CLI"
+          Target="[INSTALLFOLDER]dataplicity.exe"
+          WorkingDirectory="INSTALLFOLDER" />
+        <RemoveFolder Id="RemoveApplicationProgramsFolder" On="uninstall" />
+        <RegistryValue Root="HKLM" Key="Software\Dataplicity\DataplicityCLI" Name="installed" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+
+    <Feature Id="ProductFeature" Title="Dataplicity CLI" Level="1">
+      <ComponentRef Id="MainExecutable" />
+      <ComponentRef Id="StartMenuShortcut" />
+    </Feature>
+
+    <UIRef Id="WixUI_Minimal" />
+  </Product>
+</Wix>
