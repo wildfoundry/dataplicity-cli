@@ -26,6 +26,10 @@ class RawTerminal:
             termios.tcsetattr(self._fd, termios.TCSADRAIN, self._old)
 
 
+class CommandTimeoutError(TimeoutError):
+    pass
+
+
 async def run_terminal_session(m2m: M2MClient, port: int) -> None:
     queue = m2m.channel_queue(port)
     stdin_fd = sys.stdin.fileno()
@@ -47,6 +51,42 @@ async def run_terminal_session(m2m: M2MClient, port: int) -> None:
 
     with RawTerminal():
         await asyncio.gather(stdin_loop(), stdout_loop())
+
+
+async def run_single_command(
+    m2m: M2MClient,
+    channel_port: int,
+    command: str,
+    *,
+    timeout_seconds: Optional[float] = 30.0,
+) -> bytes:
+    queue = m2m.channel_queue(channel_port)
+    command_text = str(command or "").strip()
+    if not command_text:
+        raise RuntimeError("Command cannot be empty.")
+
+    # Send command and close the terminal session afterwards.
+    await m2m.send_route(channel_port, f"{command_text}\nexit\n".encode("utf-8"))
+
+    async def read_output() -> bytes:
+        chunks = []
+        while True:
+            data = await queue.get()
+            if data is None:
+                break
+            chunks.append(data)
+        return b"".join(chunks)
+
+    if timeout_seconds is None:
+        return await read_output()
+
+    try:
+        return await asyncio.wait_for(read_output(), timeout=timeout_seconds)
+    except asyncio.TimeoutError as exc:
+        await m2m.close_channel(channel_port)
+        raise CommandTimeoutError(
+            f"Command timed out after {int(timeout_seconds)}s. Retry with --no-timeout for long-running commands."
+        ) from exc
 
 
 async def run_remote_file(

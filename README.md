@@ -104,6 +104,18 @@ Open a terminal:
 dataplicity devices terminal <device-hash>
 ```
 
+Run one command and capture output:
+
+```
+dataplicity devices run <device-hash> --command "uname -a"
+```
+
+Long-running command with no timeout:
+
+```
+dataplicity devices run <device-hash> --command "tail -f /var/log/syslog" --no-timeout
+```
+
 If you omit `<device-hash>`, the CLI now shows an interactive picker.
 
 Top-level shortcut:

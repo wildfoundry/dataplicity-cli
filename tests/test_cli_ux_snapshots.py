@@ -52,6 +52,18 @@ class CliUxSnapshotsTest(unittest.TestCase):
         for snippet in expected_snippets:
             self.assertIn(snippet, result.output)
 
+    def test_devices_run_help_snapshot(self) -> None:
+        result = self._invoke(["devices", "run", "--help"])
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+        expected_snippets = [
+            "Run a single command on a device and print output.",
+            "dataplicity devices run --command",
+            "dataplicity devices run <device-hash> --command",
+            "--no-timeout",
+        ]
+        for snippet in expected_snippets:
+            self.assertIn(snippet, result.output)
+
     def test_doctor_help_snapshot(self) -> None:
         result = self._invoke(["doctor", "--help"])
         self.assertEqual(result.exit_code, 0, msg=result.output)
