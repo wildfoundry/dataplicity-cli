@@ -29,6 +29,11 @@ class CliUxSnapshotsTest(unittest.TestCase):
             "setup",
             "whoami",
             "doctor",
+            "endpoint-monitors",
+            "user-impact",
+            "heartbeat-monitors",
+            "fleet-jobs",
+            "logging",
             "ls",
             "connect",
         ]
@@ -55,6 +60,17 @@ class CliUxSnapshotsTest(unittest.TestCase):
             "Examples:",
             "dataplicity doctor",
             "dataplicity --json doctor",
+        ]
+        for snippet in expected_snippets:
+            self.assertIn(snippet, result.output)
+
+    def test_fleet_jobs_run_help_snapshot(self) -> None:
+        result = self._invoke(["fleet-jobs", "run", "--help"])
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+        expected_snippets = [
+            "Create and start a fleet job.",
+            "Examples:",
+            "dataplicity fleet-jobs run --data",
         ]
         for snippet in expected_snippets:
             self.assertIn(snippet, result.output)
