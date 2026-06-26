@@ -38,10 +38,22 @@ pipx install dataplicity-cli
 
 ## Quick start
 
+Guided setup (recommended):
+
+```
+dataplicity setup
+```
+
+Quick health check:
+
+```
+dataplicity doctor
+```
+
 Set the API base URL if you are not using the default:
 
 ```
-dataplicity config set --base-url https://api.prelude.dataplicity.com
+dataplicity config set --base-url https://gateway.dataplicity.com
 ```
 
 Login with email/password:
@@ -59,7 +71,7 @@ dataplicity auth sso --email you@example.com
 Use an organisation API key:
 
 ```
-dataplicity auth api-key set
+dataplicity auth api-key
 ```
 
 Show organisation:
@@ -74,10 +86,30 @@ List developer devices:
 dataplicity devices list
 ```
 
+Short alias:
+
+```
+dataplicity devices ls
+```
+
+Top-level shortcut:
+
+```
+dataplicity ls
+```
+
 Open a terminal:
 
 ```
 dataplicity devices terminal <device-hash>
+```
+
+If you omit `<device-hash>`, the CLI now shows an interactive picker.
+
+Top-level shortcut:
+
+```
+dataplicity connect
 ```
 
 Forward device port 22 to local port 2022:
@@ -96,6 +128,18 @@ Output JSON for scripting:
 
 ```
 dataplicity --json org show
+```
+
+Show your current session and fleet summary:
+
+```
+dataplicity whoami
+```
+
+Install shell completion:
+
+```
+dataplicity --install-completion zsh
 ```
 
 ## Notes
