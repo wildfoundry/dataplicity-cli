@@ -177,8 +177,14 @@ def _parse_sso_user_artifact(raw: str) -> Optional[Dict[str, Any]]:
 def _with_callback_hint(url: str, callback_url: str) -> str:
     parsed = urlparse(url)
     query = parse_qs(parsed.query, keep_blank_values=True)
+    # Prefer standards/common redirect targets when present so the IdP/browser
+    # flow can return directly to the loopback listener.
+    for redirect_key in ("redirect_uri", "redirect_url", "return_to", "return", "next"):
+        if redirect_key in query:
+            query[redirect_key] = [callback_url]
+            break
     if "cli_callback_url" in query:
-        return url
+        return urlunparse(parsed._replace(query=urlencode(query, doseq=True)))
     query["cli_callback_url"] = [callback_url]
     return urlunparse(parsed._replace(query=urlencode(query, doseq=True)))
 
