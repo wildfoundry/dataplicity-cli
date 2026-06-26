@@ -295,6 +295,14 @@ def _attempt_sso_auto_complete(
     return False
 
 
+def _coerce_timeout_seconds(value: Any, default: int = 180) -> int:
+    try:
+        timeout = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(timeout, 1)
+
+
 def _friendly_response_message(default_message: str, response_data: Any, response_text: str) -> str:
     if isinstance(response_data, dict):
         detail = response_data.get("detail") or response_data.get("error") or response_data.get("message")
@@ -719,6 +727,7 @@ def auth_sso(
       dataplicity auth sso --email you@example.com --timeout 300
     """
     state = _ctx(ctx)
+    timeout_seconds = _coerce_timeout_seconds(timeout)
     response = state.api.post("/api/auth/bootstrap/", json_data={"email": email})
     if not response.ok:
         message = _friendly_response_message("Unable to start SSO.", response.data, response.text)
@@ -760,7 +769,7 @@ def auth_sso(
     if not state.json_output:
         state.console.print("Waiting for browser sign-in to complete...")
     try:
-        if _attempt_sso_auto_complete(state, listener, timeout_seconds=timeout):
+        if _attempt_sso_auto_complete(state, listener, timeout_seconds=timeout_seconds):
             if state.json_output:
                 _print_json({"ok": True, "detail": "SSO login complete"})
             else:
