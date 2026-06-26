@@ -21,3 +21,9 @@ tmp-release/
 *.wixpdb
 *.exe
 
+# Python packaging byproducts
+build/lib/
+*.egg-info/
+
+# Local PyInstaller spec outputs
+*.spec
