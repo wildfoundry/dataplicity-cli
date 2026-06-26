@@ -130,6 +130,30 @@ Output JSON for scripting:
 dataplicity --json org show
 ```
 
+List endpoint monitors:
+
+```
+dataplicity endpoint-monitors list
+```
+
+Inspect user impact:
+
+```
+dataplicity user-impact list --unresolved-only
+```
+
+Run a fleet job:
+
+```
+dataplicity fleet-jobs run --data '{"name":"restart-edge","device_hashes":["abc123"],"command":"restart"}'
+```
+
+Query logs:
+
+```
+dataplicity logging list --device <device-hash> --level error
+```
+
 Show your current session and fleet summary:
 
 ```

@@ -2,11 +2,16 @@ from __future__ import annotations
 
 import asyncio
 import json
+import queue
 import sys
+import threading
+import time
 import webbrowser
 from dataclasses import dataclass
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 import typer
 from rich.console import Console
@@ -16,7 +21,6 @@ from rich.table import Table
 from .api import ApiClient
 from .config import Config, default_config_path
 from .m2m import M2MClient
-from .remote_access import run_port_forward, run_remote_file, run_terminal_session
 
 
 app = typer.Typer(
@@ -37,12 +41,22 @@ orgs_app = typer.Typer(help="Organisation commands")
 devices_app = typer.Typer(help="Device commands")
 config_app = typer.Typer(help="Configuration commands")
 api_app = typer.Typer(help="Raw API commands")
+endpoint_monitors_app = typer.Typer(help="Endpoint monitor commands")
+user_impact_app = typer.Typer(help="User impact commands")
+heartbeat_monitors_app = typer.Typer(help="Heartbeat monitor commands")
+fleet_jobs_app = typer.Typer(help="Fleet job commands")
+logging_app = typer.Typer(help="Logging commands")
 
 app.add_typer(auth_app, name="auth")
 app.add_typer(orgs_app, name="org")
 app.add_typer(devices_app, name="devices")
 app.add_typer(config_app, name="config")
 app.add_typer(api_app, name="api")
+app.add_typer(endpoint_monitors_app, name="endpoint-monitors")
+app.add_typer(user_impact_app, name="user-impact")
+app.add_typer(heartbeat_monitors_app, name="heartbeat-monitors")
+app.add_typer(fleet_jobs_app, name="fleet-jobs")
+app.add_typer(logging_app, name="logging")
 
 
 @dataclass
@@ -90,6 +104,188 @@ def _print_json(data: Any) -> None:
 
 def _show_error(console: Console, message: str) -> None:
     console.print(f"[red]Error:[/red] {message}")
+
+
+def _extract_sso_tokens(payload: Any) -> Tuple[Optional[str], Optional[str]]:
+    if not isinstance(payload, dict):
+        return None, None
+    tokens = payload.get("tokens") if isinstance(payload.get("tokens"), dict) else None
+    access = tokens.get("access") if tokens else None
+    refresh = tokens.get("refresh") if tokens else None
+    access = access or payload.get("access") or payload.get("token")
+    refresh = refresh or payload.get("refresh")
+    return access, refresh
+
+
+def _decode_json_payload(raw: str) -> Optional[Dict[str, Any]]:
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    if isinstance(parsed, dict):
+        return parsed
+    return None
+
+
+def _extract_sso_payload_from_query(query: Dict[str, List[str]]) -> Optional[Dict[str, Any]]:
+    payload: Dict[str, Any] = {}
+    for key in ("access", "refresh", "code", "state", "token"):
+        values = query.get(key)
+        if values:
+            payload[key] = values[0]
+    for key in ("payload", "json", "data"):
+        values = query.get(key)
+        if not values:
+            continue
+        nested = _decode_json_payload(values[0])
+        if nested:
+            payload.update(nested)
+            break
+    return payload if payload else None
+
+
+def _with_callback_hint(url: str, callback_url: str) -> str:
+    parsed = urlparse(url)
+    query = parse_qs(parsed.query, keep_blank_values=True)
+    if "cli_callback_url" in query:
+        return url
+    query["cli_callback_url"] = [callback_url]
+    return urlunparse(parsed._replace(query=urlencode(query, doseq=True)))
+
+
+class _SsoCallbackListener:
+    def __init__(self) -> None:
+        self._queue: "queue.Queue[Dict[str, Any]]" = queue.Queue()
+        self._server: Optional[ThreadingHTTPServer] = None
+        self._thread: Optional[threading.Thread] = None
+        self.callback_url: Optional[str] = None
+
+    def start(self) -> bool:
+        payload_queue = self._queue
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, format: str, *args: Any) -> None:  # pragma: no cover
+                return
+
+            def _write_html(self, status: int, message: str) -> None:
+                body = (
+                    "<html><body><h2>Dataplicity CLI</h2>"
+                    f"<p>{message}</p>"
+                    "<p>You can close this tab and return to your terminal.</p></body></html>"
+                ).encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def _capture_payload(self) -> Optional[Dict[str, Any]]:
+                parsed = urlparse(self.path)
+                query_payload = _extract_sso_payload_from_query(parse_qs(parsed.query, keep_blank_values=True))
+                if query_payload:
+                    return query_payload
+                if self.command != "POST":
+                    return None
+                length = int(self.headers.get("Content-Length") or "0")
+                if length <= 0:
+                    return None
+                raw = self.rfile.read(length).decode("utf-8", "ignore")
+                if "application/json" in (self.headers.get("Content-Type") or ""):
+                    return _decode_json_payload(raw)
+                form_payload = _extract_sso_payload_from_query(parse_qs(raw, keep_blank_values=True))
+                return form_payload
+
+            def do_GET(self) -> None:  # noqa: N802
+                payload = self._capture_payload()
+                if payload:
+                    payload_queue.put(payload)
+                    self._write_html(200, "Authentication received.")
+                    return
+                self._write_html(200, "Waiting for authentication callback.")
+
+            def do_POST(self) -> None:  # noqa: N802
+                payload = self._capture_payload()
+                if payload:
+                    payload_queue.put(payload)
+                    self._write_html(200, "Authentication received.")
+                    return
+                self._write_html(400, "No authentication payload was provided.")
+
+        try:
+            self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        except OSError:
+            return False
+        host, port = self._server.server_address[:2]
+        self.callback_url = f"http://{host}:{port}/callback"
+        self._thread = threading.Thread(target=self._server.serve_forever, kwargs={"poll_interval": 0.2}, daemon=True)
+        self._thread.start()
+        return True
+
+    def wait_for_payload(self, timeout_seconds: float) -> Optional[Dict[str, Any]]:
+        try:
+            return self._queue.get(timeout=timeout_seconds)
+        except queue.Empty:
+            return None
+
+    def stop(self) -> None:
+        if self._server:
+            self._server.shutdown()
+            self._server.server_close()
+        if self._thread:
+            self._thread.join(timeout=1.0)
+
+
+def _apply_tokens_or_none(state: AppContext, payload: Any) -> bool:
+    access, refresh = _extract_sso_tokens(payload)
+    if not access:
+        return False
+    state.config.access_token = access
+    state.config.refresh_token = refresh
+    state.config.auth_method = "jwt"
+    state.config.save(state.config_path)
+    return True
+
+
+def _try_complete_sso_from_code(state: AppContext, code_payload: Dict[str, Any]) -> bool:
+    code = code_payload.get("code")
+    if not code:
+        return False
+    body: Dict[str, Any] = {"code": code}
+    if code_payload.get("state"):
+        body["state"] = code_payload["state"]
+    response = state.api.post("/api/auth/sso/complete/", json_data=body)
+    if not response.ok:
+        return False
+    return _apply_tokens_or_none(state, response.data)
+
+
+def _attempt_sso_auto_complete(
+    state: AppContext,
+    listener: Optional[_SsoCallbackListener],
+    *,
+    timeout_seconds: int,
+) -> bool:
+    deadline = time.monotonic() + max(timeout_seconds, 1)
+    unauthenticated_polls = 0
+    while time.monotonic() < deadline:
+        if listener:
+            payload = listener.wait_for_payload(timeout_seconds=1.0)
+            if payload:
+                if _apply_tokens_or_none(state, payload):
+                    return True
+                if _try_complete_sso_from_code(state, payload):
+                    return True
+        response = state.api.get("/api/auth/sso/complete/")
+        if response.ok and _apply_tokens_or_none(state, response.data):
+            return True
+        if response.status_code in {401, 403, 404}:
+            unauthenticated_polls += 1
+            if unauthenticated_polls >= 3:
+                break
+        else:
+            unauthenticated_polls = 0
+        time.sleep(1.0)
+    return False
 
 
 def _friendly_response_message(default_message: str, response_data: Any, response_text: str) -> str:
@@ -498,12 +694,14 @@ def auth_sso(
     ctx: typer.Context,
     email: str = typer.Option(..., "--email", prompt=True),
     open_browser: bool = typer.Option(True, "--open-browser/--no-open-browser", help="Open SSO login in the browser"),
+    timeout: int = typer.Option(180, "--timeout", help="Seconds to wait for automatic browser callback"),
 ) -> None:
     """Start SSO login flow for your email.
 
     Examples:
       dataplicity auth sso --email you@example.com
       dataplicity auth sso --email you@example.com --no-open-browser
+      dataplicity auth sso --email you@example.com --timeout 300
     """
     state = _ctx(ctx)
     response = state.api.post("/api/auth/bootstrap/", json_data={"email": email})
@@ -532,52 +730,56 @@ def auth_sso(
             _show_error(state.console, message)
         raise typer.Exit(code=1)
 
+    listener: Optional[_SsoCallbackListener] = None
+    browser_url = redirect_url
     if open_browser:
-        webbrowser.open(redirect_url)
+        listener = _SsoCallbackListener()
+        if listener.start() and listener.callback_url:
+            browser_url = _with_callback_hint(redirect_url, listener.callback_url)
+            if not state.json_output:
+                state.console.print(f"Listening for SSO callback on [blue]{listener.callback_url}[/blue]")
+        else:
+            listener = None
+        webbrowser.open(browser_url)
+
+    if not state.json_output:
+        state.console.print("Waiting for browser sign-in to complete...")
+    try:
+        if _attempt_sso_auto_complete(state, listener, timeout_seconds=timeout):
+            if state.json_output:
+                _print_json({"ok": True, "detail": "SSO login complete"})
+            else:
+                state.console.print("[green]SSO login complete.[/green]")
+            return
+    finally:
+        if listener:
+            listener.stop()
 
     sso_complete_url = state.api._build_url("/api/auth/sso/complete/")
-    if not state.json_output:
-        state.console.print("Complete SSO in your browser, then open:")
-        state.console.print(f"[blue]{sso_complete_url}[/blue]")
-        state.console.print("Paste the JSON payload below.")
+    if state.json_output:
+        _print_json(
+            {
+                "ok": False,
+                "detail": "Automatic SSO completion timed out. Complete sign-in in your browser and run `dataplicity auth sso` again.",
+                "sso_complete_url": sso_complete_url,
+            }
+        )
+        raise typer.Exit(code=2)
+
+    state.console.print("[yellow]Automatic callback did not complete in time.[/yellow]")
+    state.console.print("Complete SSO in your browser, then open:")
+    state.console.print(f"[blue]{sso_complete_url}[/blue]")
+    state.console.print("Paste the JSON payload below.")
 
     raw = typer.prompt("SSO JSON")
-    try:
-        payload = json.loads(raw)
-    except json.JSONDecodeError:
-        message = "Invalid JSON payload."
-        if state.json_output:
-            _print_json({"ok": False, "detail": message})
-        else:
-            _show_error(state.console, message)
+    payload = _decode_json_payload(raw)
+    if payload is None:
+        _show_error(state.console, "Invalid JSON payload.")
         raise typer.Exit(code=1)
-
-    tokens = payload.get("tokens") if isinstance(payload, dict) else None
-    access = None
-    refresh = None
-    if isinstance(tokens, dict):
-        access = tokens.get("access")
-        refresh = tokens.get("refresh")
-    if isinstance(payload, dict):
-        access = access or payload.get("access")
-        refresh = refresh or payload.get("refresh")
-
-    if not access:
-        message = "No access token found in payload."
-        if state.json_output:
-            _print_json({"ok": False, "detail": message})
-        else:
-            _show_error(state.console, message)
+    if not _apply_tokens_or_none(state, payload):
+        _show_error(state.console, "No access token found in payload.")
         raise typer.Exit(code=1)
-
-    state.config.access_token = access
-    state.config.refresh_token = refresh
-    state.config.auth_method = "jwt"
-    state.config.save(state.config_path)
-    if state.json_output:
-        _print_json({"ok": True, "detail": "SSO login complete"})
-    else:
-        state.console.print("[green]SSO login complete.[/green]")
+    state.console.print("[green]SSO login complete.[/green]")
 
 
 @auth_app.command("api-key")
@@ -898,6 +1100,8 @@ def devices_terminal(ctx: typer.Context, device_hash: Optional[str] = typer.Argu
     resolved_hash = _resolve_device_hash_interactive(state, device_hash, action_name="terminal")
 
     async def runner() -> None:
+        from .remote_access import run_terminal_session
+
         ws_url = await _resolve_m2m_url(state, resolved_hash)
         m2m = M2MClient(ws_url)
         await m2m.connect()
@@ -941,6 +1145,8 @@ def devices_port_forward(
     resolved_hash = _resolve_device_hash_interactive(state, device_hash, action_name="port-forward")
 
     async def runner() -> None:
+        from .remote_access import run_port_forward
+
         ws_url = await _resolve_m2m_url(state, resolved_hash)
         m2m = M2MClient(ws_url)
         await m2m.connect()
@@ -1009,6 +1215,8 @@ def devices_remote_file(
     resolved_hash = _resolve_device_hash_interactive(state, device_hash, action_name="remote-file")
 
     async def runner() -> int:
+        from .remote_access import run_remote_file
+
         ws_url = await _resolve_m2m_url(state, resolved_hash)
         m2m = M2MClient(ws_url)
         await m2m.connect()
@@ -1095,6 +1303,396 @@ def _parse_kv_pairs(items: Optional[List[str]]) -> Dict[str, Any]:
         key, value = item.split("=", 1)
         payload[key] = value
     return payload
+
+
+def _parse_json_payload_or_exit(state: AppContext, data: str) -> Dict[str, Any]:
+    try:
+        payload = json.loads(data)
+    except json.JSONDecodeError:
+        message = "Invalid JSON payload."
+        if state.json_output:
+            _print_json({"ok": False, "detail": message})
+        else:
+            _show_error(state.console, message)
+        raise typer.Exit(code=1)
+    if not isinstance(payload, dict):
+        message = "JSON payload must be an object."
+        if state.json_output:
+            _print_json({"ok": False, "detail": message})
+        else:
+            _show_error(state.console, message)
+        raise typer.Exit(code=1)
+    return payload
+
+
+def _extract_objects(payload: Any) -> List[Dict[str, Any]]:
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+    if isinstance(payload, dict):
+        for key in ("results", "items", "data"):
+            items = payload.get(key)
+            if isinstance(items, list):
+                return [item for item in items if isinstance(item, dict)]
+    return []
+
+
+def _resource_key(item: Dict[str, Any]) -> str:
+    for key in ("hash_id", "id", "uuid", "slug", "name"):
+        value = item.get(key)
+        if value is not None:
+            text = str(value).strip()
+            if text:
+                return text
+    return ""
+
+
+def _resource_name(item: Dict[str, Any]) -> str:
+    for key in ("name", "title", "label", "endpoint"):
+        value = item.get(key)
+        if value is not None:
+            text = str(value).strip()
+            if text:
+                return text
+    return ""
+
+
+def _resource_status(item: Dict[str, Any]) -> str:
+    for key in ("status", "state", "health", "severity"):
+        value = item.get(key)
+        if value is not None:
+            text = str(value).strip()
+            if text:
+                return text
+    return ""
+
+
+def _render_resource_table(state: AppContext, title: str, payload: Any) -> None:
+    rows = _extract_objects(payload)
+    table = Table(title=title)
+    table.add_column("ID", style="cyan")
+    table.add_column("Name")
+    table.add_column("Status")
+    if not rows:
+        state.console.print(table)
+        state.console.print("No results.")
+        return
+    for row in rows:
+        table.add_row(_resource_key(row), _resource_name(row), _resource_status(row))
+    state.console.print(table)
+    state.console.print(f"Showing {len(rows)} results.")
+
+
+def _list_resource(
+    state: AppContext,
+    *,
+    endpoint: str,
+    title: str,
+    params: Optional[Dict[str, Any]] = None,
+) -> None:
+    _require_auth(state)
+    response = state.api.get(endpoint, params=params)
+    if not response.ok:
+        message = _friendly_response_message(f"Unable to list {title.lower()}.", response.data, response.text)
+        if state.json_output:
+            _print_json({"ok": False, "detail": message})
+        else:
+            _show_error(state.console, message)
+        raise typer.Exit(code=1)
+    if state.json_output:
+        _print_json(response.data or [])
+        return
+    _render_resource_table(state, title, response.data or [])
+
+
+def _show_resource(
+    state: AppContext,
+    *,
+    endpoint: str,
+    resource_id: str,
+    not_found_label: str,
+) -> None:
+    _require_auth(state)
+    response = state.api.get(f"{endpoint}{resource_id}/")
+    if not response.ok:
+        message = _friendly_response_message(f"Unable to fetch {not_found_label}.", response.data, response.text)
+        if state.json_output:
+            _print_json({"ok": False, "detail": message})
+        else:
+            _show_error(state.console, message)
+        raise typer.Exit(code=1)
+    if state.json_output:
+        _print_json(response.data or {})
+        return
+    table = Table(title=f"{not_found_label.title()} {resource_id}")
+    table.add_column("Key")
+    table.add_column("Value")
+    if isinstance(response.data, dict):
+        for key, value in response.data.items():
+            table.add_row(str(key), json.dumps(_sanitize_payload(value)))
+    state.console.print(table)
+
+
+def _create_resource(state: AppContext, *, endpoint: str, data: str, label: str) -> None:
+    _require_auth(state)
+    payload = _parse_json_payload_or_exit(state, data)
+    response = state.api.post(endpoint, json_data=payload)
+    if not response.ok:
+        message = _friendly_response_message(f"Unable to create {label}.", response.data, response.text)
+        if state.json_output:
+            _print_json({"ok": False, "detail": message})
+        else:
+            _show_error(state.console, message)
+        raise typer.Exit(code=1)
+    if state.json_output:
+        _print_json(response.data or {"ok": True})
+    else:
+        state.console.print(f"[green]{label.title()} created.[/green]")
+
+
+def _delete_resource(state: AppContext, *, endpoint: str, resource_id: str, label: str) -> None:
+    _require_auth(state)
+    response = state.api.request("DELETE", f"{endpoint}{resource_id}/")
+    if not response.ok:
+        message = _friendly_response_message(f"Unable to delete {label}.", response.data, response.text)
+        if state.json_output:
+            _print_json({"ok": False, "detail": message})
+        else:
+            _show_error(state.console, message)
+        raise typer.Exit(code=1)
+    if state.json_output:
+        _print_json(response.data if response.data is not None else {"ok": True})
+    else:
+        state.console.print(f"[green]{label.title()} deleted.[/green]")
+
+
+@endpoint_monitors_app.command("list")
+def endpoint_monitors_list(
+    ctx: typer.Context,
+    page_size: int = typer.Option(100, "--page-size", help="Page size"),
+    search: Optional[str] = typer.Option(None, "--search", help="Search term"),
+) -> None:
+    """List endpoint monitors.
+
+    Examples:
+      dataplicity endpoint-monitors list
+      dataplicity endpoint-monitors list --search production
+    """
+    params: Dict[str, Any] = {"page_size": page_size}
+    if search:
+        params["search"] = search
+    _list_resource(_ctx(ctx), endpoint="/api/developer/endpoint-monitors/", title="Endpoint monitors", params=params)
+
+
+@endpoint_monitors_app.command("show")
+def endpoint_monitors_show(ctx: typer.Context, monitor_id: str = typer.Argument(...)) -> None:
+    """Show an endpoint monitor.
+
+    Examples:
+      dataplicity endpoint-monitors show <monitor-id>
+    """
+    _show_resource(_ctx(ctx), endpoint="/api/developer/endpoint-monitors/", resource_id=monitor_id, not_found_label="endpoint monitor")
+
+
+@endpoint_monitors_app.command("create")
+def endpoint_monitors_create(
+    ctx: typer.Context,
+    data: str = typer.Option(..., "--data", help="JSON payload"),
+) -> None:
+    """Create an endpoint monitor.
+
+    Examples:
+      dataplicity endpoint-monitors create --data '{"name":"api-check","url":"https://example.com/health"}'
+    """
+    _create_resource(_ctx(ctx), endpoint="/api/developer/endpoint-monitors/", data=data, label="endpoint monitor")
+
+
+@endpoint_monitors_app.command("delete")
+def endpoint_monitors_delete(ctx: typer.Context, monitor_id: str = typer.Argument(...)) -> None:
+    """Delete an endpoint monitor.
+
+    Examples:
+      dataplicity endpoint-monitors delete <monitor-id>
+    """
+    _delete_resource(_ctx(ctx), endpoint="/api/developer/endpoint-monitors/", resource_id=monitor_id, label="endpoint monitor")
+
+
+@user_impact_app.command("list")
+def user_impact_list(
+    ctx: typer.Context,
+    page_size: int = typer.Option(100, "--page-size", help="Page size"),
+    unresolved_only: bool = typer.Option(False, "--unresolved-only", help="Show unresolved impact items"),
+) -> None:
+    """List user impact items.
+
+    Examples:
+      dataplicity user-impact list
+      dataplicity user-impact list --unresolved-only
+    """
+    params: Dict[str, Any] = {"page_size": page_size}
+    if unresolved_only:
+        params["resolved"] = "false"
+    _list_resource(_ctx(ctx), endpoint="/api/developer/user-impact/", title="User impact", params=params)
+
+
+@user_impact_app.command("show")
+def user_impact_show(ctx: typer.Context, impact_id: str = typer.Argument(...)) -> None:
+    """Show a user impact item.
+
+    Examples:
+      dataplicity user-impact show <impact-id>
+    """
+    _show_resource(_ctx(ctx), endpoint="/api/developer/user-impact/", resource_id=impact_id, not_found_label="user impact item")
+
+
+@heartbeat_monitors_app.command("list")
+def heartbeat_monitors_list(
+    ctx: typer.Context,
+    page_size: int = typer.Option(100, "--page-size", help="Page size"),
+    search: Optional[str] = typer.Option(None, "--search", help="Search term"),
+) -> None:
+    """List heartbeat monitors.
+
+    Examples:
+      dataplicity heartbeat-monitors list
+      dataplicity heartbeat-monitors list --search cron
+    """
+    params: Dict[str, Any] = {"page_size": page_size}
+    if search:
+        params["search"] = search
+    _list_resource(_ctx(ctx), endpoint="/api/developer/heartbeat-monitors/", title="Heartbeat monitors", params=params)
+
+
+@heartbeat_monitors_app.command("show")
+def heartbeat_monitors_show(ctx: typer.Context, monitor_id: str = typer.Argument(...)) -> None:
+    """Show a heartbeat monitor.
+
+    Examples:
+      dataplicity heartbeat-monitors show <monitor-id>
+    """
+    _show_resource(
+        _ctx(ctx),
+        endpoint="/api/developer/heartbeat-monitors/",
+        resource_id=monitor_id,
+        not_found_label="heartbeat monitor",
+    )
+
+
+@heartbeat_monitors_app.command("create")
+def heartbeat_monitors_create(
+    ctx: typer.Context,
+    data: str = typer.Option(..., "--data", help="JSON payload"),
+) -> None:
+    """Create a heartbeat monitor.
+
+    Examples:
+      dataplicity heartbeat-monitors create --data '{"name":"daily-job","interval_seconds":86400}'
+    """
+    _create_resource(_ctx(ctx), endpoint="/api/developer/heartbeat-monitors/", data=data, label="heartbeat monitor")
+
+
+@heartbeat_monitors_app.command("delete")
+def heartbeat_monitors_delete(ctx: typer.Context, monitor_id: str = typer.Argument(...)) -> None:
+    """Delete a heartbeat monitor.
+
+    Examples:
+      dataplicity heartbeat-monitors delete <monitor-id>
+    """
+    _delete_resource(_ctx(ctx), endpoint="/api/developer/heartbeat-monitors/", resource_id=monitor_id, label="heartbeat monitor")
+
+
+@fleet_jobs_app.command("list")
+def fleet_jobs_list(
+    ctx: typer.Context,
+    page_size: int = typer.Option(100, "--page-size", help="Page size"),
+    status: Optional[str] = typer.Option(None, "--status", help="Filter by status"),
+) -> None:
+    """List fleet jobs.
+
+    Examples:
+      dataplicity fleet-jobs list
+      dataplicity fleet-jobs list --status running
+    """
+    params: Dict[str, Any] = {"page_size": page_size}
+    if status:
+        params["status"] = status
+    _list_resource(_ctx(ctx), endpoint="/api/developer/fleet-jobs/", title="Fleet jobs", params=params)
+
+
+@fleet_jobs_app.command("show")
+def fleet_jobs_show(ctx: typer.Context, job_id: str = typer.Argument(...)) -> None:
+    """Show a fleet job.
+
+    Examples:
+      dataplicity fleet-jobs show <job-id>
+    """
+    _show_resource(_ctx(ctx), endpoint="/api/developer/fleet-jobs/", resource_id=job_id, not_found_label="fleet job")
+
+
+@fleet_jobs_app.command("run")
+def fleet_jobs_run(
+    ctx: typer.Context,
+    data: str = typer.Option(..., "--data", help="JSON payload"),
+) -> None:
+    """Create and start a fleet job.
+
+    Examples:
+      dataplicity fleet-jobs run --data '{"name":"restart-edge","device_hashes":["abc123"],"command":"restart"}'
+    """
+    _create_resource(_ctx(ctx), endpoint="/api/developer/fleet-jobs/", data=data, label="fleet job")
+
+
+@fleet_jobs_app.command("cancel")
+def fleet_jobs_cancel(ctx: typer.Context, job_id: str = typer.Argument(...)) -> None:
+    """Cancel a fleet job.
+
+    Examples:
+      dataplicity fleet-jobs cancel <job-id>
+    """
+    state = _ctx(ctx)
+    _require_auth(state)
+    response = state.api.post(f"/api/developer/fleet-jobs/{job_id}/cancel/")
+    if not response.ok:
+        message = _friendly_response_message("Unable to cancel fleet job.", response.data, response.text)
+        if state.json_output:
+            _print_json({"ok": False, "detail": message})
+        else:
+            _show_error(state.console, message)
+        raise typer.Exit(code=1)
+    if state.json_output:
+        _print_json(response.data if response.data is not None else {"ok": True})
+    else:
+        state.console.print("[green]Fleet job cancellation requested.[/green]")
+
+
+@logging_app.command("list")
+def logging_list(
+    ctx: typer.Context,
+    page_size: int = typer.Option(100, "--page-size", help="Page size"),
+    device_hash: Optional[str] = typer.Option(None, "--device", help="Filter by device hash"),
+    level: Optional[str] = typer.Option(None, "--level", help="Filter by log level"),
+) -> None:
+    """List log events.
+
+    Examples:
+      dataplicity logging list
+      dataplicity logging list --device <device-hash> --level error
+    """
+    params: Dict[str, Any] = {"page_size": page_size}
+    if device_hash:
+        params["device"] = device_hash
+    if level:
+        params["level"] = level
+    _list_resource(_ctx(ctx), endpoint="/api/developer/logging/", title="Logging", params=params)
+
+
+@logging_app.command("show")
+def logging_show(ctx: typer.Context, log_id: str = typer.Argument(...)) -> None:
+    """Show a single log event.
+
+    Examples:
+      dataplicity logging show <log-id>
+    """
+    _show_resource(_ctx(ctx), endpoint="/api/developer/logging/", resource_id=log_id, not_found_label="log event")
 
 
 @api_app.command("get")
