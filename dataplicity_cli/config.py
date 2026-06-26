@@ -11,7 +11,10 @@ try:
 except Exception:  # pragma: no cover
     user_config_dir = None
 
-DEFAULT_BASE_URL = "https://api.prelude.dataplicity.com"
+DEFAULT_BASE_URL = "https://gateway.dataplicity.com"
+LEGACY_DEFAULT_BASE_URLS = {
+    "https://api.prelude.dataplicity.com",
+}
 
 
 def _config_root() -> Path:
@@ -48,8 +51,12 @@ class Config:
             raw = json.loads(path.read_text(encoding="utf-8"))
         except Exception:
             return cls()
+        base_url = raw.get("base_url") or DEFAULT_BASE_URL
+        if base_url in LEGACY_DEFAULT_BASE_URLS:
+            # Seamlessly move older installs onto the public gateway host.
+            base_url = DEFAULT_BASE_URL
         return cls(
-            base_url=raw.get("base_url") or DEFAULT_BASE_URL,
+            base_url=base_url,
             auth_method=raw.get("auth_method"),
             access_token=raw.get("access_token"),
             refresh_token=raw.get("refresh_token"),
