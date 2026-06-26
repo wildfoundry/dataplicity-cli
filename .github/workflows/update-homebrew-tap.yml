@@ -51,12 +51,13 @@ jobs:
       - name: Download release asset
         id: asset
         env:
-          ASSET_URL: ${{ steps.release.outputs.asset_url }}
           ASSET_NAME: ${{ steps.release.outputs.asset_name }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
-          curl -fL "${ASSET_URL}" -o "${ASSET_NAME}"
+          gh release download "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" --pattern "${ASSET_NAME}" --clobber
           SHA="$(sha256sum "${ASSET_NAME}" | awk '{print $1}')"
           echo "sha=${SHA}" >>"${GITHUB_OUTPUT}"
 
