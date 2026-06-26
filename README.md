@@ -147,3 +147,9 @@ dataplicity --install-completion zsh
 - Secrets are never printed to stdout.
 - `--json` outputs raw response data where available.
 - The CLI is designed for OEM/developer access, not end users.
+
+## Maintainers
+
+- Releases publish a macOS tarball (`dataplicity-cli-<version>-macos-universal2.tar.gz`) for Homebrew consumption.
+- The `Update Homebrew tap` workflow opens a PR in `wildfoundry/homebrew-tap` after each published release.
+- Configure a repository secret named `HOMEBREW_TAP_TOKEN` (PAT with repo write access to `wildfoundry/homebrew-tap`) to enable that automation.
