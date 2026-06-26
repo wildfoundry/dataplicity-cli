@@ -31,6 +31,12 @@ class SsoAuthFlowTest(unittest.TestCase):
         self.assertIn("foo=bar", url)
         self.assertIn("cli_callback_url=", url)
 
+    def test_with_callback_hint_rewrites_next_target(self) -> None:
+        callback = "http://127.0.0.1:1234/callback"
+        url = _with_callback_hint("https://example.com/sso?next=%2Fafter-login%2F", callback)
+        self.assertIn("next=http%3A%2F%2F127.0.0.1%3A1234%2Fcallback", url)
+        self.assertIn("cli_callback_url=", url)
+
     def test_extract_sso_payload_from_url_reads_query_and_fragment(self) -> None:
         payload = _extract_sso_payload_from_url("https://dataplicity.com/cb?code=abc#state=xyz")
         self.assertEqual(payload, {"code": "abc", "state": "xyz"})
