@@ -151,6 +151,29 @@ def _extract_sso_payload_from_query(query: Dict[str, List[str]]) -> Optional[Dic
     return payload if payload else None
 
 
+def _extract_sso_payload_from_url(url: str) -> Optional[Dict[str, Any]]:
+    parsed = urlparse(url)
+    query_payload = _extract_sso_payload_from_query(parse_qs(parsed.query, keep_blank_values=True))
+    fragment_payload = _extract_sso_payload_from_query(parse_qs(parsed.fragment, keep_blank_values=True))
+    if query_payload and fragment_payload:
+        merged = dict(query_payload)
+        merged.update(fragment_payload)
+        return merged
+    return query_payload or fragment_payload
+
+
+def _parse_sso_user_artifact(raw: str) -> Optional[Dict[str, Any]]:
+    text = raw.strip()
+    if not text:
+        return None
+    payload = _decode_json_payload(text)
+    if payload:
+        return payload
+    if text.startswith("http://") or text.startswith("https://"):
+        return _extract_sso_payload_from_url(text)
+    return _extract_sso_payload_from_query(parse_qs(text, keep_blank_values=True))
+
+
 def _with_callback_hint(url: str, callback_url: str) -> str:
     parsed = urlparse(url)
     query = parse_qs(parsed.query, keep_blank_values=True)
@@ -273,7 +296,6 @@ def _attempt_sso_auto_complete(
     timeout_seconds: int,
 ) -> bool:
     deadline = time.monotonic() + max(timeout_seconds, 1)
-    unauthenticated_polls = 0
     while time.monotonic() < deadline:
         if listener:
             payload = listener.wait_for_payload(timeout_seconds=1.0)
@@ -285,12 +307,6 @@ def _attempt_sso_auto_complete(
         response = state.api.get("/api/auth/sso/complete/")
         if response.ok and _apply_tokens_or_none(state, response.data):
             return True
-        if response.status_code in {401, 403, 404}:
-            unauthenticated_polls += 1
-            if unauthenticated_polls >= 3:
-                break
-        else:
-            unauthenticated_polls = 0
         time.sleep(1.0)
     return False
 
@@ -793,14 +809,14 @@ def auth_sso(
     state.console.print("[yellow]Automatic callback did not complete in time.[/yellow]")
     state.console.print("Complete SSO in your browser, then open:")
     state.console.print(f"[blue]{sso_complete_url}[/blue]")
-    state.console.print("Paste the JSON payload below.")
+    state.console.print("Paste either the final browser URL, query string, or JSON payload below.")
 
-    raw = typer.prompt("SSO JSON")
-    payload = _decode_json_payload(raw)
+    raw = typer.prompt("SSO response")
+    payload = _parse_sso_user_artifact(raw)
     if payload is None:
-        _show_error(state.console, "Invalid JSON payload.")
+        _show_error(state.console, "Could not parse SSO response.")
         raise typer.Exit(code=1)
-    if not _apply_tokens_or_none(state, payload):
+    if not _apply_tokens_or_none(state, payload) and not _try_complete_sso_from_code(state, payload):
         _show_error(state.console, "No access token found in payload.")
         raise typer.Exit(code=1)
     state.console.print("[green]SSO login complete.[/green]")
