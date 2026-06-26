@@ -21,7 +21,6 @@ from rich.table import Table
 from .api import ApiClient
 from .config import Config, default_config_path
 from .m2m import M2MClient
-from .remote_access import run_port_forward, run_remote_file, run_terminal_session
 
 
 app = typer.Typer(
@@ -1101,6 +1100,8 @@ def devices_terminal(ctx: typer.Context, device_hash: Optional[str] = typer.Argu
     resolved_hash = _resolve_device_hash_interactive(state, device_hash, action_name="terminal")
 
     async def runner() -> None:
+        from .remote_access import run_terminal_session
+
         ws_url = await _resolve_m2m_url(state, resolved_hash)
         m2m = M2MClient(ws_url)
         await m2m.connect()
@@ -1144,6 +1145,8 @@ def devices_port_forward(
     resolved_hash = _resolve_device_hash_interactive(state, device_hash, action_name="port-forward")
 
     async def runner() -> None:
+        from .remote_access import run_port_forward
+
         ws_url = await _resolve_m2m_url(state, resolved_hash)
         m2m = M2MClient(ws_url)
         await m2m.connect()
@@ -1212,6 +1215,8 @@ def devices_remote_file(
     resolved_hash = _resolve_device_hash_interactive(state, device_hash, action_name="remote-file")
 
     async def runner() -> int:
+        from .remote_access import run_remote_file
+
         ws_url = await _resolve_m2m_url(state, resolved_hash)
         m2m = M2MClient(ws_url)
         await m2m.connect()
