@@ -6,8 +6,10 @@ from urllib.request import urlopen
 from dataplicity_cli.cli import (
     _SsoCallbackListener,
     _coerce_timeout_seconds,
+    _extract_sso_payload_from_url,
     _extract_sso_payload_from_query,
     _extract_sso_tokens,
+    _parse_sso_user_artifact,
     _with_callback_hint,
 )
 
@@ -29,6 +31,10 @@ class SsoAuthFlowTest(unittest.TestCase):
         self.assertIn("foo=bar", url)
         self.assertIn("cli_callback_url=", url)
 
+    def test_extract_sso_payload_from_url_reads_query_and_fragment(self) -> None:
+        payload = _extract_sso_payload_from_url("https://dataplicity.com/cb?code=abc#state=xyz")
+        self.assertEqual(payload, {"code": "abc", "state": "xyz"})
+
     def test_callback_listener_captures_query_payload(self) -> None:
         listener = _SsoCallbackListener()
         started = listener.start()
@@ -47,6 +53,12 @@ class SsoAuthFlowTest(unittest.TestCase):
         self.assertEqual(_coerce_timeout_seconds("45"), 45)
         self.assertEqual(_coerce_timeout_seconds(0), 1)
         self.assertEqual(_coerce_timeout_seconds(object()), 180)
+
+    def test_parse_sso_user_artifact_supports_url_and_query(self) -> None:
+        url_payload = _parse_sso_user_artifact("https://dataplicity.com/callback?code=abc&state=xyz")
+        self.assertEqual(url_payload, {"code": "abc", "state": "xyz"})
+        query_payload = _parse_sso_user_artifact("access=tok123&refresh=ref456")
+        self.assertEqual(query_payload, {"access": "tok123", "refresh": "ref456"})
 
 
 if __name__ == "__main__":
