@@ -1308,6 +1308,81 @@ def devices_connect(ctx: typer.Context, device_hash: Optional[str] = typer.Argum
     devices_terminal(ctx, device_hash=device_hash)
 
 
+@devices_app.command("run")
+def devices_run(
+    ctx: typer.Context,
+    device_hash: Optional[str] = typer.Argument(None),
+    command: str = typer.Option(..., "--command", "-c", help="Single shell command to run"),
+    timeout: int = typer.Option(30, "--timeout", min=1, help="Seconds before command times out"),
+    no_timeout: bool = typer.Option(
+        False,
+        "--no-timeout",
+        help="Disable timeout and wait until command completes",
+    ),
+) -> None:
+    """Run a single command on a device and print output.
+
+    Examples:
+      dataplicity devices run --command "uname -a"
+      dataplicity devices run <device-hash> --command "systemctl status dataplicity"
+      dataplicity devices run <device-hash> --command "tail -f /var/log/syslog" --no-timeout
+    """
+    state = _ctx(ctx)
+    _require_auth(state)
+    resolved_hash = _resolve_device_hash_interactive(state, device_hash, action_name="run command")
+    timeout_seconds: Optional[float] = None if no_timeout else float(timeout)
+
+    async def runner() -> str:
+        from .remote_access import run_single_command
+
+        ws_url = await _resolve_m2m_url(state, resolved_hash)
+        m2m = M2MClient(ws_url)
+        await m2m.connect()
+        try:
+            identity = await m2m.wait_for_identity()
+            response = state.api.post(
+                f"/api/developer/devices/{resolved_hash}/ports/",
+                json_data={"m2m_identity": identity, "service": "terminal"},
+            )
+            if not response.ok:
+                raise RuntimeError(response.text or "Unable to open terminal")
+            channel_port = await m2m.wait_for_channel_open()
+            output_bytes = await run_single_command(
+                m2m,
+                channel_port,
+                command,
+                timeout_seconds=timeout_seconds,
+            )
+            return output_bytes.decode("utf-8", "replace")
+        finally:
+            await m2m.close()
+
+    try:
+        output = asyncio.run(runner())
+    except Exception as exc:
+        message = str(exc) or "Remote command failed"
+        if state.json_output:
+            _print_json({"ok": False, "detail": message})
+        else:
+            _show_error(state.console, message)
+        raise typer.Exit(code=1)
+
+    if state.json_output:
+        _print_json(
+            {
+                "ok": True,
+                "device_hash": resolved_hash,
+                "command": command,
+                "timeout": None if no_timeout else timeout,
+                "output": output,
+            }
+        )
+    else:
+        sys.stdout.write(output)
+        if output and not output.endswith("\n"):
+            sys.stdout.write("\n")
+
+
 @app.command("ls")
 def top_level_ls(
     ctx: typer.Context,
