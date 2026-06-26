@@ -153,3 +153,6 @@ dataplicity --install-completion zsh
 - Releases publish a macOS tarball (`dataplicity-cli-<version>-macos-universal2.tar.gz`) for Homebrew consumption.
 - The `Update Homebrew tap` workflow opens a PR in `wildfoundry/homebrew-tap` after each published release.
 - Configure a repository secret named `HOMEBREW_TAP_TOKEN` (PAT with repo write access to `wildfoundry/homebrew-tap`) to enable that automation.
+- The `Update WinGet package` workflow publishes new `.msi` releases to WinGet using `Wildfoundry.DataplicityCLI`.
+- Configure a repository secret named `WINGET_TOKEN` (classic PAT with `public_repo`) and ensure your account has a fork of `microsoft/winget-pkgs`.
+- WinGet automation updates existing manifests; if this package is not yet in WinGet, submit the first manifest manually, then subsequent releases are automated.
