@@ -18,6 +18,7 @@ from rich.console import Console
 from rich.prompt import Prompt
 from rich.table import Table
 
+from . import __version__
 from .api import ApiClient
 from .config import Config, default_config_path
 from .m2m import M2MClient
@@ -72,6 +73,12 @@ def _ctx(ctx: typer.Context) -> AppContext:
     if not ctx.obj:
         raise typer.Exit(code=1)
     return ctx.obj
+
+
+def _version_callback(value: bool) -> None:
+    if value:
+        typer.echo(f"dataplicity-cli {__version__}")
+        raise typer.Exit()
 
 
 SENSITIVE_KEYS = {
@@ -395,10 +402,18 @@ def _resolve_device_hash_interactive(
 @app.callback()
 def main(
     ctx: typer.Context,
+    version: bool = typer.Option(
+        False,
+        "--version",
+        callback=_version_callback,
+        is_eager=True,
+        help="Show CLI version and exit",
+    ),
     json_output: bool = typer.Option(False, "--json", help="Output JSON instead of tables"),
     config_path: Optional[Path] = typer.Option(None, "--config", help="Path to config file"),
     base_url: Optional[str] = typer.Option(None, "--base-url", help="Override API base URL"),
 ) -> None:
+    _ = version
     path = config_path or default_config_path()
     config = Config.load(path)
     if base_url:
