@@ -75,6 +75,11 @@ class CliUxSnapshotsTest(unittest.TestCase):
         for snippet in expected_snippets:
             self.assertIn(snippet, result.output)
 
+    def test_version_flag_snapshot(self) -> None:
+        result = self._invoke(["--version"])
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+        self.assertEqual(result.output.strip(), "dataplicity-cli 0.1.4")
+
     def test_auth_required_message_snapshot_json(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = Path(temp_dir) / "cli.json"

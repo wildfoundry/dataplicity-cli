@@ -18,6 +18,7 @@ from rich.console import Console
 from rich.prompt import Prompt
 from rich.table import Table
 
+from . import __version__
 from .api import ApiClient
 from .config import Config, default_config_path
 from .m2m import M2MClient
@@ -72,6 +73,12 @@ def _ctx(ctx: typer.Context) -> AppContext:
     if not ctx.obj:
         raise typer.Exit(code=1)
     return ctx.obj
+
+
+def _version_callback(value: bool) -> None:
+    if value:
+        typer.echo(f"dataplicity-cli {__version__}")
+        raise typer.Exit()
 
 
 SENSITIVE_KEYS = {
@@ -288,6 +295,14 @@ def _attempt_sso_auto_complete(
     return False
 
 
+def _coerce_timeout_seconds(value: Any, default: int = 180) -> int:
+    try:
+        timeout = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(timeout, 1)
+
+
 def _friendly_response_message(default_message: str, response_data: Any, response_text: str) -> str:
     if isinstance(response_data, dict):
         detail = response_data.get("detail") or response_data.get("error") or response_data.get("message")
@@ -395,10 +410,18 @@ def _resolve_device_hash_interactive(
 @app.callback()
 def main(
     ctx: typer.Context,
+    version: bool = typer.Option(
+        False,
+        "--version",
+        callback=_version_callback,
+        is_eager=True,
+        help="Show CLI version and exit",
+    ),
     json_output: bool = typer.Option(False, "--json", help="Output JSON instead of tables"),
     config_path: Optional[Path] = typer.Option(None, "--config", help="Path to config file"),
     base_url: Optional[str] = typer.Option(None, "--base-url", help="Override API base URL"),
 ) -> None:
+    _ = version
     path = config_path or default_config_path()
     config = Config.load(path)
     if base_url:
@@ -704,6 +727,7 @@ def auth_sso(
       dataplicity auth sso --email you@example.com --timeout 300
     """
     state = _ctx(ctx)
+    timeout_seconds = _coerce_timeout_seconds(timeout)
     response = state.api.post("/api/auth/bootstrap/", json_data={"email": email})
     if not response.ok:
         message = _friendly_response_message("Unable to start SSO.", response.data, response.text)
@@ -745,7 +769,7 @@ def auth_sso(
     if not state.json_output:
         state.console.print("Waiting for browser sign-in to complete...")
     try:
-        if _attempt_sso_auto_complete(state, listener, timeout_seconds=timeout):
+        if _attempt_sso_auto_complete(state, listener, timeout_seconds=timeout_seconds):
             if state.json_output:
                 _print_json({"ok": True, "detail": "SSO login complete"})
             else:

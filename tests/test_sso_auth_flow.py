@@ -5,6 +5,7 @@ from urllib.request import urlopen
 
 from dataplicity_cli.cli import (
     _SsoCallbackListener,
+    _coerce_timeout_seconds,
     _extract_sso_payload_from_query,
     _extract_sso_tokens,
     _with_callback_hint,
@@ -40,6 +41,12 @@ class SsoAuthFlowTest(unittest.TestCase):
             self.assertEqual(payload, {"access": "abc", "refresh": "def"})
         finally:
             listener.stop()
+
+    def test_coerce_timeout_seconds_handles_invalid_values(self) -> None:
+        self.assertEqual(_coerce_timeout_seconds(30), 30)
+        self.assertEqual(_coerce_timeout_seconds("45"), 45)
+        self.assertEqual(_coerce_timeout_seconds(0), 1)
+        self.assertEqual(_coerce_timeout_seconds(object()), 180)
 
 
 if __name__ == "__main__":
