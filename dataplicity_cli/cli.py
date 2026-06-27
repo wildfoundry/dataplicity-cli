@@ -31,6 +31,7 @@ from .m2m import M2MClient
 
 app = typer.Typer(
     add_completion=True,
+    invoke_without_command=True,
     help=(
         "Dataplicity CLI\n\n"
         "Fast access to auth, devices, and remote operations.\n"
@@ -955,6 +956,10 @@ def _device_name(device: Dict[str, Any]) -> str:
     return str(device.get("name") or "").strip()
 
 
+def _device_is_online(device: Dict[str, Any]) -> bool:
+    return str(device.get("status") or "").strip().lower() == "online"
+
+
 def _resolve_device_hash_interactive(
     state: AppContext,
     provided_hash: Optional[str],
@@ -980,7 +985,7 @@ def _resolve_device_hash_interactive(
     devices = sorted(
         devices,
         key=lambda d: (
-            not bool(d.get("online")),
+            not _device_is_online(d),
             str(d.get("name") or "").lower(),
             _device_hash(d).lower(),
         ),
@@ -995,7 +1000,7 @@ def _resolve_device_hash_interactive(
             str(index),
             _device_hash(device),
             _device_name(device),
-            "yes" if bool(device.get("online")) else "no",
+            "yes" if _device_is_online(device) else "no",
         )
     state.console.print(table)
     state.console.print("Tip: pass a device hash directly to skip this prompt.")
@@ -1115,13 +1120,11 @@ def whoami(ctx: typer.Context) -> None:
     display_ports = sorted(port for port in (profile_ports or []) if port != -1)
     orgs = _extract_orgs(org_response.data or []) if org_response.ok else []
     devices = _extract_devices(devices_response.data or []) if devices_response.ok else []
-    online_count = sum(1 for device in devices if bool(device.get("online")))
     payload = {
         "base_url": state.config.base_url,
         "auth_method": state.config.auth_method,
         "organisation": orgs[0] if orgs else None,
         "devices_total": len(devices),
-        "devices_online": online_count,
         "port_forwarding_ports": [-1] if profile_all_ports else display_ports,
     }
     if state.json_output:
@@ -1136,7 +1139,7 @@ def whoami(ctx: typer.Context) -> None:
         org = orgs[0]
         table.add_row("Organisation", str(org.get("name") or "(unnamed)"))
         table.add_row("Organisation hash", str(org.get("hash_id") or org.get("hash") or ""))
-    table.add_row("Devices", f"{len(devices)} total / {online_count} online")
+    table.add_row("Devices", f"{len(devices)} total")
     if profile_ports is not None:
         if profile_all_ports:
             table.add_row("Port forwarding ports", "all")
@@ -1636,20 +1639,17 @@ def devices_list(
 
     devices = _extract_devices(payload)
 
-    def _is_online(device: Dict[str, Any]) -> bool:
-        return str(device.get("status") or "").strip().lower() == "online"
-
     if online_only:
-        devices = [device for device in devices if _is_online(device)]
+        devices = [device for device in devices if _device_is_online(device)]
     devices = sorted(
         devices,
         key=lambda d: (
-            not _is_online(d),
+            not _device_is_online(d),
             str(d.get("name") or "").lower(),
             _device_hash(d).lower(),
         ),
     )
-    online_count = sum(1 for device in devices if _is_online(device))
+    online_count = sum(1 for device in devices if _device_is_online(device))
 
     table = Table(title="Devices")
     table.add_column("Serial", style="cyan")
@@ -1668,7 +1668,7 @@ def devices_list(
             _device_name(device),
             status,
             device_class,
-            style="green" if _is_online(device) else "",
+            style="green" if _device_is_online(device) else "",
         )
     state.console.print(table)
     state.console.print(f"Showing {len(devices)} devices ({online_count} online).")
