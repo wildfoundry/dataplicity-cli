@@ -1612,7 +1612,7 @@ def devices_provisioning_key(
 
 
 async def _resolve_m2m_url(state: AppContext, device_hash: str) -> str:
-    response = state.api.get(f"/api/developer/devices/{device_hash}/host/")
+    response = state.api.get(f"/api/remote/devices/{device_hash}/host/")
     if not response.ok or not isinstance(response.data, dict):
         detail = _friendly_response_message("Remote Access host lookup failed.", response.data, response.text)
         raise RuntimeError(detail)
@@ -1622,6 +1622,13 @@ async def _resolve_m2m_url(state: AppContext, device_hash: str) -> str:
     ws_base = m2m_url.replace("https://", "wss://").replace("http://", "ws://")
     joiner = "&" if "?" in ws_base else "?"
     return f"{ws_base}{joiner}device={device_hash}"
+
+
+def _open_remote_access_port(state: AppContext, device_hash: str, payload: Dict[str, Any]) -> Any:
+    return state.api.post(
+        f"/api/remote/devices/{device_hash}/ports/",
+        json_data=payload,
+    )
 
 
 @devices_app.command("terminal")
@@ -1643,9 +1650,10 @@ def devices_terminal(ctx: typer.Context, device_hash: Optional[str] = typer.Argu
         m2m = M2MClient(ws_url)
         await m2m.connect()
         identity = await m2m.wait_for_identity()
-        response = state.api.post(
-            f"/api/developer/devices/{resolved_hash}/ports/",
-            json_data={"m2m_identity": identity, "service": "terminal"},
+        response = _open_remote_access_port(
+            state,
+            resolved_hash,
+            {"m2m_identity": identity, "service": "terminal"},
         )
         if not response.ok:
             raise RuntimeError(response.text or "Unable to open terminal")
@@ -1720,9 +1728,10 @@ def devices_port_forward(
         await m2m.connect()
         try:
             identity = await m2m.wait_for_identity()
-            response = state.api.post(
-                f"/api/developer/devices/{resolved_hash}/ports/",
-                json_data={
+            response = _open_remote_access_port(
+                state,
+                resolved_hash,
+                {
                     "m2m_identity": identity,
                     "service": "redirect-port",
                     "port": remote_port,
@@ -1828,9 +1837,10 @@ def devices_remote_file(
         m2m = M2MClient(ws_url)
         await m2m.connect()
         identity = await m2m.wait_for_identity()
-        response = state.api.post(
-            f"/api/developer/devices/{resolved_hash}/ports/",
-            json_data={
+        response = _open_remote_access_port(
+            state,
+            resolved_hash,
+            {
                 "m2m_identity": identity,
                 "service": "remote-file",
                 "path": path,
@@ -1907,9 +1917,10 @@ def devices_run(
         await m2m.connect()
         try:
             identity = await m2m.wait_for_identity()
-            response = state.api.post(
-                f"/api/developer/devices/{resolved_hash}/ports/",
-                json_data={"m2m_identity": identity, "service": "terminal"},
+            response = _open_remote_access_port(
+                state,
+                resolved_hash,
+                {"m2m_identity": identity, "service": "terminal"},
             )
             if not response.ok:
                 raise RuntimeError(response.text or "Unable to open terminal")
