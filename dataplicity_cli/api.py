@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 
 import requests
 
@@ -17,9 +17,10 @@ class ApiResponse:
 
 
 class ApiClient:
-    def __init__(self, config: Config) -> None:
+    def __init__(self, config: Config, on_token_update: Optional[Callable[[], None]] = None) -> None:
         self.config = config
         self.session = requests.Session()
+        self._on_token_update = on_token_update
 
     def _build_url(self, path: str) -> str:
         if path.startswith("http://") or path.startswith("https://"):
@@ -52,8 +53,21 @@ class ApiClient:
         if not access:
             return False
         self.config.access_token = access
+        refresh = payload.get("refresh")
+        if refresh:
+            self.config.refresh_token = refresh
         self.config.auth_method = "jwt"
+        if self._on_token_update is not None:
+            try:
+                self._on_token_update()
+            except Exception:
+                pass
         return True
+
+    def refresh_session(self) -> bool:
+        if self.config.auth_method != "jwt":
+            return False
+        return self._refresh_access_token()
 
     def request(
         self,

@@ -781,7 +781,10 @@ def main(
     if base_url:
         config.base_url = base_url.rstrip("/")
     console = Console()
-    ctx.obj = AppContext(config=config, config_path=path, console=console, json_output=json_output, api=ApiClient(config))
+    api_client = ApiClient(config, on_token_update=lambda: config.save(path))
+    if config.auth_method == "jwt" and config.refresh_token:
+        api_client.refresh_session()
+    ctx.obj = AppContext(config=config, config_path=path, console=console, json_output=json_output, api=api_client)
 
 
 @app.command("setup")
@@ -1320,35 +1323,40 @@ def devices_list(
         return
 
     devices = _extract_devices(payload)
+
+    def _is_online(device: Dict[str, Any]) -> bool:
+        return str(device.get("status") or "").strip().lower() == "online"
+
     if online_only:
-        devices = [device for device in devices if bool(device.get("online"))]
+        devices = [device for device in devices if _is_online(device)]
     devices = sorted(
         devices,
         key=lambda d: (
-            not bool(d.get("online")),
+            not _is_online(d),
             str(d.get("name") or "").lower(),
             _device_hash(d).lower(),
         ),
     )
-    online_count = sum(1 for device in devices if bool(device.get("online")))
+    online_count = sum(1 for device in devices if _is_online(device))
 
     table = Table(title="Devices")
     table.add_column("Serial", style="cyan")
     table.add_column("Name", style="bold")
     table.add_column("Status")
-    table.add_column("Online")
     table.add_column("Class")
-    table.add_column("Network")
     for device in devices:
-        online = bool(device.get("online"))
+        status = str(device.get("status") or "").strip()
+        device_class = (
+            str((device.get("device_class") or {}).get("name") or "").strip()
+            if isinstance(device.get("device_class"), dict)
+            else ""
+        )
         table.add_row(
             _device_hash(device),
             _device_name(device),
-            str(device.get("status") or ""),
-            "yes" if online else "no",
-            str(device.get("device_class_name") or ""),
-            str(device.get("network_name") or ""),
-            style="green" if online else "",
+            status,
+            device_class,
+            style="green" if _is_online(device) else "",
         )
     state.console.print(table)
     state.console.print(f"Showing {len(devices)} devices ({online_count} online).")
