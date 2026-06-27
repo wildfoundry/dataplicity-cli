@@ -117,6 +117,8 @@ class ApiClient:
         except Exception:
             payload = None
         ok = 200 <= resp.status_code < 300
+        if not ok and not text:
+            text = f"HTTP {resp.status_code}"
         return ApiResponse(ok, resp.status_code, payload, text)
 
     def get(self, path: str, *, params: Optional[Dict[str, Any]] = None) -> ApiResponse:

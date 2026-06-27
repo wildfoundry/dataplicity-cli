@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import select
 import sys
 import termios
 import time
@@ -64,10 +65,14 @@ async def run_terminal_session(m2m: M2MClient, port: int) -> None:
     queue = m2m.channel_queue(port)
     stdin_fd = sys.stdin.fileno()
     stdout_fd = sys.stdout.fileno()
+    stop_event = asyncio.Event()
 
     async def stdin_loop() -> None:
-        while True:
-            data = await asyncio.to_thread(os.read, stdin_fd, 1024)
+        while not stop_event.is_set():
+            ready, _, _ = await asyncio.to_thread(select.select, [stdin_fd], [], [], 0.1)
+            if not ready:
+                continue
+            data = os.read(stdin_fd, 1024)
             if not data:
                 break
             await m2m.send_route(port, data)
@@ -76,11 +81,22 @@ async def run_terminal_session(m2m: M2MClient, port: int) -> None:
         while True:
             data = await queue.get()
             if data is None:
+                stop_event.set()
                 break
             os.write(stdout_fd, data)
 
     with RawTerminal():
-        await asyncio.gather(stdin_loop(), stdout_loop())
+        stdin_task = asyncio.create_task(stdin_loop())
+        stdout_task = asyncio.create_task(stdout_loop())
+        done, pending = await asyncio.wait(
+            {stdin_task, stdout_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if stdout_task in done:
+            stop_event.set()
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(stdin_task, stdout_task, return_exceptions=True)
 
 
 async def run_single_command(

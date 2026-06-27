@@ -6,6 +6,7 @@ import html
 import json
 import queue
 import re
+import shlex
 import sys
 import threading
 import time
@@ -51,6 +52,7 @@ user_impact_app = typer.Typer(help="User impact commands")
 heartbeat_monitors_app = typer.Typer(help="Heartbeat monitor commands")
 fleet_jobs_app = typer.Typer(help="Fleet job commands")
 logging_app = typer.Typer(help="Logging commands", no_args_is_help=True)
+_EMBEDDED_SHELL_DISPATCH = False
 
 LOGGING_MAX_OUTPUT_ITEMS = 200
 LOGGING_MAX_FIELD_CHARS = 2000
@@ -80,6 +82,115 @@ def _ctx(ctx: typer.Context) -> AppContext:
     if not ctx.obj:
         raise typer.Exit(code=1)
     return ctx.obj
+
+
+def _embedded_shell_command_tree() -> Dict[str, List[str]]:
+    top_level: Set[str] = {"help", "exit", "quit"}
+    grouped: Dict[str, List[str]] = {}
+    for command in app.registered_commands:
+        if command.name:
+            top_level.add(command.name)
+    for group in app.registered_groups:
+        if not group.name:
+            continue
+        top_level.add(group.name)
+        grouped[group.name] = sorted(
+            {
+                command.name
+                for command in group.typer_instance.registered_commands
+                if command.name
+            }
+        )
+    grouped["__top__"] = sorted(top_level)
+    return grouped
+
+
+def _run_embedded_shell(state: AppContext) -> None:
+    try:
+        import readline  # type: ignore
+    except Exception:  # pragma: no cover - platform dependent
+        readline = None
+    command_tree = _embedded_shell_command_tree()
+    global_options = ["--help", "--version", "--json", "--config", "--base-url"]
+    top_level = sorted(set(command_tree.get("__top__", [])) | set(global_options))
+
+    if readline is not None:
+        def completer(text: str, state_index: int) -> Optional[str]:
+            buffer = readline.get_line_buffer()
+            end_index = readline.get_endidx()
+            prefix = buffer[:end_index]
+            at_token_boundary = prefix.endswith((" ", "\t"))
+            try:
+                tokens = shlex.split(prefix)
+            except ValueError:
+                tokens = prefix.split()
+
+            candidates: List[str] = []
+            if not tokens:
+                candidates = top_level
+            elif len(tokens) == 1:
+                first = tokens[0]
+                if at_token_boundary and first in command_tree:
+                    candidates = command_tree[first]
+                elif at_token_boundary and first.startswith("-"):
+                    candidates = global_options
+                else:
+                    candidates = [item for item in top_level if item.startswith(first)]
+            elif tokens and tokens[0] in command_tree:
+                if len(tokens) == 2 and not at_token_boundary:
+                    second = tokens[1]
+                    candidates = [item for item in command_tree[tokens[0]] if item.startswith(second)]
+                elif len(tokens) == 2 and at_token_boundary:
+                    candidates = command_tree[tokens[0]]
+
+            if state_index < len(candidates):
+                return candidates[state_index]
+            return None
+
+        readline.set_completer(completer)
+        readline.parse_and_bind("tab: complete")
+
+    state.console.print("[bold]Dataplicity interactive shell[/bold]")
+    state.console.print("Type [cyan]help[/cyan] for usage, [cyan]exit[/cyan] to quit.")
+
+    while True:
+        try:
+            raw = input("dataplicity> ").strip()
+        except EOFError:
+            state.console.print()
+            break
+        except KeyboardInterrupt:
+            state.console.print()
+            continue
+
+        if not raw:
+            continue
+        if raw in {"exit", "quit"}:
+            break
+        if raw in {"help", "?"}:
+            raw = "--help"
+
+        try:
+            args = shlex.split(raw)
+        except ValueError as exc:
+            _show_error(state.console, f"Unable to parse command: {exc}")
+            continue
+
+        if args and args[0] == "dataplicity":
+            args = args[1:]
+        if not args:
+            continue
+
+        global _EMBEDDED_SHELL_DISPATCH
+        _EMBEDDED_SHELL_DISPATCH = True
+        try:
+            app(args=args, prog_name="dataplicity", standalone_mode=False)
+        except typer.Exit:
+            pass
+        except Exception as exc:
+            _show_error(state.console, str(exc))
+        finally:
+            _EMBEDDED_SHELL_DISPATCH = False
 
 
 def _version_callback(value: bool) -> None:
@@ -924,6 +1035,16 @@ def main(
     if config.auth_method == "jwt" and config.refresh_token:
         api_client.refresh_session()
     ctx.obj = AppContext(config=config, config_path=path, console=console, json_output=json_output, api=api_client)
+    if (
+        not _EMBEDDED_SHELL_DISPATCH
+        and ctx.invoked_subcommand is None
+        and not json_output
+        and len(sys.argv) == 1
+        and sys.stdin.isatty()
+        and sys.stdout.isatty()
+    ):
+        _run_embedded_shell(ctx.obj)
+        raise typer.Exit(code=0)
 
 
 @app.command("setup")
@@ -1384,6 +1505,58 @@ def _extract_orgs(payload: Any) -> List[Dict[str, Any]]:
             if isinstance(items, list):
                 return [item for item in items if isinstance(item, dict)]
     return []
+
+
+def _resolve_primary_org_hash(state: AppContext) -> str:
+    _require_auth(state)
+    response = state.api.get("/api/v1/organisations/")
+    if response.ok:
+        orgs = _extract_orgs(response.data or [])
+        if orgs:
+            org = orgs[0]
+            org_hash = str(org.get("hash_id") or org.get("hash") or "").strip()
+            if org_hash:
+                return org_hash
+    devices_response = state.api.get("/api/developer/devices/", params={"page_size": 1})
+    if devices_response.ok:
+        devices = _extract_objects(devices_response.data or [])
+        if devices:
+            org_hash = str(devices[0].get("organisation_hash") or "").strip()
+            if org_hash:
+                return org_hash
+    if not response.ok:
+        message = _friendly_response_message("Unable to fetch organisation.", response.data, response.text)
+        if state.json_output:
+            _print_json({"ok": False, "detail": message})
+        else:
+            _show_error(state.console, message)
+        raise typer.Exit(code=1)
+    message = "No organisation found for this user."
+    if state.json_output:
+        _print_json({"ok": False, "detail": message})
+    else:
+        _show_error(state.console, message)
+    raise typer.Exit(code=2)
+
+
+def _statuspages_endpoint(state: AppContext, resource: str) -> str:
+    org_hash = _resolve_primary_org_hash(state)
+    suffix = resource.strip("/")
+    return f"/api/organisations/{org_hash}/statuspages/{suffix}/"
+
+
+def _resolve_monitor_collection_endpoint(state: AppContext, *, statuspages_resource: str, legacy_endpoint: str) -> str:
+    candidates: List[str] = []
+    try:
+        candidates.append(_statuspages_endpoint(state, statuspages_resource))
+    except typer.Exit:
+        pass
+    candidates.append(legacy_endpoint)
+    for endpoint in candidates:
+        probe = state.api.get(endpoint, params={"page_size": 1})
+        if probe.status_code != 404:
+            return endpoint
+    return candidates[0]
 
 
 @orgs_app.command("show")
@@ -2040,7 +2213,7 @@ def _resource_key(item: Dict[str, Any]) -> str:
 
 
 def _resource_name(item: Dict[str, Any]) -> str:
-    for key in ("name", "title", "label", "endpoint"):
+    for key in ("name", "title", "label", "endpoint", "url"):
         value = item.get(key)
         if value is not None:
             text = str(value).strip()
@@ -2050,7 +2223,7 @@ def _resource_name(item: Dict[str, Any]) -> str:
 
 
 def _resource_status(item: Dict[str, Any]) -> str:
-    for key in ("status", "state", "health", "severity"):
+    for key in ("status", "state", "health", "severity", "last_status"):
         value = item.get(key)
         if value is not None:
             text = str(value).strip()
@@ -2173,7 +2346,13 @@ def endpoint_monitors_list(
     params: Dict[str, Any] = {"page_size": page_size}
     if search:
         params["search"] = search
-    _list_resource(_ctx(ctx), endpoint="/api/developer/endpoint-monitors/", title="Endpoint monitors", params=params)
+    state = _ctx(ctx)
+    endpoint = _resolve_monitor_collection_endpoint(
+        state,
+        statuspages_resource="status-endpoints",
+        legacy_endpoint="/api/developer/endpoint-monitors/",
+    )
+    _list_resource(state, endpoint=endpoint, title="Endpoint monitors", params=params)
 
 
 @endpoint_monitors_app.command("show")
@@ -2183,7 +2362,13 @@ def endpoint_monitors_show(ctx: typer.Context, monitor_id: str = typer.Argument(
     Examples:
       dataplicity endpoint-monitors show <monitor-id>
     """
-    _show_resource(_ctx(ctx), endpoint="/api/developer/endpoint-monitors/", resource_id=monitor_id, not_found_label="endpoint monitor")
+    state = _ctx(ctx)
+    endpoint = _resolve_monitor_collection_endpoint(
+        state,
+        statuspages_resource="status-endpoints",
+        legacy_endpoint="/api/developer/endpoint-monitors/",
+    )
+    _show_resource(state, endpoint=endpoint, resource_id=monitor_id, not_found_label="endpoint monitor")
 
 
 @endpoint_monitors_app.command("create")
@@ -2196,7 +2381,13 @@ def endpoint_monitors_create(
     Examples:
       dataplicity endpoint-monitors create --data '{"name":"api-check","url":"https://example.com/health"}'
     """
-    _create_resource(_ctx(ctx), endpoint="/api/developer/endpoint-monitors/", data=data, label="endpoint monitor")
+    state = _ctx(ctx)
+    endpoint = _resolve_monitor_collection_endpoint(
+        state,
+        statuspages_resource="status-endpoints",
+        legacy_endpoint="/api/developer/endpoint-monitors/",
+    )
+    _create_resource(state, endpoint=endpoint, data=data, label="endpoint monitor")
 
 
 @endpoint_monitors_app.command("delete")
@@ -2206,7 +2397,13 @@ def endpoint_monitors_delete(ctx: typer.Context, monitor_id: str = typer.Argumen
     Examples:
       dataplicity endpoint-monitors delete <monitor-id>
     """
-    _delete_resource(_ctx(ctx), endpoint="/api/developer/endpoint-monitors/", resource_id=monitor_id, label="endpoint monitor")
+    state = _ctx(ctx)
+    endpoint = _resolve_monitor_collection_endpoint(
+        state,
+        statuspages_resource="status-endpoints",
+        legacy_endpoint="/api/developer/endpoint-monitors/",
+    )
+    _delete_resource(state, endpoint=endpoint, resource_id=monitor_id, label="endpoint monitor")
 
 
 @user_impact_app.command("list")
@@ -2221,10 +2418,31 @@ def user_impact_list(
       dataplicity user-impact list
       dataplicity user-impact list --unresolved-only
     """
+    state = _ctx(ctx)
+    endpoint = _resolve_monitor_collection_endpoint(
+        state,
+        statuspages_resource="user-impact",
+        legacy_endpoint="/api/developer/user-impact/",
+    )
+    _require_auth(state)
     params: Dict[str, Any] = {"page_size": page_size}
+    response = state.api.get(endpoint, params=params)
+    if not response.ok:
+        message = _friendly_response_message("Unable to list user impact.", response.data, response.text)
+        if state.json_output:
+            _print_json({"ok": False, "detail": message})
+        else:
+            _show_error(state.console, message)
+        raise typer.Exit(code=1)
+    payload = response.data or []
     if unresolved_only:
-        params["resolved"] = "false"
-    _list_resource(_ctx(ctx), endpoint="/api/developer/user-impact/", title="User impact", params=params)
+        rows = _extract_objects(payload)
+        unresolved = [row for row in rows if str(row.get("last_error") or "").strip()]
+        payload = unresolved
+    if state.json_output:
+        _print_json(payload)
+        return
+    _render_resource_table(state, "User impact", payload)
 
 
 @user_impact_app.command("show")
@@ -2234,7 +2452,13 @@ def user_impact_show(ctx: typer.Context, impact_id: str = typer.Argument(...)) -
     Examples:
       dataplicity user-impact show <impact-id>
     """
-    _show_resource(_ctx(ctx), endpoint="/api/developer/user-impact/", resource_id=impact_id, not_found_label="user impact item")
+    state = _ctx(ctx)
+    endpoint = _resolve_monitor_collection_endpoint(
+        state,
+        statuspages_resource="user-impact",
+        legacy_endpoint="/api/developer/user-impact/",
+    )
+    _show_resource(state, endpoint=endpoint, resource_id=impact_id, not_found_label="user impact item")
 
 
 @heartbeat_monitors_app.command("list")
@@ -2252,7 +2476,13 @@ def heartbeat_monitors_list(
     params: Dict[str, Any] = {"page_size": page_size}
     if search:
         params["search"] = search
-    _list_resource(_ctx(ctx), endpoint="/api/developer/heartbeat-monitors/", title="Heartbeat monitors", params=params)
+    state = _ctx(ctx)
+    endpoint = _resolve_monitor_collection_endpoint(
+        state,
+        statuspages_resource="heartbeats",
+        legacy_endpoint="/api/developer/heartbeat-monitors/",
+    )
+    _list_resource(state, endpoint=endpoint, title="Heartbeat monitors", params=params)
 
 
 @heartbeat_monitors_app.command("show")
@@ -2262,12 +2492,13 @@ def heartbeat_monitors_show(ctx: typer.Context, monitor_id: str = typer.Argument
     Examples:
       dataplicity heartbeat-monitors show <monitor-id>
     """
-    _show_resource(
-        _ctx(ctx),
-        endpoint="/api/developer/heartbeat-monitors/",
-        resource_id=monitor_id,
-        not_found_label="heartbeat monitor",
+    state = _ctx(ctx)
+    endpoint = _resolve_monitor_collection_endpoint(
+        state,
+        statuspages_resource="heartbeats",
+        legacy_endpoint="/api/developer/heartbeat-monitors/",
     )
+    _show_resource(state, endpoint=endpoint, resource_id=monitor_id, not_found_label="heartbeat monitor")
 
 
 @heartbeat_monitors_app.command("create")
@@ -2280,7 +2511,13 @@ def heartbeat_monitors_create(
     Examples:
       dataplicity heartbeat-monitors create --data '{"name":"daily-job","interval_seconds":86400}'
     """
-    _create_resource(_ctx(ctx), endpoint="/api/developer/heartbeat-monitors/", data=data, label="heartbeat monitor")
+    state = _ctx(ctx)
+    endpoint = _resolve_monitor_collection_endpoint(
+        state,
+        statuspages_resource="heartbeats",
+        legacy_endpoint="/api/developer/heartbeat-monitors/",
+    )
+    _create_resource(state, endpoint=endpoint, data=data, label="heartbeat monitor")
 
 
 @heartbeat_monitors_app.command("delete")
@@ -2290,7 +2527,13 @@ def heartbeat_monitors_delete(ctx: typer.Context, monitor_id: str = typer.Argume
     Examples:
       dataplicity heartbeat-monitors delete <monitor-id>
     """
-    _delete_resource(_ctx(ctx), endpoint="/api/developer/heartbeat-monitors/", resource_id=monitor_id, label="heartbeat monitor")
+    state = _ctx(ctx)
+    endpoint = _resolve_monitor_collection_endpoint(
+        state,
+        statuspages_resource="heartbeats",
+        legacy_endpoint="/api/developer/heartbeat-monitors/",
+    )
+    _delete_resource(state, endpoint=endpoint, resource_id=monitor_id, label="heartbeat monitor")
 
 
 @fleet_jobs_app.command("list")
