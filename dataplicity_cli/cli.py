@@ -7,14 +7,15 @@ import sys
 import threading
 import time
 import webbrowser
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 import typer
 from rich.console import Console
+from rich.live import Live
 from rich.prompt import Prompt
 from rich.table import Table
 
@@ -336,6 +337,332 @@ def _friendly_response_message(default_message: str, response_data: Any, respons
     return response_text or default_message
 
 
+def _format_rate(bytes_per_second: float) -> str:
+    value = float(bytes_per_second)
+    units = ["B/s", "KiB/s", "MiB/s", "GiB/s"]
+    for unit in units:
+        if abs(value) < 1024 or unit == units[-1]:
+            return f"{value:.1f} {unit}"
+        value /= 1024.0
+    return f"{value:.1f} GiB/s"
+
+
+def _format_bytes(total_bytes: int) -> str:
+    value = float(total_bytes)
+    units = ["B", "KiB", "MiB", "GiB", "TiB"]
+    for unit in units:
+        if abs(value) < 1024 or unit == units[-1]:
+            return f"{value:.1f} {unit}"
+        value /= 1024.0
+    return f"{value:.1f} TiB"
+
+
+def _sparkline(values: List[float], width: int = 28) -> str:
+    bars = "▁▂▃▄▅▆▇█"
+    if width <= 0:
+        return ""
+    if not values:
+        return bars[0] * width
+    sample = values[-width:]
+    if len(sample) < width:
+        sample = ([sample[0]] * (width - len(sample))) + sample
+    low = min(sample)
+    high = max(sample)
+    if high <= low:
+        return bars[0] * width
+    out = []
+    for value in sample:
+        idx = int((value - low) / (high - low) * (len(bars) - 1))
+        idx = max(0, min(idx, len(bars) - 1))
+        out.append(bars[idx])
+    return "".join(out)
+
+
+def _extract_port_numbers(value: Any) -> Set[int]:
+    found: Set[int] = set()
+    if isinstance(value, int):
+        if value == -1:
+            found.add(-1)
+        elif 1 <= value <= 65535:
+            found.add(value)
+    elif isinstance(value, str):
+        text = value.strip()
+        if "-" in text:
+            left, _, right = text.partition("-")
+            try:
+                low = int(left.strip())
+                high = int(right.strip())
+            except ValueError:
+                return found
+            low, high = min(low, high), max(low, high)
+            if 1 <= low <= 65535 and 1 <= high <= 65535:
+                size = high - low + 1
+                if size <= 4096:
+                    found.update(range(low, high + 1))
+        else:
+            for token in text.replace(",", " ").split():
+                try:
+                    number = int(token)
+                except ValueError:
+                    continue
+                if number == -1:
+                    found.add(-1)
+                elif 1 <= number <= 65535:
+                    found.add(number)
+    elif isinstance(value, dict):
+        low = value.get("start") or value.get("min") or value.get("from")
+        high = value.get("end") or value.get("max") or value.get("to")
+        if isinstance(low, int) and isinstance(high, int):
+            low, high = min(low, high), max(low, high)
+            if 1 <= low <= 65535 and 1 <= high <= 65535:
+                size = high - low + 1
+                if size <= 4096:
+                    found.update(range(low, high + 1))
+    return found
+
+
+def _extract_port_forwarding_ports(payload: Any) -> Optional[List[int]]:
+    if not isinstance(payload, dict):
+        return None
+    if "port_forwarding_ports" not in payload:
+        return None
+    value = payload.get("port_forwarding_ports")
+    if isinstance(value, list):
+        found: Set[int] = set()
+        for item in value:
+            found.update(_extract_port_numbers(item))
+        ports = sorted(port for port in found if port == -1 or 1 <= port <= 65535)
+        return ports
+    found = _extract_port_numbers(value)
+    if not found:
+        return []
+    return sorted(port for port in found if port == -1 or 1 <= port <= 65535)
+
+
+def _load_user_profile_payload(state: AppContext) -> Optional[Dict[str, Any]]:
+    primary = state.api.get("/api/users/me/")
+    if primary.ok and isinstance(primary.data, dict):
+        return primary.data
+    legacy = state.api.get("/profile/")
+    if legacy.ok and isinstance(legacy.data, dict):
+        return legacy.data
+    return None
+
+
+def _find_allowed_ports(payload: Any) -> Set[int]:
+    allowed: Set[int] = set()
+    queue_items: List[Any] = [payload]
+    while queue_items:
+        current = queue_items.pop()
+        if isinstance(current, dict):
+            for key, value in current.items():
+                key_text = str(key).lower()
+                if key_text in {
+                    "allowed_ports",
+                    "supported_ports",
+                    "forwardable_ports",
+                    "redirect_ports",
+                    "port_whitelist",
+                    "ports_allowed",
+                    "allowed_port_ranges",
+                    "supported_port_ranges",
+                } or ("port" in key_text and ("allow" in key_text or "support" in key_text or "entitle" in key_text)):
+                    allowed.update(_extract_port_numbers(value))
+                    if isinstance(value, list):
+                        for item in value:
+                            allowed.update(_extract_port_numbers(item))
+                if isinstance(value, (dict, list)):
+                    queue_items.append(value)
+        elif isinstance(current, list):
+            queue_items.extend(current)
+    return {port for port in allowed if port == -1 or 1 <= port <= 65535}
+
+
+def _find_plan_label(payload: Any) -> Optional[str]:
+    queue_items: List[Any] = [payload]
+    while queue_items:
+        current = queue_items.pop()
+        if isinstance(current, dict):
+            for key, value in current.items():
+                key_text = str(key).lower()
+                if key_text in {"plan", "plan_name", "subscription", "tier", "package"}:
+                    if isinstance(value, str) and value.strip():
+                        return value.strip()
+                    if isinstance(value, dict):
+                        name = value.get("name") or value.get("plan_name") or value.get("tier")
+                        if isinstance(name, str) and name.strip():
+                            return name.strip()
+                if isinstance(value, (dict, list)):
+                    queue_items.append(value)
+        elif isinstance(current, list):
+            queue_items.extend(current)
+    return None
+
+
+def _discover_port_forward_capabilities(state: AppContext, device_hash: str) -> Dict[str, Any]:
+    sources: List[Any] = []
+    profile_payload = _load_user_profile_payload(state)
+    if profile_payload:
+        sources.append(profile_payload)
+    org_response = state.api.get("/api/v1/organisations/")
+    if org_response.ok:
+        sources.append(org_response.data)
+    device_response = state.api.get(f"/api/developer/devices/{device_hash}/")
+    if device_response.ok:
+        sources.append(device_response.data)
+    allowed_ports: Set[int] = set()
+    plan_label: Optional[str] = None
+    for payload in sources:
+        if plan_label is None:
+            plan_label = _find_plan_label(payload)
+        profile_ports = _extract_port_forwarding_ports(payload)
+        if profile_ports is not None:
+            allowed_ports.update(profile_ports)
+        allowed_ports.update(_find_allowed_ports(payload))
+    all_ports_allowed = -1 in allowed_ports
+    if all_ports_allowed:
+        allowed_ports.discard(-1)
+    return {
+        "plan_label": plan_label,
+        "allowed_ports": sorted(allowed_ports),
+        "all_ports_allowed": all_ports_allowed,
+        "source_count": len(sources),
+    }
+
+
+@dataclass
+class _PortForwardDashboard:
+    device_hash: str
+    local_port: int
+    remote_port: int
+    plan_label: Optional[str]
+    allowed_ports: List[int]
+    all_ports_allowed: bool = False
+    started_at: float = field(default_factory=time.monotonic)
+    up_total_bytes: int = 0
+    down_total_bytes: int = 0
+    up_sample_bytes: int = 0
+    down_sample_bytes: int = 0
+    last_sample_at: float = field(default_factory=time.monotonic)
+    up_history: List[float] = field(default_factory=list)
+    down_history: List[float] = field(default_factory=list)
+    active_clients: int = 0
+    total_connections: int = 0
+    rejected_connections: int = 0
+    current_connection_started_at: Optional[float] = None
+    first_byte_latencies_ms: List[float] = field(default_factory=list)
+    protocols_seen: List[str] = field(default_factory=list)
+    listener_ready: bool = False
+    listener_detail: str = ""
+    stop_reason: str = "running"
+
+    def apply_event(self, event: Any) -> None:
+        kind = getattr(event, "kind", "")
+        timestamp = float(getattr(event, "timestamp", time.monotonic()))
+        bytes_count = int(getattr(event, "bytes_count", 0))
+        detail = str(getattr(event, "detail", ""))
+        if kind == "listener_started":
+            self.listener_ready = True
+            self.listener_detail = detail
+            return
+        if kind == "listener_stopped":
+            self.listener_ready = False
+            self.stop_reason = "stopped"
+            return
+        if kind == "connection_opened":
+            self.active_clients = 1
+            self.total_connections += 1
+            self.current_connection_started_at = timestamp
+            return
+        if kind == "connection_closed":
+            self.active_clients = 0
+            self.current_connection_started_at = None
+            return
+        if kind == "connection_rejected":
+            self.rejected_connections += 1
+            return
+        if kind == "first_remote_byte" and self.current_connection_started_at is not None:
+            latency_ms = (timestamp - self.current_connection_started_at) * 1000.0
+            self.first_byte_latencies_ms.append(latency_ms)
+            self.first_byte_latencies_ms = self.first_byte_latencies_ms[-64:]
+            return
+        if kind == "bytes_up":
+            self.up_total_bytes += bytes_count
+            self.up_sample_bytes += bytes_count
+            return
+        if kind == "bytes_down":
+            self.down_total_bytes += bytes_count
+            self.down_sample_bytes += bytes_count
+            return
+        if kind == "protocol_detected" and detail:
+            if detail not in self.protocols_seen:
+                self.protocols_seen.append(detail)
+                self.protocols_seen = self.protocols_seen[-8:]
+
+    def tick(self) -> None:
+        now = time.monotonic()
+        elapsed = max(now - self.last_sample_at, 1e-6)
+        self.up_history.append(self.up_sample_bytes / elapsed)
+        self.down_history.append(self.down_sample_bytes / elapsed)
+        self.up_history = self.up_history[-120:]
+        self.down_history = self.down_history[-120:]
+        self.up_sample_bytes = 0
+        self.down_sample_bytes = 0
+        self.last_sample_at = now
+
+    def render(self) -> Table:
+        uptime = max(time.monotonic() - self.started_at, 0.0)
+        latest_up = self.up_history[-1] if self.up_history else 0.0
+        latest_down = self.down_history[-1] if self.down_history else 0.0
+        p95 = 0.0
+        if self.first_byte_latencies_ms:
+            ordered = sorted(self.first_byte_latencies_ms)
+            idx = int(0.95 * (len(ordered) - 1))
+            p95 = ordered[idx]
+
+        table = Table(title="Port Forward Live", expand=True)
+        table.add_column("Metric")
+        table.add_column("Value", overflow="fold")
+        table.add_row("Path", f"localhost:{self.local_port} -> device:{self.remote_port} ({self.device_hash})")
+        table.add_row("Uptime", f"{uptime:.1f}s")
+        table.add_row("Status", "listening" if self.listener_ready else self.stop_reason)
+        if self.plan_label:
+            table.add_row("Plan", self.plan_label)
+        if self.all_ports_allowed:
+            table.add_row("Allowed remote ports", "All ports allowed")
+        elif self.allowed_ports:
+            if len(self.allowed_ports) <= 16:
+                table.add_row("Allowed remote ports", ", ".join(str(port) for port in self.allowed_ports))
+            else:
+                preview = ", ".join(str(port) for port in self.allowed_ports[:16])
+                table.add_row("Allowed remote ports", f"{preview}, ... ({len(self.allowed_ports)} total)")
+        else:
+            table.add_row("Allowed remote ports", "Unknown (not advertised by API payload)")
+        table.add_row(
+            "Connections",
+            f"{self.total_connections} opened, {self.active_clients} active, {self.rejected_connections} rejected",
+        )
+        table.add_row(
+            "Traffic",
+            f"up { _format_bytes(self.up_total_bytes) } / down { _format_bytes(self.down_total_bytes) }",
+        )
+        table.add_row(
+            "Throughput",
+            f"up { _format_rate(latest_up) }  { _sparkline(self.up_history) }\n"
+            f"down { _format_rate(latest_down) }  { _sparkline(self.down_history) }",
+        )
+        table.add_row("First-byte latency (p95)", f"{p95:.1f} ms")
+        if self.protocols_seen:
+            table.add_row("Detected traffic", ", ".join(self.protocols_seen))
+            if "HTTP request" in self.protocols_seen or "HTTP response" in self.protocols_seen:
+                table.add_row("HTTP hint", "Use a browser or curl against localhost to validate status and latency.")
+            if "TLS" in self.protocols_seen:
+                table.add_row("TLS hint", "TLS traffic detected; certificate/SNI issues happen at application layer.")
+            if "SSH" in self.protocols_seen:
+                table.add_row("SSH hint", "SSH detected; test with `ssh -p <local-port> user@127.0.0.1`.")
+        return table
+
+
 def _is_configured_for_auth(config: Config) -> bool:
     if config.auth_method == "jwt" and bool(config.access_token):
         return True
@@ -514,6 +841,10 @@ def whoami(ctx: typer.Context) -> None:
     _require_auth(state)
     org_response = state.api.get("/api/v1/organisations/")
     devices_response = state.api.get("/api/developer/devices/", params={"page_size": 250})
+    profile_payload = _load_user_profile_payload(state)
+    profile_ports = _extract_port_forwarding_ports(profile_payload) if profile_payload else None
+    profile_all_ports = bool(profile_ports and -1 in profile_ports)
+    display_ports = sorted(port for port in (profile_ports or []) if port != -1)
     orgs = _extract_orgs(org_response.data or []) if org_response.ok else []
     devices = _extract_devices(devices_response.data or []) if devices_response.ok else []
     online_count = sum(1 for device in devices if bool(device.get("online")))
@@ -523,6 +854,7 @@ def whoami(ctx: typer.Context) -> None:
         "organisation": orgs[0] if orgs else None,
         "devices_total": len(devices),
         "devices_online": online_count,
+        "port_forwarding_ports": [-1] if profile_all_ports else display_ports,
     }
     if state.json_output:
         _print_json(payload)
@@ -537,6 +869,13 @@ def whoami(ctx: typer.Context) -> None:
         table.add_row("Organisation", str(org.get("name") or "(unnamed)"))
         table.add_row("Organisation hash", str(org.get("hash_id") or org.get("hash") or ""))
     table.add_row("Devices", f"{len(devices)} total / {online_count} online")
+    if profile_ports is not None:
+        if profile_all_ports:
+            table.add_row("Port forwarding ports", "all")
+        elif display_ports:
+            table.add_row("Port forwarding ports", ", ".join(str(port) for port in display_ports))
+        else:
+            table.add_row("Port forwarding ports", "(none)")
     state.console.print(table)
 
 
@@ -1180,7 +1519,7 @@ def devices_port_forward(
     remote_port: int = typer.Option(..., "--remote-port", help="Remote device port"),
     local_port: int = typer.Option(..., "--local-port", help="Local listen port"),
 ) -> None:
-    """Forward a local port to a remote device port.
+    """Forward a local port to a remote device port with live metrics.
 
     Examples:
       dataplicity devices port-forward --remote-port 22 --local-port 2022
@@ -1189,34 +1528,102 @@ def devices_port_forward(
     state = _ctx(ctx)
     _require_auth(state)
     resolved_hash = _resolve_device_hash_interactive(state, device_hash, action_name="port-forward")
+    capabilities = _discover_port_forward_capabilities(state, resolved_hash)
+    allowed_ports = capabilities.get("allowed_ports") or []
+    all_ports_allowed = bool(capabilities.get("all_ports_allowed"))
+    plan_label = capabilities.get("plan_label")
+    if (not all_ports_allowed) and allowed_ports and remote_port not in allowed_ports:
+        message = (
+            f"Remote port {remote_port} is not allowed for this account plan."
+            f" Allowed ports: {', '.join(str(port) for port in allowed_ports[:32])}"
+        )
+        if len(allowed_ports) > 32:
+            message += f", ... ({len(allowed_ports)} total)"
+        if state.json_output:
+            _print_json(
+                {
+                    "ok": False,
+                    "detail": message,
+                    "plan": plan_label,
+                    "allowed_ports": allowed_ports,
+                }
+            )
+        else:
+            _show_error(state.console, message)
+        raise typer.Exit(code=2)
 
-    async def runner() -> None:
+    async def runner() -> Dict[str, Any]:
         from .remote_access import run_port_forward
 
+        dashboard = _PortForwardDashboard(
+            device_hash=resolved_hash,
+            local_port=local_port,
+            remote_port=remote_port,
+            plan_label=plan_label,
+            allowed_ports=allowed_ports,
+            all_ports_allowed=all_ports_allowed,
+        )
         ws_url = await _resolve_m2m_url(state, resolved_hash)
         m2m = M2MClient(ws_url)
         await m2m.connect()
-        identity = await m2m.wait_for_identity()
-        response = state.api.post(
-            f"/api/developer/devices/{resolved_hash}/ports/",
-            json_data={
-                "m2m_identity": identity,
-                "service": "redirect-port",
-                "port": remote_port,
-            },
-        )
-        if not response.ok:
-            raise RuntimeError(response.text or "Unable to open port redirect")
-        channel_port = await m2m.wait_for_channel_open()
-        if not state.json_output:
-            state.console.print(
-                f"[green]Forwarding device:{remote_port} -> localhost:{local_port}[/green]"
+        try:
+            identity = await m2m.wait_for_identity()
+            response = state.api.post(
+                f"/api/developer/devices/{resolved_hash}/ports/",
+                json_data={
+                    "m2m_identity": identity,
+                    "service": "redirect-port",
+                    "port": remote_port,
+                },
             )
-        await run_port_forward(m2m, channel_port, local_port)
-        await m2m.close()
+            if not response.ok:
+                detail = _friendly_response_message("Unable to open port redirect", response.data, response.text)
+                raise RuntimeError(detail)
+            channel_port = await m2m.wait_for_channel_open()
+            forward_task = asyncio.create_task(
+                run_port_forward(
+                    m2m,
+                    channel_port,
+                    local_port,
+                    event_callback=dashboard.apply_event,
+                )
+            )
+            if state.json_output:
+                await forward_task
+            else:
+                with Live(dashboard.render(), console=state.console, refresh_per_second=4, transient=False) as live:
+                    while not forward_task.done():
+                        await asyncio.sleep(0.5)
+                        dashboard.tick()
+                        live.update(dashboard.render())
+                    dashboard.tick()
+                    live.update(dashboard.render())
+                await forward_task
+            return {
+                "ok": True,
+                "device_hash": resolved_hash,
+                "remote_port": remote_port,
+                "local_port": local_port,
+                "plan": plan_label,
+                "allowed_ports": allowed_ports,
+                "all_ports_allowed": all_ports_allowed,
+                "bytes_up": dashboard.up_total_bytes,
+                "bytes_down": dashboard.down_total_bytes,
+                "connections": dashboard.total_connections,
+                "rejected_connections": dashboard.rejected_connections,
+                "protocols": dashboard.protocols_seen,
+            }
+        finally:
+            await m2m.close()
 
     try:
-        asyncio.run(runner())
+        result = asyncio.run(runner())
+    except KeyboardInterrupt:
+        if state.json_output:
+            _print_json({"ok": True, "detail": "Port forward stopped by user"})
+        else:
+            state.console.print("[yellow]Port forward stopped (Ctrl-C).[/yellow]")
+        raise typer.Exit(code=0)
     except Exception as exc:
         message = str(exc) or "Port forward failed"
         if state.json_output:
@@ -1224,6 +1631,8 @@ def devices_port_forward(
         else:
             _show_error(state.console, message)
         raise typer.Exit(code=1)
+    if state.json_output:
+        _print_json(result)
 
 
 @devices_app.command("remote-file")

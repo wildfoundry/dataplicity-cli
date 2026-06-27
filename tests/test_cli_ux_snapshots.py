@@ -64,6 +64,18 @@ class CliUxSnapshotsTest(unittest.TestCase):
         for snippet in expected_snippets:
             self.assertIn(snippet, result.output)
 
+    def test_devices_port_forward_help_snapshot(self) -> None:
+        result = self._invoke(["devices", "port-forward", "--help"])
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+        expected_snippets = [
+            "Forward a local port to a remote device port with live metrics.",
+            "dataplicity devices port-forward --remote-port 22 --local-port 2022",
+            "--remote-port",
+            "--local-port",
+        ]
+        for snippet in expected_snippets:
+            self.assertIn(snippet, result.output)
+
     def test_doctor_help_snapshot(self) -> None:
         result = self._invoke(["doctor", "--help"])
         self.assertEqual(result.exit_code, 0, msg=result.output)

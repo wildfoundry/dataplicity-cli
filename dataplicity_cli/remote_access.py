@@ -4,8 +4,10 @@ import asyncio
 import os
 import sys
 import termios
+import time
 import tty
-from typing import Optional
+from dataclasses import dataclass
+from typing import Callable, Optional
 
 from .m2m import M2MClient
 
@@ -28,6 +30,34 @@ class RawTerminal:
 
 class CommandTimeoutError(TimeoutError):
     pass
+
+
+@dataclass
+class PortForwardEvent:
+    kind: str
+    timestamp: float
+    bytes_count: int = 0
+    detail: str = ""
+
+
+PortForwardEventCallback = Callable[[PortForwardEvent], None]
+
+
+def _detect_protocol(sample: bytes) -> Optional[str]:
+    if not sample:
+        return None
+    upper = sample[:16].upper()
+    if upper.startswith(b"GET ") or upper.startswith(b"POST ") or upper.startswith(b"PUT "):
+        return "HTTP request"
+    if upper.startswith(b"HEAD ") or upper.startswith(b"PATCH ") or upper.startswith(b"DELETE "):
+        return "HTTP request"
+    if upper.startswith(b"HTTP/"):
+        return "HTTP response"
+    if sample.startswith(b"SSH-"):
+        return "SSH"
+    if len(sample) >= 3 and sample[0] == 0x16 and sample[1] == 0x03 and sample[2] in {0x00, 0x01, 0x02, 0x03, 0x04}:
+        return "TLS"
+    return None
 
 
 async def run_terminal_session(m2m: M2MClient, port: int) -> None:
@@ -125,33 +155,83 @@ async def run_port_forward(
     m2m: M2MClient,
     channel_port: int,
     local_port: int,
+    *,
+    event_callback: Optional[PortForwardEventCallback] = None,
 ) -> None:
     queue = m2m.channel_queue(channel_port)
-    done = asyncio.Event()
+    active_client = asyncio.Lock()
+
+    def emit(kind: str, *, bytes_count: int = 0, detail: str = "") -> None:
+        if event_callback:
+            event_callback(
+                PortForwardEvent(
+                    kind=kind,
+                    timestamp=time.monotonic(),
+                    bytes_count=bytes_count,
+                    detail=detail,
+                )
+            )
 
     async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        peer = writer.get_extra_info("peername")
+        peer_label = str(peer) if peer else "unknown"
+        if active_client.locked():
+            emit("connection_rejected", detail=peer_label)
+            writer.close()
+            await writer.wait_closed()
+            return
+
+        await active_client.acquire()
+        acquired = True
+        emit("connection_opened", detail=peer_label)
+        local_started = asyncio.Event()
+        first_remote_byte_seen = False
+        protocols_seen = set()
+
         async def local_to_remote() -> None:
             while True:
                 data = await reader.read(65536)
                 if not data:
                     break
+                local_started.set()
                 await m2m.send_route(channel_port, data)
+                emit("bytes_up", bytes_count=len(data))
+                protocol = _detect_protocol(data[:32])
+                if protocol and protocol not in protocols_seen:
+                    protocols_seen.add(protocol)
+                    emit("protocol_detected", detail=protocol)
 
         async def remote_to_local() -> None:
+            nonlocal first_remote_byte_seen
             while True:
                 data = await queue.get()
                 if data is None:
                     break
+                if local_started.is_set() and not first_remote_byte_seen:
+                    first_remote_byte_seen = True
+                    emit("first_remote_byte")
                 writer.write(data)
                 await writer.drain()
+                emit("bytes_down", bytes_count=len(data))
+                protocol = _detect_protocol(data[:32])
+                if protocol and protocol not in protocols_seen:
+                    protocols_seen.add(protocol)
+                    emit("protocol_detected", detail=protocol)
 
-        await asyncio.gather(local_to_remote(), remote_to_local())
         try:
+            await asyncio.gather(local_to_remote(), remote_to_local())
+        finally:
             writer.close()
             await writer.wait_closed()
-        finally:
-            done.set()
+            emit("connection_closed", detail=peer_label)
+            if acquired and active_client.locked():
+                active_client.release()
 
     server = await asyncio.start_server(handle_client, host="127.0.0.1", port=local_port)
-    async with server:
-        await done.wait()
+    emit("listener_started", detail=f"127.0.0.1:{local_port}")
+    try:
+        async with server:
+            await server.serve_forever()
+    except asyncio.CancelledError:
+        emit("listener_stopped")
+        raise
