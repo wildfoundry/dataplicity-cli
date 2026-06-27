@@ -1,4 +1,4 @@
-from .cli import app
+from dataplicity_cli.cli import app
 
 if __name__ == "__main__":
     app()

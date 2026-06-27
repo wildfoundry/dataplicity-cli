@@ -1,0 +1,157 @@
+name: Update Homebrew tap
+
+"on":
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (e.g. 0.1.5 or v0.1.5)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: "homebrew-tap-${{ github.event.release.tag_name || inputs.version }}"
+  cancel-in-progress: false
+
+jobs:
+  update-tap:
+    name: Open tap PR
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve release metadata
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_REPO: ${{ github.repository }}
+          RELEASE_TAG: "${{ github.event.release.tag_name || inputs.version }}"
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${RELEASE_TAG}"
+          if [[ "${TAG}" != v* ]]; then
+            TAG="v${TAG}"
+          fi
+          VERSION="${TAG#v}"
+          RELEASE_JSON="$(gh api "repos/${SOURCE_REPO}/releases/tags/${TAG}")"
+          ASSET_NAME="dataplicity-cli-${VERSION}-macos-universal2.tar.gz"
+          ASSET_URL="$(jq -r --arg name "${ASSET_NAME}" '.assets[] | select(.name == $name) | .browser_download_url' <<<"${RELEASE_JSON}")"
+          if [[ -z "${ASSET_URL}" || "${ASSET_URL}" == "null" ]]; then
+            echo "Could not find release asset ${ASSET_NAME} for ${TAG}" >&2
+            exit 1
+          fi
+          echo "tag=${TAG}" >>"${GITHUB_OUTPUT}"
+          echo "version=${VERSION}" >>"${GITHUB_OUTPUT}"
+          echo "asset_name=${ASSET_NAME}" >>"${GITHUB_OUTPUT}"
+          echo "asset_url=${ASSET_URL}" >>"${GITHUB_OUTPUT}"
+
+      - name: Download release asset
+        id: asset
+        env:
+          ASSET_NAME: ${{ steps.release.outputs.asset_name }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release download "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" --pattern "${ASSET_NAME}" --clobber
+          SHA="$(sha256sum "${ASSET_NAME}" | awk '{print $1}')"
+          echo "sha=${SHA}" >>"${GITHUB_OUTPUT}"
+
+      - name: Validate tap token
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${TAP_TOKEN}" ]]; then
+            echo "Missing required repository secret: HOMEBREW_TAP_TOKEN" >&2
+            exit 1
+          fi
+
+      - name: Checkout tap repository
+        uses: actions/checkout@v4
+        with:
+          repository: wildfoundry/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: homebrew-tap
+
+      - name: Update formula
+        env:
+          FORMULA_PATH: homebrew-tap/Formula/dataplicity-cli.rb
+          VERSION: ${{ steps.release.outputs.version }}
+          ASSET_URL: ${{ steps.release.outputs.asset_url }}
+          ASSET_SHA: ${{ steps.asset.outputs.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          import pathlib
+          import re
+
+          path = pathlib.Path(os.environ["FORMULA_PATH"])
+          version = os.environ["VERSION"]
+          url = os.environ["ASSET_URL"]
+          sha = os.environ["ASSET_SHA"]
+          raw = path.read_text(encoding="utf-8")
+
+          updated = re.sub(r'^\s*url\s+"[^"]+"\s*$', f'  url "{url}"', raw, flags=re.MULTILINE)
+          updated = re.sub(r'^\s*sha256\s+"[^"]+"\s*$', f'  sha256 "{sha}"', updated, flags=re.MULTILINE)
+          updated = re.sub(r'^\s*version\s+"[^"]+"\s*$', f'  version "{version}"', updated, flags=re.MULTILINE)
+
+          if updated == raw:
+              raise SystemExit("Formula did not change; is it already up to date?")
+
+          path.write_text(updated, encoding="utf-8")
+          PY
+
+      - name: Create pull request in tap
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          VERSION: ${{ steps.release.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd homebrew-tap
+
+          if git diff --quiet; then
+            echo "No formula changes to commit."
+            exit 0
+          fi
+
+          BRANCH="chore/dataplicity-cli-${VERSION}"
+          EXISTING="$(gh pr list --repo wildfoundry/homebrew-tap --head "${BRANCH}" --state open --json number --jq '.[0].number // empty')"
+          if [[ -n "${EXISTING}" ]]; then
+            echo "PR already open: #${EXISTING}"
+            exit 0
+          fi
+          if git ls-remote --exit-code --heads origin "${BRANCH}" >/dev/null; then
+            BRANCH="${BRANCH}-${GITHUB_RUN_ID}"
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "${BRANCH}"
+          git add Formula/dataplicity-cli.rb
+          git commit -m "Bump dataplicity-cli to ${VERSION}"
+          git push -u origin "${BRANCH}"
+
+          gh pr create \
+            --repo wildfoundry/homebrew-tap \
+            --base main \
+            --head "${BRANCH}" \
+            --title "Bump dataplicity-cli to ${VERSION}" \
+            --body "$(cat <<'EOF'
+          ## Summary
+          - bump `dataplicity-cli` Homebrew formula to the latest release
+          - update formula `url`, `sha256`, and `version`
+          
+          ## Validation
+          - sourced release asset from `wildfoundry/dataplicity-cli` GitHub release
+          - recomputed SHA256 from the downloaded tarball
+          EOF
+          )"
