@@ -163,8 +163,22 @@ dataplicity fleet-jobs run --data '{"name":"restart-edge","device_hashes":["abc1
 Query logs:
 
 ```
-dataplicity logging list --device <device-hash> --level error
+dataplicity logging list --device <device-hash> --level error --since 4h
 ```
+
+Discover web-style path filters for logs:
+
+```
+dataplicity logging path-map
+```
+
+Cross-fleet log searches are intentionally explicit:
+
+```
+dataplicity logging list --all-scopes --search timeout --since 30m
+```
+
+Log output is client-truncated for safety (max 200 records per request, long fields abbreviated).
 
 Show your current session and fleet summary:
 
