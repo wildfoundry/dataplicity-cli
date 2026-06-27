@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import datetime as dt
 import json
 import queue
+import re
 import sys
 import threading
 import time
@@ -47,7 +49,10 @@ endpoint_monitors_app = typer.Typer(help="Endpoint monitor commands")
 user_impact_app = typer.Typer(help="User impact commands")
 heartbeat_monitors_app = typer.Typer(help="Heartbeat monitor commands")
 fleet_jobs_app = typer.Typer(help="Fleet job commands")
-logging_app = typer.Typer(help="Logging commands")
+logging_app = typer.Typer(help="Logging commands", no_args_is_help=True)
+
+LOGGING_MAX_OUTPUT_ITEMS = 200
+LOGGING_MAX_FIELD_CHARS = 2000
 
 app.add_typer(auth_app, name="auth")
 app.add_typer(orgs_app, name="org")
@@ -2197,22 +2202,231 @@ def fleet_jobs_cancel(ctx: typer.Context, job_id: str = typer.Argument(...)) -> 
 @logging_app.command("list")
 def logging_list(
     ctx: typer.Context,
-    page_size: int = typer.Option(100, "--page-size", help="Page size"),
+    page_size: int = typer.Option(200, "--page-size", help="Number of records to request (max 200)"),
     device_hash: Optional[str] = typer.Option(None, "--device", help="Filter by device hash"),
     level: Optional[str] = typer.Option(None, "--level", help="Filter by log level"),
+    path: Optional[str] = typer.Option(None, "--path", help="Filter by web-style path scope (for example /devices/<hash>)"),
+    search: Optional[str] = typer.Option(None, "--search", help="Free-text search term"),
+    since: str = typer.Option("1h", "--since", help="Start of time window (relative like 15m, 2h, 1d, or ISO timestamp)"),
+    until: Optional[str] = typer.Option(None, "--until", help="End of time window (relative or ISO timestamp)"),
+    all_scopes: bool = typer.Option(
+        False,
+        "--all-scopes",
+        help="Allow broad cross-fleet queries. Requires a bounded time window.",
+    ),
 ) -> None:
-    """List log events.
+    """List log events with safe query constraints.
 
     Examples:
-      dataplicity logging list
-      dataplicity logging list --device <device-hash> --level error
+      dataplicity logging list --device <device-hash> --since 4h
+      dataplicity logging list --path /devices/<device-hash> --level error --since 24h
+      dataplicity logging list --all-scopes --search timeout --since 30m
     """
-    params: Dict[str, Any] = {"page_size": page_size}
+    state = _ctx(ctx)
+    max_page_size = LOGGING_MAX_OUTPUT_ITEMS
+    if page_size < 1 or page_size > max_page_size:
+        message = f"--page-size must be between 1 and {max_page_size}."
+        if state.json_output:
+            _print_json({"ok": False, "detail": message})
+        else:
+            _show_error(state.console, message)
+        raise typer.Exit(code=2)
+    if not any([device_hash, level, path, search, all_scopes]):
+        message = (
+            "Refusing broad log query. Provide at least one scope filter "
+            "(--device, --path, --search, or --level), or pass --all-scopes."
+        )
+        if state.json_output:
+            _print_json({"ok": False, "detail": message})
+        else:
+            _show_error(state.console, message)
+        raise typer.Exit(code=2)
+    now = dt.datetime.now(dt.timezone.utc)
+    try:
+        since_iso = _parse_log_time_expr(since, now=now)
+        until_iso = _parse_log_time_expr(until, now=now) if until else None
+    except ValueError as exc:
+        if state.json_output:
+            _print_json({"ok": False, "detail": str(exc)})
+        else:
+            _show_error(state.console, str(exc))
+        raise typer.Exit(code=2)
+    if until_iso and until_iso < since_iso:
+        message = "--until must be greater than or equal to --since."
+        if state.json_output:
+            _print_json({"ok": False, "detail": message})
+        else:
+            _show_error(state.console, message)
+        raise typer.Exit(code=2)
+    _require_auth(state)
+    params: Dict[str, Any] = {"page_size": page_size, "since": since_iso}
+    if until_iso:
+        params["until"] = until_iso
     if device_hash:
         params["device"] = device_hash
     if level:
         params["level"] = level
-    _list_resource(_ctx(ctx), endpoint="/api/developer/logging/", title="Logging", params=params)
+    if path:
+        params["path"] = path
+    if search:
+        params["search"] = search
+    response = state.api.get("/api/developer/logging/", params=params)
+    if not response.ok:
+        message = _friendly_response_message("Unable to list logging.", response.data, response.text)
+        if state.json_output:
+            _print_json({"ok": False, "detail": message})
+        else:
+            _show_error(state.console, message)
+        raise typer.Exit(code=1)
+
+    safe_payload, was_truncated, dropped_items = _truncate_logging_payload(response.data or [])
+    if state.json_output:
+        _print_json(safe_payload)
+        return
+    _render_resource_table(state, "Logging", safe_payload)
+    if was_truncated:
+        state.console.print(
+            f"[yellow]Output truncated:[/yellow] showing first {LOGGING_MAX_OUTPUT_ITEMS} records "
+            f"(dropped {dropped_items}). Narrow with --device/--path/--search or reduce the time window."
+        )
+
+
+def _parse_log_time_expr(value: Optional[str], *, now: dt.datetime) -> str:
+    if not value:
+        raise ValueError("Empty time value.")
+    raw = value.strip()
+    if not raw:
+        raise ValueError("Empty time value.")
+    relative_match = re.fullmatch(r"(?i)(\d+)\s*([smhdw])", raw)
+    parsed: Optional[dt.datetime]
+    if relative_match:
+        quantity = int(relative_match.group(1))
+        unit = relative_match.group(2).lower()
+        multiplier = {
+            "s": 1,
+            "m": 60,
+            "h": 60 * 60,
+            "d": 60 * 60 * 24,
+            "w": 60 * 60 * 24 * 7,
+        }[unit]
+        parsed = now - dt.timedelta(seconds=quantity * multiplier)
+    else:
+        text = raw.replace("Z", "+00:00")
+        try:
+            parsed = dt.datetime.fromisoformat(text)
+        except ValueError as exc:
+            raise ValueError(
+                "Invalid time value. Use relative values like 15m/2h/1d or an ISO timestamp."
+            ) from exc
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=dt.timezone.utc)
+        else:
+            parsed = parsed.astimezone(dt.timezone.utc)
+    return parsed.isoformat().replace("+00:00", "Z")
+
+
+def _truncate_log_value(value: Any, *, max_chars: int) -> Any:
+    if isinstance(value, str):
+        if len(value) <= max_chars:
+            return value
+        return f"{value[:max_chars]}... [truncated {len(value) - max_chars} chars]"
+    if isinstance(value, list):
+        return [_truncate_log_value(item, max_chars=max_chars) for item in value]
+    if isinstance(value, dict):
+        return {key: _truncate_log_value(item, max_chars=max_chars) for key, item in value.items()}
+    return value
+
+
+def _truncate_logging_payload(payload: Any) -> Tuple[Any, bool, int]:
+    items: Optional[List[Any]] = None
+    container: Optional[Dict[str, Any]] = None
+    key_name = ""
+
+    if isinstance(payload, list):
+        items = payload
+    elif isinstance(payload, dict):
+        container = dict(payload)
+        for key in ("results", "items", "data"):
+            candidate = container.get(key)
+            if isinstance(candidate, list):
+                key_name = key
+                items = candidate
+                break
+
+    if items is None:
+        return _truncate_log_value(payload, max_chars=LOGGING_MAX_FIELD_CHARS), False, 0
+
+    total_items = len(items)
+    kept_items = items[:LOGGING_MAX_OUTPUT_ITEMS]
+    truncated = total_items > LOGGING_MAX_OUTPUT_ITEMS
+    dropped = total_items - len(kept_items)
+    kept_items = [_truncate_log_value(item, max_chars=LOGGING_MAX_FIELD_CHARS) for item in kept_items]
+
+    if container is None:
+        return kept_items, truncated, dropped
+
+    container[key_name] = kept_items
+    if truncated:
+        container["__cli_truncated__"] = {
+            "reason": "result set too large",
+            "max_items": LOGGING_MAX_OUTPUT_ITEMS,
+            "dropped_items": dropped,
+        }
+    return container, truncated, dropped
+
+
+@logging_app.command("path-map")
+def logging_path_map(ctx: typer.Context) -> None:
+    """Show recommended path filters for scoped log queries.
+
+    Examples:
+      dataplicity logging path-map
+    """
+    state = _ctx(ctx)
+    payload = {
+        "scopes": [
+            {
+                "name": "device",
+                "flag": "--device <device-hash>",
+                "path_hint": "--path /devices/<device-hash>",
+                "example": "dataplicity logging list --device <device-hash> --since 4h",
+            },
+            {
+                "name": "fleet job",
+                "flag": "--search <fleet-job-id>",
+                "path_hint": "--path /fleet-jobs/<job-id>",
+                "example": "dataplicity logging list --path /fleet-jobs/<job-id> --since 2h",
+            },
+            {
+                "name": "endpoint monitor",
+                "flag": "--search <monitor-id>",
+                "path_hint": "--path /endpoint-monitors/<monitor-id>",
+                "example": "dataplicity logging list --path /endpoint-monitors/<monitor-id> --since 24h",
+            },
+            {
+                "name": "heartbeat monitor",
+                "flag": "--search <monitor-id>",
+                "path_hint": "--path /heartbeat-monitors/<monitor-id>",
+                "example": "dataplicity logging list --path /heartbeat-monitors/<monitor-id> --since 24h",
+            },
+        ]
+    }
+    if state.json_output:
+        _print_json(payload)
+        return
+    table = Table(title="Logging path map")
+    table.add_column("Scope", style="cyan")
+    table.add_column("Primary filter")
+    table.add_column("Web-style path filter")
+    table.add_column("Example")
+    for scope in payload["scopes"]:
+        table.add_row(
+            str(scope["name"]),
+            str(scope["flag"]),
+            str(scope["path_hint"]),
+            str(scope["example"]),
+        )
+    state.console.print(table)
 
 
 @logging_app.command("show")

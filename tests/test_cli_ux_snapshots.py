@@ -99,6 +99,30 @@ class CliUxSnapshotsTest(unittest.TestCase):
         for snippet in expected_snippets:
             self.assertIn(snippet, result.output)
 
+    def test_logging_list_help_snapshot(self) -> None:
+        result = self._invoke(["logging", "list", "--help"])
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+        expected_snippets = [
+            "List log events with safe query constraints.",
+            "--device",
+            "--path",
+            "--search",
+            "--since",
+            "--all-scopes",
+        ]
+        for snippet in expected_snippets:
+            self.assertIn(snippet, result.output)
+
+    def test_logging_path_map_help_snapshot(self) -> None:
+        result = self._invoke(["logging", "path-map", "--help"])
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+        expected_snippets = [
+            "Show recommended path filters for scoped log queries.",
+            "dataplicity logging path-map",
+        ]
+        for snippet in expected_snippets:
+            self.assertIn(snippet, result.output)
+
     def test_version_flag_snapshot(self) -> None:
         result = self._invoke(["--version"])
         self.assertEqual(result.exit_code, 0, msg=result.output)
@@ -115,6 +139,15 @@ class CliUxSnapshotsTest(unittest.TestCase):
             payload.get("detail"),
             "Authentication required. Use `dataplicity auth login` or `dataplicity auth api-key`.",
         )
+
+    def test_logging_scope_guard_snapshot_json(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "cli.json"
+            result = self._invoke(["--json", "--config", str(config_path), "logging", "list"])
+        self.assertEqual(result.exit_code, 2, msg=result.output)
+        payload = json.loads(result.output)
+        self.assertEqual(payload.get("ok"), False)
+        self.assertIn("Refusing broad log query", payload.get("detail", ""))
 
 
 if __name__ == "__main__":
