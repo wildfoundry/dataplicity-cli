@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import html
 import json
 import queue
 import re
@@ -210,11 +211,149 @@ class _SsoCallbackListener:
                 return
 
             def _write_html(self, status: int, message: str) -> None:
-                body = (
-                    "<html><body><h2>Dataplicity CLI</h2>"
-                    f"<p>{message}</p>"
-                    "<p>You can close this tab and return to your terminal.</p></body></html>"
-                ).encode("utf-8")
+                tone = "info"
+                if status >= 400:
+                    tone = "error"
+                elif "received" in message.lower() or "complete" in message.lower():
+                    tone = "success"
+                badge = {
+                    "info": "Waiting",
+                    "success": "Success",
+                    "error": "Issue",
+                }[tone]
+                escaped_message = html.escape(message)
+                body = f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Dataplicity CLI Authentication</title>
+  <style>
+    :root {{
+      --dp-primary: #1976d2;
+      --dp-appbar-bg: linear-gradient(90deg, #2e638c 0%, #5156a2 50%);
+      --dp-success: #28a745;
+      --dp-error: #dc3545;
+      --dp-text: #2d3748;
+      --dp-muted: #6c757d;
+      --dp-surface: #ffffff;
+      --dp-background: #f7f9fb;
+      --dp-border: #dee2e6;
+      --shadow-md: 0 10px 28px rgba(0, 0, 0, 0.12);
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0;
+      min-height: 100vh;
+      font-family: Lato, "Segoe UI", Arial, sans-serif;
+      color: var(--dp-text);
+      background:
+        radial-gradient(1200px 550px at 5% -10%, rgba(80, 86, 162, 0.2) 0%, rgba(80, 86, 162, 0) 60%),
+        radial-gradient(900px 400px at 95% 0%, rgba(25, 118, 210, 0.2) 0%, rgba(25, 118, 210, 0) 65%),
+        var(--dp-background);
+      display: grid;
+      place-items: center;
+      padding: 28px;
+    }}
+    .shell {{
+      width: min(720px, 100%);
+      border-radius: 16px;
+      overflow: hidden;
+      border: 1px solid var(--dp-border);
+      box-shadow: var(--shadow-md);
+      background: var(--dp-surface);
+    }}
+    .header {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 18px 22px;
+      background: var(--dp-appbar-bg);
+      color: #fff;
+    }}
+    .brand {{
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      font-size: 0.93rem;
+    }}
+    .brand svg {{
+      width: 30px;
+      height: 30px;
+      border-radius: 8px;
+      flex: 0 0 auto;
+      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
+    }}
+    .chip {{
+      border-radius: 999px;
+      font-size: 0.78rem;
+      padding: 0.36rem 0.68rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      border: 1px solid rgba(255, 255, 255, 0.25);
+      background: rgba(255, 255, 255, 0.12);
+    }}
+    .content {{ padding: 30px 26px 24px; }}
+    h1 {{
+      margin: 0 0 10px;
+      font-size: clamp(1.35rem, 2.5vw, 1.75rem);
+      line-height: 1.25;
+      font-weight: 700;
+    }}
+    p {{
+      margin: 0;
+      color: var(--dp-muted);
+      font-size: 1rem;
+      line-height: 1.55;
+    }}
+    .hint {{
+      margin-top: 18px;
+      display: inline-block;
+      border-radius: 10px;
+      border: 1px solid var(--dp-border);
+      background: #fbfcff;
+      padding: 0.7rem 0.9rem;
+      color: #4a5568;
+      font-size: 0.92rem;
+    }}
+    .tone-info .status-accent {{ color: var(--dp-primary); }}
+    .tone-success .status-accent {{ color: var(--dp-success); }}
+    .tone-error .status-accent {{ color: var(--dp-error); }}
+  </style>
+</head>
+<body>
+  <main class="shell tone-{tone}">
+    <section class="header">
+      <div class="brand">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 70.46 70.46" aria-hidden="true">
+          <rect fill="#f4b321" x="0" y="0" width="70.46" height="70.46" rx="18" />
+          <g transform="translate(6 -2)">
+            <circle fill="#f4b321" cx="30.33" cy="40.12" r="30.33" />
+            <path d="M57.36,29.8c-3.23-1.55-5.66-3.16-7.46-3.71l-.16-.25A19.83,19.83,0,0,0,40.94,6.07c7.49-2.27,8.61-4.49,8.61-4.49A48.11,48.11,0,0,1,39.9,3.41C44.2,1.35,43.79,0,43.79,0c-2.66,1.63-11.07,2.59-14,2.88a19.81,19.81,0,0,0-19.12,23.4,23.34,23.34,0,1,0,43,12.52c0-.24,0-.47,0-.7l.68.35c5.8,2.78,11.8,2.32,13.4-1S63.16,32.57,57.36,29.8Z" />
+            <path fill="#fff" d="M49.53,52.08a19.84,19.84,0,0,0-6.71-21.65,11.07,11.07,0,0,0,2.93-7.77c0-5.44-3.39-9.84-7.58-9.84A6.74,6.74,0,0,0,33,15.5c-1.47-4-4.63-6.83-8.3-6.83-5.07,0-9.18,5.34-9.18,11.92A13.42,13.42,0,0,0,19,30a20,20,0,0,0-3.16,2.85c.68,1.85,1.29,4.39,2.3,7.28,2.36,6.7,6,12.71,2.15,14.07-3,1.06-6.77-1.36-9.39-5.68a19.75,19.75,0,0,0,1.32,5.08,23.33,23.33,0,0,0,37.26-1.49Z" />
+            <path d="M24.15,16.58a3.3,3.3,0,0,0-1.12.2,1.45,1.45,0,1,1-2,2,3.31,3.31,0,1,0,3.11-2.19Z" />
+            <path d="M37.31,17a3.3,3.3,0,0,0-1.12.2,1.45,1.45,0,1,1-2,2A3.31,3.31,0,1,0,37.31,17Z" />
+            <path fill="#f4b321" d="M38.44,26.26S33.67,23.53,31,23.53s-7.45,2.73-7.45,2.73,3.91,5.09,7.45,5.09S38.44,26.26,38.44,26.26Z" />
+          </g>
+        </svg>
+        <span>Dataplicity CLI</span>
+      </div>
+      <span class="chip">{badge}</span>
+    </section>
+    <section class="content">
+      <h1 class="status-accent">{escaped_message}</h1>
+      <p>Finish the sign-in flow in your browser. This tab is only used for the secure callback.</p>
+      <p class="hint">You can close this tab and return to your terminal.</p>
+    </section>
+  </main>
+</body>
+</html>
+""".encode("utf-8")
                 self.send_response(status)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Content-Length", str(len(body)))
