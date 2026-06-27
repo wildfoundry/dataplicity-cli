@@ -941,8 +941,16 @@ def _require_auth(ctx: AppContext) -> None:
 
 
 def _extract_devices(payload: Any) -> List[Dict[str, Any]]:
-    if isinstance(payload, dict) and isinstance(payload.get("devices"), list):
-        return [item for item in payload["devices"] if isinstance(item, dict)]
+    if isinstance(payload, dict):
+        devices: List[Dict[str, Any]] = []
+        primary = payload.get("devices")
+        limited = payload.get("limited_devices")
+        if isinstance(primary, list):
+            devices.extend(item for item in primary if isinstance(item, dict))
+        if isinstance(limited, list):
+            devices.extend(item for item in limited if isinstance(item, dict))
+        if devices:
+            return devices
     if isinstance(payload, list):
         return [item for item in payload if isinstance(item, dict)]
     return []
@@ -957,7 +965,125 @@ def _device_name(device: Dict[str, Any]) -> str:
 
 
 def _device_is_online(device: Dict[str, Any]) -> bool:
+    if isinstance(device.get("is_online"), bool):
+        return bool(device.get("is_online"))
+    if isinstance(device.get("online"), bool):
+        return bool(device.get("online"))
     return str(device.get("status") or "").strip().lower() == "online"
+
+
+def _device_is_active(device: Dict[str, Any]) -> bool:
+    if isinstance(device.get("is_active"), bool):
+        return bool(device.get("is_active"))
+    if isinstance(device.get("enabled"), bool):
+        return bool(device.get("enabled"))
+    return True
+
+
+def _sort_devices_for_display(devices: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return sorted(
+        devices,
+        key=lambda d: (
+            not _device_is_active(d),
+            not _device_is_online(d),
+            str(d.get("name") or "").lower(),
+            _device_hash(d).lower(),
+        ),
+    )
+
+
+def _connection_quality_points(payload: Any) -> List[Dict[str, Any]]:
+    if not isinstance(payload, dict):
+        return []
+    points = payload.get("points")
+    if not isinstance(points, list):
+        return []
+    return [point for point in points if isinstance(point, dict)]
+
+
+def _quality_status_rank(status: str) -> int:
+    normalized = str(status or "").strip().lower()
+    if normalized == "good":
+        return 0
+    if normalized == "degraded":
+        return 1
+    if normalized == "poor":
+        return 2
+    return 3
+
+
+def _quality_status_style(status: str) -> str:
+    normalized = str(status or "").strip().lower()
+    if normalized == "good":
+        return "green"
+    if normalized == "degraded":
+        return "yellow"
+    if normalized == "poor":
+        return "red"
+    return "dim"
+
+
+def _bucket_quality_points(points: List[Dict[str, Any]], width: int) -> List[List[Dict[str, Any]]]:
+    if not points:
+        return []
+    width = max(1, int(width))
+    chunk_size = max(1, (len(points) + width - 1) // width)
+    buckets: List[List[Dict[str, Any]]] = []
+    for index in range(0, len(points), chunk_size):
+        buckets.append(points[index : index + chunk_size])
+    return buckets
+
+
+def _render_quality_status_bar(points: List[Dict[str, Any]], width: int = 48) -> str:
+    buckets = _bucket_quality_points(points, width)
+    if not buckets:
+        return "[dim](no data)[/dim]"
+    segments: List[str] = []
+    for bucket in buckets:
+        statuses = [str(point.get("status") or "unknown").strip().lower() for point in bucket]
+        worst = max(statuses, key=_quality_status_rank, default="unknown")
+        style = _quality_status_style(worst)
+        segments.append(f"[{style}]█[/{style}]")
+    return "".join(segments)
+
+
+def _render_latency_sparkline(points: List[Dict[str, Any]], width: int = 48) -> str:
+    buckets = _bucket_quality_points(points, width)
+    if not buckets:
+        return "[dim](no data)[/dim]"
+    levels = "▁▂▃▄▅▆▇█"
+    latencies: List[Optional[float]] = []
+    bucket_statuses: List[str] = []
+    for bucket in buckets:
+        samples: List[float] = []
+        statuses: List[str] = []
+        for point in bucket:
+            raw = point.get("latency_ms")
+            if isinstance(raw, (int, float)):
+                samples.append(float(raw))
+            statuses.append(str(point.get("status") or "unknown").strip().lower())
+        latencies.append((sum(samples) / len(samples)) if samples else None)
+        worst = max(statuses, key=_quality_status_rank, default="unknown")
+        bucket_statuses.append(worst)
+
+    numeric = [value for value in latencies if value is not None]
+    if not numeric:
+        return "[dim](latency unavailable)[/dim]"
+    lo = min(numeric)
+    hi = max(numeric)
+    span = max(1.0, hi - lo)
+
+    segments: List[str] = []
+    for index, latency in enumerate(latencies):
+        if latency is None:
+            segments.append("[dim]·[/dim]")
+            continue
+        normalized = (latency - lo) / span
+        level_index = min(len(levels) - 1, max(0, int(round(normalized * (len(levels) - 1)))))
+        glyph = levels[level_index]
+        style = _quality_status_style(bucket_statuses[index])
+        segments.append(f"[{style}]{glyph}[/{style}]")
+    return "".join(segments)
 
 
 def _resolve_device_hash_interactive(
@@ -982,24 +1108,19 @@ def _resolve_device_hash_interactive(
         _show_error(state.console, "No devices available for this account.")
         raise typer.Exit(code=2)
 
-    devices = sorted(
-        devices,
-        key=lambda d: (
-            not _device_is_online(d),
-            str(d.get("name") or "").lower(),
-            _device_hash(d).lower(),
-        ),
-    )
+    devices = _sort_devices_for_display(devices)
     table = Table(title=f"Select a device for {action_name}")
     table.add_column("#", style="cyan")
     table.add_column("Serial")
     table.add_column("Name")
+    table.add_column("Active")
     table.add_column("Online")
     for index, device in enumerate(devices, start=1):
         table.add_row(
             str(index),
             _device_hash(device),
             _device_name(device),
+            "yes" if _device_is_active(device) else "no",
             "yes" if _device_is_online(device) else "no",
         )
     state.console.print(table)
@@ -1641,23 +1762,22 @@ def devices_list(
 
     if online_only:
         devices = [device for device in devices if _device_is_online(device)]
-    devices = sorted(
-        devices,
-        key=lambda d: (
-            not _device_is_online(d),
-            str(d.get("name") or "").lower(),
-            _device_hash(d).lower(),
-        ),
-    )
+    devices = _sort_devices_for_display(devices)
     online_count = sum(1 for device in devices if _device_is_online(device))
+    active_count = sum(1 for device in devices if _device_is_active(device))
 
     table = Table(title="Devices")
     table.add_column("Serial", style="cyan")
     table.add_column("Name", style="bold")
+    table.add_column("Active")
     table.add_column("Status")
     table.add_column("Class")
     for device in devices:
         status = str(device.get("status") or "").strip()
+        if not status:
+            status = "online" if _device_is_online(device) else "offline"
+        if not _device_is_active(device):
+            status = f"{status} (limited)"
         device_class = (
             str((device.get("device_class") or {}).get("name") or "").strip()
             if isinstance(device.get("device_class"), dict)
@@ -1666,12 +1786,13 @@ def devices_list(
         table.add_row(
             _device_hash(device),
             _device_name(device),
+            "yes" if _device_is_active(device) else "no",
             status,
             device_class,
-            style="green" if _device_is_online(device) else "",
+            style="green" if _device_is_online(device) and _device_is_active(device) else "",
         )
     state.console.print(table)
-    state.console.print(f"Showing {len(devices)} devices ({online_count} online).")
+    state.console.print(f"Showing {len(devices)} devices ({active_count} active, {online_count} online).")
 
 
 @devices_app.command("ls")
@@ -1719,6 +1840,145 @@ def devices_show(ctx: typer.Context, device_hash: Optional[str] = typer.Argument
         for key, value in response.data.items():
             table.add_row(str(key), json.dumps(_sanitize_payload(value)))
     state.console.print(table)
+
+
+@devices_app.command("wormhole-status")
+def devices_wormhole_status(ctx: typer.Context, device_hash: Optional[str] = typer.Argument(None)) -> None:
+    """Show wormhole status and recent usage for a device.
+
+    Examples:
+      dataplicity devices wormhole-status
+      dataplicity devices wormhole-status <device-hash>
+    """
+    state = _ctx(ctx)
+    _require_auth(state)
+    resolved_hash = _resolve_device_hash_interactive(state, device_hash, action_name="wormhole status")
+    response = state.api.get(f"/api/developer/devices/{resolved_hash}/wormhole/status/")
+    payload = response.data or {}
+    if response.status_code == 404:
+        detail_response = state.api.get(f"/api/developer/devices/{resolved_hash}/")
+        if detail_response.ok and isinstance(detail_response.data, dict):
+            detail = detail_response.data
+            payload = {
+                "wormhole_enabled": bool(detail.get("wormhole_enabled")),
+                "wormhole_disabled_by_admin": bool(detail.get("wormhole_disabled_by_admin")),
+                "slug": detail.get("wormhole_slug"),
+                "probe_status": "unknown",
+                "last_access": None,
+                "request_count": None,
+                "error_count": None,
+                "top_paths": [],
+            }
+    elif response.ok:
+        payload = response.data or {}
+    if not payload:
+        message = _friendly_response_message("Unable to fetch wormhole status.", response.data, response.text)
+        if state.json_output:
+            _print_json({"ok": False, "detail": message})
+        else:
+            _show_error(state.console, message)
+        raise typer.Exit(code=1)
+    if state.json_output:
+        _print_json(payload)
+        return
+
+    table = Table(title=f"Wormhole status: {resolved_hash}")
+    table.add_column("Key")
+    table.add_column("Value")
+    table.add_row("enabled", str(bool(payload.get("wormhole_enabled"))))
+    table.add_row("disabled_by_admin", str(bool(payload.get("wormhole_disabled_by_admin"))))
+    table.add_row("slug", str(payload.get("slug") or ""))
+    table.add_row("probe_status", str(payload.get("probe_status") or ""))
+    table.add_row("last_access", str(payload.get("last_access") or ""))
+    table.add_row("request_count", str(payload.get("request_count") or 0))
+    table.add_row("error_count", str(payload.get("error_count") or 0))
+    state.console.print(table)
+
+    top_paths = payload.get("top_paths")
+    if isinstance(top_paths, list) and top_paths:
+        paths_table = Table(title="Top wormhole paths")
+        paths_table.add_column("Path")
+        paths_table.add_column("Count")
+        for item in top_paths:
+            if isinstance(item, dict):
+                paths_table.add_row(str(item.get("path") or ""), str(item.get("count") or 0))
+        state.console.print(paths_table)
+
+
+@devices_app.command("connection-quality")
+def devices_connection_quality(ctx: typer.Context, device_hash: Optional[str] = typer.Argument(None)) -> None:
+    """Show 24h connection-quality diagnostics for a device.
+
+    Examples:
+      dataplicity devices connection-quality
+      dataplicity devices connection-quality <device-hash>
+    """
+    state = _ctx(ctx)
+    _require_auth(state)
+    resolved_hash = _resolve_device_hash_interactive(state, device_hash, action_name="connection quality")
+    response = state.api.get(f"/api/developer/devices/{resolved_hash}/remote-access-status/")
+    payload = response.data or {}
+    warning = ""
+    if response.status_code == 404:
+        warning = "Connection quality endpoint is unavailable on this API host."
+        detail_response = state.api.get(f"/api/developer/devices/{resolved_hash}/")
+        if detail_response.ok and isinstance(detail_response.data, dict):
+            detail = detail_response.data
+            payload = {
+                "device_hash": resolved_hash,
+                "device_status": detail.get("status"),
+                "last_heartbeat": detail.get("last_heartbeat"),
+                "m2m_identity_cached": None,
+                "router_host_lookup": {"ok": None, "status_code": None, "detail": "Unavailable"},
+                "connection_quality_24h": None,
+            }
+    elif response.ok:
+        payload = response.data or {}
+    if not payload:
+        message = _friendly_response_message("Unable to fetch connection quality.", response.data, response.text)
+        if state.json_output:
+            _print_json({"ok": False, "detail": message})
+        else:
+            _show_error(state.console, message)
+        raise typer.Exit(code=1)
+    quality = payload.get("connection_quality_24h")
+    if state.json_output:
+        _print_json(
+            {
+                "device_hash": payload.get("device_hash") or resolved_hash,
+                "device_status": payload.get("device_status"),
+                "connection_quality_24h": quality,
+                "warning": warning or None,
+            }
+        )
+        return
+
+    table = Table(title=f"Connection quality: {resolved_hash}")
+    table.add_column("Key")
+    table.add_column("Value")
+    table.add_row("device_status", str(payload.get("device_status") or ""))
+    table.add_row("m2m_identity_cached", str(bool(payload.get("m2m_identity_cached"))))
+    host_lookup = payload.get("router_host_lookup") if isinstance(payload.get("router_host_lookup"), dict) else {}
+    table.add_row("router_host_lookup_ok", str(bool(host_lookup.get("ok"))))
+    table.add_row("router_host_lookup_status", str(host_lookup.get("status_code") or ""))
+    table.add_row("router_host_lookup_detail", str(host_lookup.get("detail") or ""))
+    if warning:
+        table.add_row("warning", warning)
+    if isinstance(quality, dict):
+        points = _connection_quality_points(quality)
+        for key in sorted(quality.keys()):
+            value = quality.get(key)
+            if isinstance(value, (dict, list)):
+                continue
+            table.add_row(f"connection_quality_24h.{key}", str(value))
+        table.add_row("connection_quality_24h.points", str(len(points)))
+    else:
+        points = []
+        table.add_row("connection_quality_24h", "Not available for this organisation or device.")
+    state.console.print(table)
+    if points:
+        state.console.print("24h status   " + _render_quality_status_bar(points, width=72))
+        state.console.print("24h latency  " + _render_latency_sparkline(points, width=72))
 
 
 @devices_app.command("reboot")
