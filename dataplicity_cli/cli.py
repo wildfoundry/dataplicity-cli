@@ -104,7 +104,10 @@ def main(
     if base_url:
         config.base_url = base_url.rstrip("/")
     console = Console()
-    ctx.obj = AppContext(config=config, config_path=path, console=console, json_output=json_output, api=ApiClient(config))
+    api_client = ApiClient(config, on_token_update=lambda: config.save(path))
+    if config.auth_method == "jwt" and config.refresh_token:
+        api_client.refresh_session()
+    ctx.obj = AppContext(config=config, config_path=path, console=console, json_output=json_output, api=api_client)
 
 
 @config_app.command("set")
@@ -410,17 +413,19 @@ def devices_list(
     table.add_column("Serial")
     table.add_column("Name")
     table.add_column("Status")
-    table.add_column("Online")
     table.add_column("Class")
-    table.add_column("Network")
     for device in devices:
+        status = str(device.get("status") or "").strip()
+        device_class = (
+            str((device.get("device_class") or {}).get("name") or "").strip()
+            if isinstance(device.get("device_class"), dict)
+            else ""
+        )
         table.add_row(
             str(device.get("hash_id") or device.get("serial") or ""),
             str(device.get("name") or ""),
-            str(device.get("status") or ""),
-            str(device.get("online") if device.get("online") is not None else ""),
-            str(device.get("device_class_name") or ""),
-            str(device.get("network_name") or ""),
+            status,
+            device_class,
         )
     state.console.print(table)
 
