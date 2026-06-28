@@ -122,7 +122,7 @@ async def run_single_command(
         + "PS1=''\n"
         + "PROMPT=''\n"
         + "PROMPT_COMMAND=''\n"
-        + f"printf '\\n__DP_''CLI_BEGIN_{marker_token}__\\n'\n"
+        + f"printf '__DP_''CLI_BEGIN_{marker_token}__'\n"
         + command_text
         + "\n"
         + "__dp_cli_status=$?\n"
@@ -137,10 +137,6 @@ async def run_single_command(
         begin_at = merged.find(begin_marker.encode("utf-8"))
         if begin_at != -1 and begin_at < end_at:
             output = merged[begin_at + len(begin_marker) : end_at]
-            if output.startswith(b"\r\n"):
-                output = output[2:]
-            elif output.startswith((b"\n", b"\r")):
-                output = output[1:]
         else:
             output = merged[:end_at]
         return output.rstrip(b"\r\n")
