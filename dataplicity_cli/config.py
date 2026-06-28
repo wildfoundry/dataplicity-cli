@@ -42,6 +42,8 @@ class Config:
     access_token: Optional[str] = None
     refresh_token: Optional[str] = None
     api_key: Optional[str] = None
+    last_email: Optional[str] = None
+    preferred_login_method: Optional[str] = None  # "email-password" | "sso" | "api-key"
 
     @classmethod
     def load(cls, path: Path) -> "Config":
@@ -61,6 +63,8 @@ class Config:
             access_token=raw.get("access_token"),
             refresh_token=raw.get("refresh_token"),
             api_key=raw.get("api_key"),
+            last_email=raw.get("last_email"),
+            preferred_login_method=raw.get("preferred_login_method"),
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -70,6 +74,8 @@ class Config:
             "access_token": self.access_token,
             "refresh_token": self.refresh_token,
             "api_key": self.api_key,
+            "last_email": self.last_email,
+            "preferred_login_method": self.preferred_login_method,
         }
 
     def save(self, path: Path) -> None:

@@ -124,6 +124,57 @@ class CliAuthExpiryTest(unittest.TestCase):
             self.assertFalse(payload["ok"])
             self.assertIn("Saved login appears expired", payload["detail"])
 
+    def test_setup_defaults_to_sso_with_remembered_email(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "cli.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "base_url": "https://gateway.dataplicity.com",
+                        "preferred_login_method": "sso",
+                        "last_email": "emacKenzie@dataplicity.com",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with patch("dataplicity_cli.cli.auth_sso") as mock_auth_sso:
+                result = self.runner.invoke(app, ["--config", str(config_path), "setup"], input="\n\n")
+            self.assertEqual(result.exit_code, 0, msg=result.output)
+            mock_auth_sso.assert_called_once()
+            called_kwargs = mock_auth_sso.call_args.kwargs
+            self.assertEqual(called_kwargs["email"], "emackenzie@dataplicity.com")
+            self.assertEqual(called_kwargs["open_browser"], True)
+
+    def test_auth_login_redirects_to_sso_when_account_requires_sso(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "cli.json"
+
+            with patch("dataplicity_cli.cli.ApiClient.post") as mock_post, patch("dataplicity_cli.cli.auth_sso") as mock_auth_sso:
+                mock_post.return_value = ApiResponse(
+                    ok=True,
+                    status_code=200,
+                    data={"status": "sso_redirect", "redirect_url": "https://example.com/sso"},
+                    text='{"status":"sso_redirect"}',
+                )
+                result = self.runner.invoke(
+                    app,
+                    [
+                        "--config",
+                        str(config_path),
+                        "auth",
+                        "login",
+                        "--email",
+                        "emackenzie@dataplicity.com",
+                        "--password",
+                        "secret",
+                    ],
+                )
+            self.assertEqual(result.exit_code, 0, msg=result.output)
+            mock_auth_sso.assert_called_once()
+            called_kwargs = mock_auth_sso.call_args.kwargs
+            self.assertEqual(called_kwargs["email"], "emackenzie@dataplicity.com")
+            self.assertEqual(called_kwargs["open_browser"], True)
+
 
 if __name__ == "__main__":
     unittest.main()
