@@ -9,6 +9,14 @@ name: Update Homebrew tap
         description: "Release version (e.g. 0.1.5 or v0.1.5)"
         required: true
         type: string
+      tap_repository:
+        description: "Target tap repository (owner/repo)"
+        required: false
+        type: string
+      formula_name:
+        description: "Formula filename without .rb (e.g. dataplicity-cli)"
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -48,6 +56,21 @@ jobs:
           echo "asset_name=${ASSET_NAME}" >>"${GITHUB_OUTPUT}"
           echo "asset_url=${ASSET_URL}" >>"${GITHUB_OUTPUT}"
 
+      - name: Resolve tap metadata
+        id: tap
+        env:
+          TAP_REPOSITORY_INPUT: ${{ inputs.tap_repository }}
+          FORMULA_NAME_INPUT: ${{ inputs.formula_name }}
+          TAP_REPOSITORY_VAR: ${{ vars.HOMEBREW_TAP_REPOSITORY }}
+          FORMULA_NAME_VAR: ${{ vars.HOMEBREW_FORMULA_NAME }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAP_REPOSITORY="${TAP_REPOSITORY_INPUT:-${TAP_REPOSITORY_VAR:-wildfoundry/homebrew-tap}}"
+          FORMULA_NAME="${FORMULA_NAME_INPUT:-${FORMULA_NAME_VAR:-dataplicity-cli}}"
+          echo "tap_repository=${TAP_REPOSITORY}" >>"${GITHUB_OUTPUT}"
+          echo "formula_name=${FORMULA_NAME}" >>"${GITHUB_OUTPUT}"
+
       - name: Download release asset
         id: asset
         env:
@@ -75,13 +98,13 @@ jobs:
       - name: Checkout tap repository
         uses: actions/checkout@v4
         with:
-          repository: wildfoundry/homebrew-tap
+          repository: ${{ steps.tap.outputs.tap_repository }}
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           path: homebrew-tap
 
       - name: Update formula
         env:
-          FORMULA_PATH: homebrew-tap/Formula/dataplicity-cli.rb
+          FORMULA_PATH: homebrew-tap/Formula/${{ steps.tap.outputs.formula_name }}.rb
           VERSION: ${{ steps.release.outputs.version }}
           ASSET_URL: ${{ steps.release.outputs.asset_url }}
           ASSET_SHA: ${{ steps.asset.outputs.sha }}
@@ -112,6 +135,8 @@ jobs:
       - name: Create pull request in tap
         env:
           GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          TAP_REPOSITORY: ${{ steps.tap.outputs.tap_repository }}
+          FORMULA_NAME: ${{ steps.tap.outputs.formula_name }}
           VERSION: ${{ steps.release.outputs.version }}
         shell: bash
         run: |
@@ -123,8 +148,8 @@ jobs:
             exit 0
           fi
 
-          BRANCH="chore/dataplicity-cli-${VERSION}"
-          EXISTING="$(gh pr list --repo wildfoundry/homebrew-tap --head "${BRANCH}" --state open --json number --jq '.[0].number // empty')"
+          BRANCH="chore/${FORMULA_NAME}-${VERSION}"
+          EXISTING="$(gh pr list --repo "${TAP_REPOSITORY}" --head "${BRANCH}" --state open --json number --jq '.[0].number // empty')"
           if [[ -n "${EXISTING}" ]]; then
             echo "PR already open: #${EXISTING}"
             exit 0
@@ -136,22 +161,22 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git checkout -b "${BRANCH}"
-          git add Formula/dataplicity-cli.rb
-          git commit -m "Bump dataplicity-cli to ${VERSION}"
+          git add "Formula/${FORMULA_NAME}.rb"
+          git commit -m "Bump ${FORMULA_NAME} to ${VERSION}"
           git push -u origin "${BRANCH}"
 
           gh pr create \
-            --repo wildfoundry/homebrew-tap \
+            --repo "${TAP_REPOSITORY}" \
             --base main \
             --head "${BRANCH}" \
-            --title "Bump dataplicity-cli to ${VERSION}" \
+            --title "Bump ${FORMULA_NAME} to ${VERSION}" \
             --body "$(cat <<'EOF'
           ## Summary
-          - bump `dataplicity-cli` Homebrew formula to the latest release
+          - bump Homebrew formula to the latest release
           - update formula `url`, `sha256`, and `version`
           
           ## Validation
-          - sourced release asset from `wildfoundry/dataplicity-cli` GitHub release
+          - sourced release asset from GitHub release
           - recomputed SHA256 from the downloaded tarball
           EOF
           )"

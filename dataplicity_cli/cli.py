@@ -6,11 +6,14 @@ import html
 import json
 import queue
 import re
+import shutil
 import shlex
+import socket
 import sys
 import threading
 import time
 import webbrowser
+from contextlib import suppress
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -55,7 +58,7 @@ fleet_jobs_app = typer.Typer(help="Fleet job commands")
 logging_app = typer.Typer(help="Logging commands", no_args_is_help=True)
 _EMBEDDED_SHELL_DISPATCH = False
 
-LOGGING_MAX_OUTPUT_ITEMS = 200
+LOGGING_MAX_OUTPUT_ITEMS = 1000
 LOGGING_MAX_FIELD_CHARS = 2000
 
 app.add_typer(auth_app, name="auth")
@@ -2281,6 +2284,14 @@ def _open_remote_access_port(state: AppContext, device_hash: str, payload: Dict[
     )
 
 
+def _resolve_local_port(preferred: Optional[int]) -> int:
+    if preferred is not None:
+        return preferred
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        return int(probe.getsockname()[1])
+
+
 @devices_app.command("terminal")
 def devices_terminal(ctx: typer.Context, device_hash: Optional[str] = typer.Argument(None)) -> None:
     """Open an interactive terminal session to a device.
@@ -2444,6 +2455,125 @@ def devices_port_forward(
         raise typer.Exit(code=1)
     if state.json_output:
         _print_json(result)
+
+
+@devices_app.command("ssh")
+def devices_ssh(
+    ctx: typer.Context,
+    device_hash: Optional[str] = typer.Argument(None),
+    user: Optional[str] = typer.Option(None, "--user", "-u", help="SSH username"),
+    remote_port: int = typer.Option(22, "--remote-port", help="Remote device SSH port"),
+    local_port: Optional[int] = typer.Option(None, "--local-port", help="Local port to bind (auto if omitted)"),
+    identity_file: Optional[Path] = typer.Option(
+        None,
+        "--identity-file",
+        "-i",
+        help="Path to SSH private key file (same as ssh -i)",
+    ),
+    connect_timeout: int = typer.Option(15, "--connect-timeout", min=1, help="Seconds to wait for tunnel setup"),
+    strict_host_key_checking: bool = typer.Option(
+        False,
+        "--strict-host-key-checking/--no-strict-host-key-checking",
+        help="Enable strict SSH host key checking",
+    ),
+    ssh_arg: Optional[List[str]] = typer.Option(None, "--ssh-arg", help="Extra ssh argument (repeatable)"),
+    remote_command: Optional[str] = typer.Option(None, "--remote-command", help="Optional command to run over SSH"),
+) -> None:
+    """Open SSH to a device using an automatic secure tunnel.
+
+    Uses your normal SSH authentication flow:
+    - keys from ssh-agent by default
+    - optional explicit key via --identity-file / -i
+
+    Examples:
+      dataplicity devices ssh <device-hash>
+      dataplicity devices ssh --user ubuntu <device-hash>
+      dataplicity devices ssh --user root --identity-file ~/.ssh/id_ed25519 <device-hash>
+      dataplicity devices ssh --user ubuntu -i ~/.ssh/id_ed25519 <device-hash>
+      dataplicity devices ssh --user ubuntu --remote-command "uname -a" <device-hash>
+    """
+    state = _ctx(ctx)
+    _require_auth(state)
+    if state.json_output:
+        _print_json({"ok": False, "detail": "`devices ssh` is interactive and not available in --json mode."})
+        raise typer.Exit(code=2)
+    if not shutil.which("ssh"):
+        _show_error(state.console, "`ssh` executable not found on PATH.")
+        raise typer.Exit(code=1)
+
+    resolved_hash = _resolve_device_hash_interactive(state, device_hash, action_name="ssh")
+    resolved_local_port = _resolve_local_port(local_port)
+
+    async def runner() -> None:
+        ws_url = await asyncio.wait_for(_resolve_m2m_url(state, resolved_hash), timeout=float(connect_timeout))
+        m2m = M2MClient(ws_url)
+        await asyncio.wait_for(m2m.connect(), timeout=float(connect_timeout))
+        forward_task: Optional[asyncio.Task] = None
+        listener_ready = asyncio.Event()
+
+        def on_forward_event(event: Any) -> None:
+            if getattr(event, "kind", "") == "listener_started":
+                listener_ready.set()
+
+        try:
+            identity = await m2m.wait_for_identity(timeout=float(connect_timeout))
+            response = _open_remote_access_port(
+                state,
+                resolved_hash,
+                {
+                    "m2m_identity": identity,
+                    "service": "redirect-port",
+                    "port": remote_port,
+                },
+            )
+            if not response.ok:
+                raise RuntimeError(_friendly_response_message("Unable to open SSH tunnel.", response.data, response.text))
+            channel_port = await m2m.wait_for_channel_open(timeout=float(connect_timeout))
+            from .remote_access import run_port_forward
+
+            forward_task = asyncio.create_task(
+                run_port_forward(
+                    m2m,
+                    channel_port,
+                    resolved_local_port,
+                    event_callback=on_forward_event,
+                )
+            )
+            await asyncio.wait_for(listener_ready.wait(), timeout=float(connect_timeout))
+
+            target = f"{user}@127.0.0.1" if user else "127.0.0.1"
+            ssh_cmd: List[str] = ["ssh", "-p", str(resolved_local_port)]
+            if identity_file:
+                ssh_cmd.extend(["-i", str(identity_file.expanduser())])
+            if not strict_host_key_checking:
+                ssh_cmd.extend(["-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null"])
+            ssh_cmd.extend(ssh_arg or [])
+            ssh_cmd.append(target)
+            if remote_command:
+                ssh_cmd.append(remote_command)
+
+            state.console.print(
+                f"[green]SSH tunnel ready:[/green] {target} via localhost:{resolved_local_port} -> device:{remote_port}"
+            )
+            proc = await asyncio.create_subprocess_exec(*ssh_cmd)
+            exit_code = await proc.wait()
+            if exit_code != 0:
+                raise RuntimeError(f"ssh exited with code {exit_code}.")
+        finally:
+            if forward_task:
+                forward_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await forward_task
+            await m2m.close()
+
+    try:
+        asyncio.run(runner())
+    except KeyboardInterrupt:
+        state.console.print("[yellow]SSH session closed.[/yellow]")
+        raise typer.Exit(code=0)
+    except Exception as exc:
+        _show_error(state.console, str(exc) or "SSH session failed.")
+        raise typer.Exit(code=1)
 
 
 @devices_app.command("remote-file")
@@ -3263,7 +3393,7 @@ def fleet_jobs_delete(ctx: typer.Context, job_id: str = typer.Argument(...)) -> 
 @logging_app.command("list")
 def logging_list(
     ctx: typer.Context,
-    page_size: int = typer.Option(200, "--page-size", help="Number of records to request (max 200)"),
+    page_size: int = typer.Option(200, "--page-size", help="Number of records to request (max 1000)"),
     device_hash: Optional[str] = typer.Option(None, "--device", help="Filter by device hash"),
     level: Optional[str] = typer.Option(None, "--level", help="Filter by log level"),
     path: Optional[str] = typer.Option(None, "--path", help="Filter by web-style path scope (for example /devices/<hash>)"),
@@ -3273,15 +3403,15 @@ def logging_list(
     all_scopes: bool = typer.Option(
         False,
         "--all-scopes",
-        help="Allow broad cross-fleet queries. Requires a bounded time window.",
+        help="Compatibility flag retained for older scripts (no-op).",
     ),
 ) -> None:
-    """List log events with safe query constraints.
+    """List raw log lines.
 
     Examples:
-      dataplicity logging list --device <device-hash> --since 4h
+      dataplicity logging list
       dataplicity logging list --path /devices/<device-hash> --level error --since 24h
-      dataplicity logging list --all-scopes --search timeout --since 30m
+      dataplicity logging list --search timeout --since 30m
     """
     state = _ctx(ctx)
     max_page_size = LOGGING_MAX_OUTPUT_ITEMS
@@ -3292,16 +3422,12 @@ def logging_list(
         else:
             _show_error(state.console, message)
         raise typer.Exit(code=2)
-    if not any([device_hash, level, path, search, all_scopes]):
-        message = (
-            "Refusing broad log query. Provide at least one scope filter "
-            "(--device, --path, --search, or --level), or pass --all-scopes."
-        )
-        if state.json_output:
-            _print_json({"ok": False, "detail": message})
-        else:
-            _show_error(state.console, message)
-        raise typer.Exit(code=2)
+    broad_default = not any([device_hash, level, path, search])
+    if broad_default:
+        # For no-filter usage, return a safe default slice rather than failing.
+        page_size = min(page_size, 150)
+        if not state.json_output:
+            state.console.print("[yellow]No filters provided.[/yellow] Showing most recent 150 log lines.")
     now = dt.datetime.now(dt.timezone.utc)
     try:
         since_iso = _parse_log_time_expr(since, now=now)
@@ -3331,7 +3457,7 @@ def logging_list(
         params["path"] = path
     if search:
         params["search"] = search
-    response = state.api.get(_incident_automation_endpoint(state, "insights"), params=params)
+    response = state.api.get("/api/developer/logging/", params=params)
     if not response.ok:
         message = _friendly_response_message("Unable to list logging.", response.data, response.text)
         if state.json_output:
@@ -3344,7 +3470,7 @@ def logging_list(
     if state.json_output:
         _print_json(safe_payload)
         return
-    _render_resource_table(state, "Logging insights", safe_payload)
+    _render_resource_table(state, "Log events", safe_payload)
     if was_truncated:
         state.console.print(
             f"[yellow]Output truncated:[/yellow] showing first {LOGGING_MAX_OUTPUT_ITEMS} records "
@@ -3362,7 +3488,7 @@ def logging_ls(
     search: Optional[str] = typer.Option(None, "--search", help="Free-text search term"),
     since: str = typer.Option("1h", "--since", help="Start of time window (relative like 15m, 2h, 1d, or ISO timestamp)"),
     until: Optional[str] = typer.Option(None, "--until", help="End of time window (relative or ISO timestamp)"),
-    all_scopes: bool = typer.Option(False, "--all-scopes", help="Allow broad cross-fleet queries. Requires a bounded time window."),
+    all_scopes: bool = typer.Option(False, "--all-scopes", help="Compatibility flag retained for older scripts (no-op)."),
 ) -> None:
     """Alias for `logging list`."""
     logging_list(
@@ -3525,7 +3651,7 @@ def logging_show(ctx: typer.Context, log_id: str = typer.Argument(...)) -> None:
     """
     state = _ctx(ctx)
     _require_auth(state)
-    response = state.api.get(_incident_automation_endpoint(state, "insights"))
+    response = state.api.get(f"/api/developer/logging/{log_id}/")
     if not response.ok:
         message = _friendly_response_message("Unable to fetch log event.", response.data, response.text)
         if state.json_output:
@@ -3533,7 +3659,16 @@ def logging_show(ctx: typer.Context, log_id: str = typer.Argument(...)) -> None:
         else:
             _show_error(state.console, message)
         raise typer.Exit(code=1)
-    _show_item_from_list_payload(state, response.data or [], resource_id=log_id, label="log event")
+    if state.json_output:
+        _print_json(response.data if response.data is not None else {})
+        return
+    table = Table(title=f"Log event {log_id}")
+    table.add_column("Key")
+    table.add_column("Value")
+    payload = response.data if isinstance(response.data, dict) else {"value": response.data}
+    for key, value in payload.items():
+        table.add_row(str(key), json.dumps(_sanitize_payload(value)))
+    state.console.print(table)
 
 
 @logging_app.command("get")
