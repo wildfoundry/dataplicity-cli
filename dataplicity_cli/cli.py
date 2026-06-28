@@ -2119,28 +2119,42 @@ def devices_connection_quality(ctx: typer.Context, device_hash: Optional[str] = 
     state = _ctx(ctx)
     _require_auth(state)
     resolved_hash = _resolve_device_hash_interactive(state, device_hash, action_name="connection quality")
-    warning = "Connection quality endpoint is unavailable on this API host."
-    detail_response = state.api.get(f"/api/developer/devices/{resolved_hash}/")
-    host_response = state.api.get(f"/api/remote/devices/{resolved_hash}/host/")
-    payload = {}
-    if detail_response.ok and isinstance(detail_response.data, dict):
-        detail = detail_response.data
-        payload = {
-            "device_hash": resolved_hash,
-            "device_status": detail.get("status"),
-            "last_heartbeat": detail.get("last_heartbeat"),
-            "m2m_identity_cached": None,
-            "router_host_lookup": {
-                "ok": host_response.ok,
-                "status_code": host_response.status_code,
-                "detail": _friendly_response_message(
-                    "Host lookup unavailable",
-                    host_response.data,
-                    host_response.text,
-                ),
-            },
-            "connection_quality_24h": None,
-        }
+    warning: Optional[str] = None
+    status_response = state.api.get(f"/api/developer/devices/{resolved_hash}/remote-access-status/")
+    payload: Dict[str, Any] = {}
+    if status_response.ok and isinstance(status_response.data, dict):
+        payload = status_response.data
+    else:
+        detail_response = state.api.get(f"/api/developer/devices/{resolved_hash}/")
+        host_response = state.api.get(f"/api/remote/devices/{resolved_hash}/host/")
+        if detail_response.ok and isinstance(detail_response.data, dict):
+            detail = detail_response.data
+            payload = {
+                "device_hash": resolved_hash,
+                "device_status": detail.get("status"),
+                "last_heartbeat": detail.get("last_heartbeat"),
+                "m2m_identity_cached": None,
+                "router_host_lookup": {
+                    "ok": host_response.ok,
+                    "status_code": host_response.status_code,
+                    "detail": _friendly_response_message(
+                        "Host lookup unavailable",
+                        host_response.data,
+                        host_response.text,
+                    ),
+                },
+                "connection_quality_24h": None,
+            }
+            if status_response.status_code in {404, 405}:
+                warning = "Connection quality endpoint is unavailable on this API host."
+            elif status_response.status_code >= 400:
+                warning = _friendly_response_message(
+                    "Unable to fetch connection quality from remote access status endpoint.",
+                    status_response.data,
+                    status_response.text,
+                )
+        else:
+            detail_response = status_response
     if not payload:
         message = _friendly_response_message("Unable to fetch connection quality.", detail_response.data, detail_response.text)
         if state.json_output:
