@@ -105,23 +105,53 @@ async def run_single_command(
     command: str,
     *,
     timeout_seconds: Optional[float] = 30.0,
+    first_response_timeout_seconds: float = 8.0,
+    idle_timeout_seconds: float = 8.0,
 ) -> bytes:
     queue = m2m.channel_queue(channel_port)
     command_text = str(command or "").strip()
     if not command_text:
         raise RuntimeError("Command cannot be empty.")
 
-    # Send command and close the terminal session afterwards.
-    await m2m.send_route(channel_port, f"{command_text}\nexit\n".encode("utf-8"))
+    done_marker = "__DP_CLI_DONE__"
+    wrapped_command = (
+        command_text
+        + "\n"
+        + "__dp_cli_status=$?\n"
+        + "printf '\\n__DP_' 'CLI_DONE__%s\\n' \"$__dp_cli_status\"\n"
+        + "exit\n"
+    )
+    await m2m.send_route(channel_port, wrapped_command.encode("utf-8"))
 
     async def read_output() -> bytes:
         chunks = []
+        marker_bytes = done_marker.encode("utf-8")
+        saw_any_data = False
         while True:
-            data = await queue.get()
+            if not saw_any_data:
+                try:
+                    data = await asyncio.wait_for(queue.get(), timeout=first_response_timeout_seconds)
+                except asyncio.TimeoutError as exc:
+                    raise RuntimeError(
+                        "Remote shell did not produce any output; command execution may be unavailable on this device."
+                    ) from exc
+            else:
+                try:
+                    data = await asyncio.wait_for(queue.get(), timeout=idle_timeout_seconds)
+                except asyncio.TimeoutError as exc:
+                    raise RuntimeError(
+                        "Remote shell became idle before command completion; no completion marker was observed."
+                    ) from exc
             if data is None:
                 break
+            saw_any_data = True
             chunks.append(data)
-        return b"".join(chunks)
+            merged = b"".join(chunks)
+            marker_at = merged.find(marker_bytes)
+            if marker_at != -1:
+                # Stop at sentinel instead of waiting for socket teardown.
+                return merged[:marker_at].rstrip(b"\r\n")
+        return b"".join(chunks).rstrip(b"\r\n")
 
     if timeout_seconds is None:
         return await read_output()

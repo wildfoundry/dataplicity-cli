@@ -76,6 +76,7 @@ class AppContext:
     config_path: Path
     console: Console
     json_output: bool
+    debug: bool
     api: ApiClient
 
 
@@ -1223,6 +1224,7 @@ def main(
         help="Show CLI version and exit",
     ),
     json_output: bool = typer.Option(False, "--json", help="Output JSON instead of tables"),
+    debug: bool = typer.Option(False, "--debug", help="Enable diagnostic progress output"),
     config_path: Optional[Path] = typer.Option(None, "--config", help="Path to config file"),
     base_url: Optional[str] = typer.Option(None, "--base-url", help="Override API base URL"),
 ) -> None:
@@ -1235,7 +1237,14 @@ def main(
     api_client = ApiClient(config, on_token_update=lambda: config.save(path))
     if config.auth_method == "jwt" and config.refresh_token:
         api_client.refresh_session()
-    ctx.obj = AppContext(config=config, config_path=path, console=console, json_output=json_output, api=api_client)
+    ctx.obj = AppContext(
+        config=config,
+        config_path=path,
+        console=console,
+        json_output=json_output,
+        debug=debug,
+        api=api_client,
+    )
     if (
         not _EMBEDDED_SHELL_DISPATCH
         and ctx.invoked_subcommand is None
@@ -2548,7 +2557,8 @@ def devices_run(
     async def runner() -> str:
         from .remote_access import run_single_command
 
-        if not state.json_output:
+        verbose = state.debug and (not state.json_output)
+        if verbose:
             state.console.print(f"[blue]Connecting to {resolved_hash}...[/blue]")
         try:
             ws_url = await asyncio.wait_for(_resolve_m2m_url(state, resolved_hash), timeout=float(connect_timeout))
@@ -2564,7 +2574,7 @@ def devices_run(
                 f"Timed out after {connect_timeout}s while opening remote transport."
             ) from exc
         try:
-            if not state.json_output:
+            if verbose:
                 state.console.print("[blue]Authorising remote session...[/blue]")
             identity = await m2m.wait_for_identity(timeout=float(connect_timeout))
             response = _open_remote_access_port(
@@ -2575,7 +2585,7 @@ def devices_run(
             if not response.ok:
                 raise RuntimeError(response.text or "Unable to open terminal")
             channel_port = await m2m.wait_for_channel_open(timeout=float(connect_timeout))
-            if not state.json_output:
+            if verbose:
                 if timeout_seconds is None:
                     state.console.print("[blue]Running command (no timeout)...[/blue]")
                 else:
@@ -2585,6 +2595,8 @@ def devices_run(
                 channel_port,
                 command,
                 timeout_seconds=timeout_seconds,
+                first_response_timeout_seconds=float(min(connect_timeout, 8)),
+                idle_timeout_seconds=float(min(timeout if not no_timeout else connect_timeout, 8)),
             )
             return output_bytes.decode("utf-8", "replace")
         finally:
