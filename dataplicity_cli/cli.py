@@ -3668,6 +3668,18 @@ def _format_log_ts(ts_value: Any) -> str:
     return ts.isoformat().replace("+00:00", "Z")
 
 
+def _extract_log_device(row: Dict[str, Any]) -> str:
+    explicit = str(row.get("device_hash") or row.get("device") or "").strip()
+    if explicit:
+        return explicit
+    message = str(row.get("message") or "")
+    for pattern in (r"\bdevice=([^\s,]+)", r"\bdevice_hash=([^\s,]+)"):
+        match = re.search(pattern, message)
+        if match:
+            return str(match.group(1)).strip()
+    return ""
+
+
 def _render_log_events_table(state: AppContext, payload: Any) -> None:
     rows = _extract_objects(payload)
     table = Table(title="Log events")
@@ -3686,7 +3698,7 @@ def _render_log_events_table(state: AppContext, payload: Any) -> None:
             _format_log_ts(row.get("ts")),
             str(row.get("level") or ""),
             source_value,
-            str(row.get("device_hash") or ""),
+            _extract_log_device(row),
             str(row.get("message") or ""),
         )
     state.console.print(table)
