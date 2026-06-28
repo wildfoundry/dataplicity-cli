@@ -114,18 +114,22 @@ async def run_single_command(
         raise RuntimeError("Command cannot be empty.")
 
     done_marker = "__DP_CLI_DONE__"
+    prompt_marker = "__DP_CLI_PROMPT__"
     wrapped_command = (
-        command_text
+        "__dp_cli_prev_ps1=\"$PS1\"\n"
+        + f"PS1='{prompt_marker} '\n"
+        + f"PROMPT='{prompt_marker} '\n"
+        + command_text
         + "\n"
         + "__dp_cli_status=$?\n"
         + "printf '\\n__DP_' 'CLI_DONE__%s\\n' \"$__dp_cli_status\"\n"
-        + "exit\n"
     )
     await m2m.send_route(channel_port, wrapped_command.encode("utf-8"))
 
     async def read_output() -> bytes:
         chunks = []
         marker_bytes = done_marker.encode("utf-8")
+        prompt_marker_bytes = prompt_marker.encode("utf-8")
         saw_any_data = False
         while True:
             if not saw_any_data:
@@ -139,6 +143,15 @@ async def run_single_command(
                 try:
                     data = await asyncio.wait_for(queue.get(), timeout=idle_timeout_seconds)
                 except asyncio.TimeoutError as exc:
+                    # Some environments never echo our sentinel but still return
+                    # complete output and a prompt. Fall back to what we have
+                    # instead of hard-failing interactive command execution.
+                    if chunks:
+                        try:
+                            await m2m.close_channel(channel_port)
+                        except Exception:
+                            pass
+                        return b"".join(chunks).rstrip(b"\r\n")
                     raise RuntimeError(
                         "Remote shell became idle before command completion; no completion marker was observed."
                     ) from exc
@@ -151,6 +164,11 @@ async def run_single_command(
             if marker_at != -1:
                 # Stop at sentinel instead of waiting for socket teardown.
                 return merged[:marker_at].rstrip(b"\r\n")
+            prompt_marker_at = merged.find(prompt_marker_bytes)
+            if prompt_marker_at != -1 and saw_any_data:
+                # Prompt marker can be more reliable on some shells where our
+                # done marker is buffered or dropped.
+                return merged[:prompt_marker_at].rstrip(b"\r\n")
         return b"".join(chunks).rstrip(b"\r\n")
 
     if timeout_seconds is None:
