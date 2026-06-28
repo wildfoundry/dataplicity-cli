@@ -32,8 +32,7 @@ class RunSingleCommandTest(unittest.IsolatedAsyncioTestCase):
         fake = _FakeM2M()
         queue = fake.channel_queue(7)
         await queue.put(
-            b"\r\n__DP_CLI_BEGIN_abc123ef__\r\n"
-            b"Linux test-host 6.6.0\r\n"
+            b"\r\n__DP_CLI_BEGIN_abc123ef__Linux test-host 6.6.0\r\n"
             b"\r\n__DP_CLI_DONE_abc123ef__0\r\n$"
         )
 
@@ -53,7 +52,7 @@ class RunSingleCommandTest(unittest.IsolatedAsyncioTestCase):
     async def test_idle_fallback_returns_collected_output_without_marker(self) -> None:
         fake = _FakeM2M()
         queue = fake.channel_queue(9)
-        await queue.put(b"\r\n__DP_CLI_BEGIN_abc123ef__\r\nLinux test-host 6.6.0\n$")
+        await queue.put(b"\r\n__DP_CLI_BEGIN_abc123ef__Linux test-host 6.6.0\n$")
 
         with patch("dataplicity_cli.remote_access.secrets.token_hex", return_value="abc123ef"):
             output = await run_single_command(
@@ -73,9 +72,8 @@ class RunSingleCommandTest(unittest.IsolatedAsyncioTestCase):
         queue = fake.channel_queue(11)
         await queue.put(
             b"root@test:/# stty -echo 2>/dev/null || true\r\n"
-            b"root@test:/# printf '\\n__DP_''CLI_BEGIN_abc123ef__\\n'\r\n"
-            b"\r\n__DP_CLI_BEGIN_abc123ef__\r\n"
-            b"Linux test-host 6.6.0\r\n"
+            b"root@test:/# printf '__DP_''CLI_BEGIN_abc123ef__'\r\n"
+            b"\r\n__DP_CLI_BEGIN_abc123ef__Linux test-host 6.6.0\r\n"
             b"\r\n__DP_CLI_DONE_abc123ef__0\r\n"
         )
 
@@ -96,8 +94,7 @@ class RunSingleCommandTest(unittest.IsolatedAsyncioTestCase):
         fake = _FakeM2M()
         queue = fake.channel_queue(13)
         await queue.put(
-            b"\r\n__DP_CLI_BEGIN_abc123ef__\r\n"
-            b"Linux test-host 6.6.0\r\n"
+            b"\r\n__DP_CLI_BEGIN_abc123ef__Linux test-host 6.6.0\r\n"
             b"\r\n__DP_CLI_DONE_abc123ef__0\r\n"
         )
 
@@ -126,8 +123,7 @@ class RunSingleCommandTest(unittest.IsolatedAsyncioTestCase):
         fake = _FakeM2M()
         queue = fake.channel_queue(15)
         await queue.put(
-            b"\r\n__DP_CLI_BEGIN_abc123ef__\r\n"
-            b"Linux test-host 6.6.0\r\n"
+            b"\r\n__DP_CLI_BEGIN_abc123ef__Linux test-host 6.6.0\r\n"
             b"\r\n__DP_CLI_DONE_abc123ef__0\r\n"
             b"stty echo 2>/dev/null || true\r\n"
         )
@@ -148,6 +144,27 @@ class RunSingleCommandTest(unittest.IsolatedAsyncioTestCase):
             payload.index(b"__DP_''CLI_DONE_abc123ef__"),
             payload.index(b"stty echo 2>/dev/null || true"),
         )
+
+    async def test_preserves_intentional_leading_newline_from_command(self) -> None:
+        fake = _FakeM2M()
+        queue = fake.channel_queue(17)
+        await queue.put(
+            b"\r\n__DP_CLI_BEGIN_abc123ef__\r\n"
+            b"starts after blank\r\n"
+            b"\r\n__DP_CLI_DONE_abc123ef__0\r\n"
+        )
+
+        with patch("dataplicity_cli.remote_access.secrets.token_hex", return_value="abc123ef"):
+            output = await run_single_command(
+                fake,
+                17,
+                "printf '\\nstarts after blank\\n'",
+                timeout_seconds=1.0,
+                first_response_timeout_seconds=0.1,
+                idle_timeout_seconds=0.1,
+            )
+
+        self.assertEqual(output, b"\r\nstarts after blank")
 
 
 if __name__ == "__main__":
