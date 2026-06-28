@@ -66,6 +66,21 @@ class CliUxSnapshotsTest(unittest.TestCase):
         for snippet in expected_snippets:
             self.assertIn(snippet, result.output)
 
+    def test_devices_ssh_help_snapshot(self) -> None:
+        result = self._invoke(["devices", "ssh", "--help"])
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+        expected_snippets = [
+            "Open SSH to a device using an automatic secure tunnel.",
+            "keys from ssh-agent by default",
+            "dataplicity devices ssh <device-hash>",
+            "--user",
+            "--remote-port",
+            "--local-port",
+            "--identity-file",
+        ]
+        for snippet in expected_snippets:
+            self.assertIn(snippet, result.output)
+
     def test_devices_port_forward_help_snapshot(self) -> None:
         result = self._invoke(["devices", "port-forward", "--help"])
         self.assertEqual(result.exit_code, 0, msg=result.output)
@@ -105,7 +120,7 @@ class CliUxSnapshotsTest(unittest.TestCase):
         result = self._invoke(["logging", "list", "--help"])
         self.assertEqual(result.exit_code, 0, msg=result.output)
         expected_snippets = [
-            "List log events with safe query constraints.",
+            "List raw log lines.",
             "--device",
             "--path",
             "--search",
@@ -142,14 +157,14 @@ class CliUxSnapshotsTest(unittest.TestCase):
             "Authentication required. Use `dataplicity auth sso`, `dataplicity auth login`, or `dataplicity auth api-key`.",
         )
 
-    def test_logging_scope_guard_snapshot_json(self) -> None:
+    def test_logging_default_scope_snapshot_json(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = Path(temp_dir) / "cli.json"
             result = self._invoke(["--json", "--config", str(config_path), "logging", "list"])
         self.assertEqual(result.exit_code, 2, msg=result.output)
         payload = json.loads(result.output)
         self.assertEqual(payload.get("ok"), False)
-        self.assertIn("Refusing broad log query", payload.get("detail", ""))
+        self.assertIn("Authentication required", payload.get("detail", ""))
 
 
 if __name__ == "__main__":

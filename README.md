@@ -172,13 +172,13 @@ Discover web-style path filters for logs:
 dataplicity logging path-map
 ```
 
-Cross-fleet log searches are intentionally explicit:
+Search logs across your org:
 
 ```
-dataplicity logging list --all-scopes --search timeout --since 30m
+dataplicity logging list --search timeout --since 30m
 ```
 
-Log output is client-truncated for safety (max 200 records per request, long fields abbreviated).
+Log output is client-truncated for safety (defaults to 150 recent lines when unfiltered, max 1000 records per request, long fields abbreviated).
 
 Show your current session and fleet summary:
 
@@ -201,8 +201,12 @@ dataplicity --install-completion zsh
 ## Maintainers
 
 - Releases publish a macOS tarball (`dataplicity-cli-<version>-macos-universal2.tar.gz`) for Homebrew consumption.
-- The `Update Homebrew tap` workflow opens a PR in `wildfoundry/homebrew-tap` after each published release.
-- Configure a repository secret named `HOMEBREW_TAP_TOKEN` (PAT with repo write access to `wildfoundry/homebrew-tap`) to enable that automation.
+- The `Update Homebrew tap` workflow opens a PR in your tap repo after each published release.
+- Configure a repository secret named `HOMEBREW_TAP_TOKEN` (PAT with repo write access to your tap repository) to enable that automation.
+- Configure repository variables to target your tap:
+  - `HOMEBREW_TAP_REPOSITORY` (example: `your-org/homebrew-tap`)
+  - `HOMEBREW_FORMULA_NAME` (default: `dataplicity-cli`)
+- You can also override tap settings per manual run using workflow inputs `tap_repository` and `formula_name`.
 - The `Update WinGet package` workflow publishes new `.msi` releases to WinGet using `Wildfoundry.DataplicityCLI`.
 - Configure a repository secret named `WINGET_TOKEN` (classic PAT with `public_repo`) and ensure your account has a fork of `microsoft/winget-pkgs`.
 - WinGet automation updates existing manifests; if this package is not yet in WinGet, submit the first manifest manually, then subsequent releases are automated.
