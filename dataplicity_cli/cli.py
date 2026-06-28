@@ -583,14 +583,37 @@ def _coerce_timeout_seconds(value: Any, default: int = 180) -> int:
 
 
 def _friendly_response_message(default_message: str, response_data: Any, response_text: str) -> str:
+    detail = None
     if isinstance(response_data, dict):
         detail = response_data.get("detail") or response_data.get("error") or response_data.get("message")
         if isinstance(detail, str) and detail.strip():
-            return detail
+            detail = detail.strip()
+        else:
+            detail = None
         non_field = response_data.get("non_field_errors")
-        if isinstance(non_field, list) and non_field:
-            return str(non_field[0])
-    return response_text or default_message
+        if detail is None and isinstance(non_field, list) and non_field:
+            detail = str(non_field[0])
+    message = detail or response_text or default_message
+    if _looks_like_invalid_auth_message(message):
+        return "Saved login appears expired or invalid. Run `dataplicity setup` to sign in again."
+    return message
+
+
+def _looks_like_invalid_auth_message(message: str) -> bool:
+    normalized = (message or "").strip().lower()
+    if not normalized:
+        return False
+    markers = (
+        "token not valid",
+        "not valid for any token type",
+        "invalid token",
+        "token is invalid or expired",
+        "token has expired",
+        "signature has expired",
+        "expired token",
+        "authentication credentials were not provided",
+    )
+    return any(marker in normalized for marker in markers)
 
 
 def _format_rate(bytes_per_second: float) -> str:
@@ -760,9 +783,6 @@ def _discover_port_forward_capabilities(state: AppContext, device_hash: str) -> 
     profile_payload = _load_user_profile_payload(state)
     if profile_payload:
         sources.append(profile_payload)
-    org_response = state.api.get("/api/v1/organisations/")
-    if org_response.ok:
-        sources.append(org_response.data)
     device_response = state.api.get(f"/api/developer/devices/{device_hash}/")
     if device_response.ok:
         sources.append(device_response.data)
@@ -938,6 +958,24 @@ def _require_auth(ctx: AppContext) -> None:
     else:
         _show_error(ctx.console, message)
     raise typer.Exit(code=2)
+
+
+def _jwt_session_still_valid(ctx: AppContext) -> bool:
+    if not (ctx.config.auth_method == "jwt" and ctx.config.access_token):
+        return False
+    probe = ctx.api.get("/api/developer/devices/", params={"page_size": 1})
+    if probe.ok:
+        return True
+    raw_message = probe.text or ""
+    if isinstance(probe.data, dict):
+        detail = probe.data.get("detail") or probe.data.get("error") or probe.data.get("message")
+        if isinstance(detail, str) and detail.strip():
+            raw_message = detail.strip()
+        else:
+            non_field = probe.data.get("non_field_errors")
+            if isinstance(non_field, list) and non_field:
+                raw_message = str(non_field[0])
+    return not _looks_like_invalid_auth_message(raw_message)
 
 
 def _extract_devices(payload: Any) -> List[Dict[str, Any]]:
@@ -1183,11 +1221,15 @@ def setup(ctx: typer.Context) -> None:
     """
     state = _ctx(ctx)
     if state.config.auth_method == "jwt" and state.config.access_token:
-        if state.json_output:
-            _print_json({"ok": True, "detail": "Already logged in", "auth_method": "jwt"})
+        if not _jwt_session_still_valid(state):
+            state.config.clear_tokens()
+            state.config.save(state.config_path)
         else:
-            state.console.print("[green]Already logged in.[/green] You can run `dataplicity devices list`.")
-        return
+            if state.json_output:
+                _print_json({"ok": True, "detail": "Already logged in", "auth_method": "jwt"})
+            else:
+                state.console.print("[green]Already logged in.[/green] You can run `dataplicity devices list`.")
+            return
     if state.config.auth_method == "api_key" and state.config.api_key:
         if state.json_output:
             _print_json({"ok": True, "detail": "API key already configured", "auth_method": "api_key"})
@@ -1233,18 +1275,24 @@ def whoami(ctx: typer.Context) -> None:
     """
     state = _ctx(ctx)
     _require_auth(state)
-    org_response = state.api.get("/api/v1/organisations/")
     devices_response = state.api.get("/api/developer/devices/", params={"page_size": 250})
+    if not devices_response.ok:
+        message = _friendly_response_message("Unable to load CLI status.", devices_response.data, devices_response.text)
+        if state.json_output:
+            _print_json({"ok": False, "detail": message})
+        else:
+            _show_error(state.console, message)
+        raise typer.Exit(code=1)
     profile_payload = _load_user_profile_payload(state)
     profile_ports = _extract_port_forwarding_ports(profile_payload) if profile_payload else None
     profile_all_ports = bool(profile_ports and -1 in profile_ports)
     display_ports = sorted(port for port in (profile_ports or []) if port != -1)
-    orgs = _extract_orgs(org_response.data or []) if org_response.ok else []
-    devices = _extract_devices(devices_response.data or []) if devices_response.ok else []
+    devices = _extract_devices(devices_response.data or [])
+    org = _infer_primary_org_from_devices(devices)
     payload = {
         "base_url": state.config.base_url,
         "auth_method": state.config.auth_method,
-        "organisation": orgs[0] if orgs else None,
+        "organisation": org,
         "devices_total": len(devices),
         "port_forwarding_ports": [-1] if profile_all_ports else display_ports,
     }
@@ -1256,8 +1304,7 @@ def whoami(ctx: typer.Context) -> None:
     table.add_column("Value")
     table.add_row("API host", state.config.base_url)
     table.add_row("Auth", str(state.config.auth_method or "none"))
-    if orgs:
-        org = orgs[0]
+    if org:
         table.add_row("Organisation", str(org.get("name") or "(unnamed)"))
         table.add_row("Organisation hash", str(org.get("hash_id") or org.get("hash") or ""))
     table.add_row("Devices", f"{len(devices)} total")
@@ -1307,7 +1354,7 @@ def doctor(ctx: typer.Context) -> None:
     )
 
     if auth_configured:
-        org_probe = state.api.get("/api/v1/organisations/")
+        org_probe = state.api.get("/api/developer/devices/", params={"page_size": 1})
         checks.append(
             {
                 "name": "auth_valid",
@@ -1320,7 +1367,7 @@ def doctor(ctx: typer.Context) -> None:
             }
         )
         if org_probe.ok:
-            devices_probe = state.api.get("/api/developer/devices/", params={"page_size": 1})
+            devices_probe = org_probe
             checks.append(
                 {
                     "name": "devices_endpoint",
@@ -1631,56 +1678,79 @@ def _extract_orgs(payload: Any) -> List[Dict[str, Any]]:
     return []
 
 
+def _infer_primary_org_from_devices(devices: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not devices:
+        return None
+    first = devices[0]
+    org_hash = str(first.get("organisation_hash") or first.get("organisation") or "").strip()
+    org_name = ""
+    for tag in first.get("property_tags") or []:
+        if not isinstance(tag, str):
+            continue
+        if tag.startswith("organisation:"):
+            org_name = tag.split(":", 1)[1].strip()
+            if org_name:
+                break
+    if not org_name:
+        org_name = str(first.get("organisation_name") or first.get("org_name") or "").strip()
+    if not org_hash and not org_name:
+        return None
+    return {"hash_id": org_hash, "name": org_name}
+
+
 def _resolve_primary_org_hash(state: AppContext) -> str:
     _require_auth(state)
-    response = state.api.get("/api/v1/organisations/")
-    if response.ok:
-        orgs = _extract_orgs(response.data or [])
-        if orgs:
-            org = orgs[0]
-            org_hash = str(org.get("hash_id") or org.get("hash") or "").strip()
-            if org_hash:
-                return org_hash
     devices_response = state.api.get("/api/developer/devices/", params={"page_size": 1})
     if devices_response.ok:
-        devices = _extract_objects(devices_response.data or [])
-        if devices:
-            org_hash = str(devices[0].get("organisation_hash") or "").strip()
+        devices = _extract_devices(devices_response.data or [])
+        org = _infer_primary_org_from_devices(devices)
+        if org:
+            org_hash = str(org.get("hash_id") or "").strip()
             if org_hash:
                 return org_hash
-    if not response.ok:
-        message = _friendly_response_message("Unable to fetch organisation.", response.data, response.text)
-        if state.json_output:
-            _print_json({"ok": False, "detail": message})
-        else:
-            _show_error(state.console, message)
-        raise typer.Exit(code=1)
-    message = "No organisation found for this user."
+    message = _friendly_response_message(
+        "Unable to determine organisation hash from accessible devices.",
+        devices_response.data,
+        devices_response.text,
+    )
     if state.json_output:
         _print_json({"ok": False, "detail": message})
     else:
         _show_error(state.console, message)
-    raise typer.Exit(code=2)
+    raise typer.Exit(code=1)
 
 
-def _statuspages_endpoint(state: AppContext, resource: str) -> str:
+def _incident_automation_endpoint(state: AppContext, resource: str) -> str:
     org_hash = _resolve_primary_org_hash(state)
     suffix = resource.strip("/")
-    return f"/api/organisations/{org_hash}/statuspages/{suffix}/"
+    return f"/api/organisations/{org_hash}/incident-automation/{suffix}/"
 
 
-def _resolve_monitor_collection_endpoint(state: AppContext, *, statuspages_resource: str, legacy_endpoint: str) -> str:
-    candidates: List[str] = []
-    try:
-        candidates.append(_statuspages_endpoint(state, statuspages_resource))
-    except typer.Exit:
-        pass
-    candidates.append(legacy_endpoint)
-    for endpoint in candidates:
-        probe = state.api.get(endpoint, params={"page_size": 1})
-        if probe.status_code != 404:
-            return endpoint
-    return candidates[0]
+def _show_item_from_list_payload(
+    state: AppContext,
+    payload: Any,
+    *,
+    resource_id: str,
+    label: str,
+) -> None:
+    rows = _extract_objects(payload)
+    item = next((row for row in rows if str(row.get("id") or row.get("hash_id") or "") == resource_id), None)
+    if not item:
+        message = f"{label.title()} `{resource_id}` not found."
+        if state.json_output:
+            _print_json({"ok": False, "detail": message})
+        else:
+            _show_error(state.console, message)
+        raise typer.Exit(code=2)
+    if state.json_output:
+        _print_json(item)
+        return
+    table = Table(title=f"{label.title()} {resource_id}")
+    table.add_column("Key")
+    table.add_column("Value")
+    for key, value in item.items():
+        table.add_row(str(key), json.dumps(_sanitize_payload(value)))
+    state.console.print(table)
 
 
 @orgs_app.command("show")
@@ -1693,36 +1763,27 @@ def orgs_show(ctx: typer.Context) -> None:
     """
     state = _ctx(ctx)
     _require_auth(state)
-    response = state.api.get("/api/v1/organisations/")
-    if not response.ok:
-        message = _friendly_response_message("Unable to fetch organisation.", response.data, response.text)
-        if state.json_output:
-            _print_json({"ok": False, "detail": message})
-        else:
-            _show_error(state.console, message)
-        raise typer.Exit(code=1)
-
-    orgs = _extract_orgs(response.data or [])
-    if not orgs:
-        message = "No organisation found for this user."
-        if state.json_output:
-            _print_json({"ok": False, "detail": message})
-        else:
-            _show_error(state.console, message)
-        raise typer.Exit(code=2)
-
-    org = orgs[0]
+    devices_response = state.api.get("/api/developer/devices/", params={"page_size": 1})
+    if devices_response.ok:
+        devices = _extract_devices(devices_response.data or [])
+        inferred = _infer_primary_org_from_devices(devices)
+        if inferred:
+            if state.json_output:
+                _print_json(inferred)
+                return
+            table = Table(title="Organisation")
+            table.add_column("Hash")
+            table.add_column("Name")
+            table.add_row(str(inferred.get("hash_id") or ""), str(inferred.get("name") or "(inferred)"))
+            state.console.print(table)
+            state.console.print("[yellow]Note:[/yellow] Organisation details inferred from device metadata.")
+            return
+    message = _friendly_response_message("Unable to fetch organisation.", devices_response.data, devices_response.text)
     if state.json_output:
-        _print_json(org)
-        return
-
-    table = Table(title="Organisation")
-    table.add_column("Hash")
-    table.add_column("Name")
-    table.add_row(str(org.get("hash_id") or org.get("hash") or ""), str(org.get("name") or ""))
-    state.console.print(table)
-    if len(orgs) > 1:
-        state.console.print(f"[yellow]Warning:[/yellow] API returned {len(orgs)} organisations; showing the first.")
+        _print_json({"ok": False, "detail": message})
+    else:
+        _show_error(state.console, message)
+    raise typer.Exit(code=1)
 
 
 @devices_app.command("list")
@@ -1853,26 +1914,22 @@ def devices_wormhole_status(ctx: typer.Context, device_hash: Optional[str] = typ
     state = _ctx(ctx)
     _require_auth(state)
     resolved_hash = _resolve_device_hash_interactive(state, device_hash, action_name="wormhole status")
-    response = state.api.get(f"/api/developer/devices/{resolved_hash}/wormhole/status/")
-    payload = response.data or {}
-    if response.status_code == 404:
-        detail_response = state.api.get(f"/api/developer/devices/{resolved_hash}/")
-        if detail_response.ok and isinstance(detail_response.data, dict):
-            detail = detail_response.data
-            payload = {
-                "wormhole_enabled": bool(detail.get("wormhole_enabled")),
-                "wormhole_disabled_by_admin": bool(detail.get("wormhole_disabled_by_admin")),
-                "slug": detail.get("wormhole_slug"),
-                "probe_status": "unknown",
-                "last_access": None,
-                "request_count": None,
-                "error_count": None,
-                "top_paths": [],
-            }
-    elif response.ok:
-        payload = response.data or {}
+    detail_response = state.api.get(f"/api/developer/devices/{resolved_hash}/")
+    payload = {}
+    if detail_response.ok and isinstance(detail_response.data, dict):
+        detail = detail_response.data
+        payload = {
+            "wormhole_enabled": bool(detail.get("wormhole_enabled")),
+            "wormhole_disabled_by_admin": bool(detail.get("wormhole_disabled_by_admin")),
+            "slug": detail.get("wormhole_slug"),
+            "probe_status": "unknown",
+            "last_access": None,
+            "request_count": None,
+            "error_count": None,
+            "top_paths": [],
+        }
     if not payload:
-        message = _friendly_response_message("Unable to fetch wormhole status.", response.data, response.text)
+        message = _friendly_response_message("Unable to fetch wormhole status.", detail_response.data, detail_response.text)
         if state.json_output:
             _print_json({"ok": False, "detail": message})
         else:
@@ -1916,26 +1973,30 @@ def devices_connection_quality(ctx: typer.Context, device_hash: Optional[str] = 
     state = _ctx(ctx)
     _require_auth(state)
     resolved_hash = _resolve_device_hash_interactive(state, device_hash, action_name="connection quality")
-    response = state.api.get(f"/api/developer/devices/{resolved_hash}/remote-access-status/")
-    payload = response.data or {}
-    warning = ""
-    if response.status_code == 404:
-        warning = "Connection quality endpoint is unavailable on this API host."
-        detail_response = state.api.get(f"/api/developer/devices/{resolved_hash}/")
-        if detail_response.ok and isinstance(detail_response.data, dict):
-            detail = detail_response.data
-            payload = {
-                "device_hash": resolved_hash,
-                "device_status": detail.get("status"),
-                "last_heartbeat": detail.get("last_heartbeat"),
-                "m2m_identity_cached": None,
-                "router_host_lookup": {"ok": None, "status_code": None, "detail": "Unavailable"},
-                "connection_quality_24h": None,
-            }
-    elif response.ok:
-        payload = response.data or {}
+    warning = "Connection quality endpoint is unavailable on this API host."
+    detail_response = state.api.get(f"/api/developer/devices/{resolved_hash}/")
+    host_response = state.api.get(f"/api/remote/devices/{resolved_hash}/host/")
+    payload = {}
+    if detail_response.ok and isinstance(detail_response.data, dict):
+        detail = detail_response.data
+        payload = {
+            "device_hash": resolved_hash,
+            "device_status": detail.get("status"),
+            "last_heartbeat": detail.get("last_heartbeat"),
+            "m2m_identity_cached": None,
+            "router_host_lookup": {
+                "ok": host_response.ok,
+                "status_code": host_response.status_code,
+                "detail": _friendly_response_message(
+                    "Host lookup unavailable",
+                    host_response.data,
+                    host_response.text,
+                ),
+            },
+            "connection_quality_24h": None,
+        }
     if not payload:
-        message = _friendly_response_message("Unable to fetch connection quality.", response.data, response.text)
+        message = _friendly_response_message("Unable to fetch connection quality.", detail_response.data, detail_response.text)
         if state.json_output:
             _print_json({"ok": False, "detail": message})
         else:
@@ -1991,20 +2052,16 @@ def devices_reboot(ctx: typer.Context, device_hash: Optional[str] = typer.Argume
     """
     state = _ctx(ctx)
     _require_auth(state)
-    resolved_hash = _resolve_device_hash_interactive(state, device_hash, action_name="reboot")
-    payload = {"command": "restart", "params": {}}
-    response = state.api.post(f"/api/developer/devices/{resolved_hash}/execute_command/", json_data=payload)
-    if not response.ok:
-        message = _friendly_response_message("Unable to reboot device.", response.data, response.text)
-        if state.json_output:
-            _print_json({"ok": False, "detail": message})
-        else:
-            _show_error(state.console, message)
-        raise typer.Exit(code=1)
+    _resolve_device_hash_interactive(state, device_hash, action_name="reboot")
+    message = (
+        "Device reboot API is not published on this gateway. "
+        "Use `dataplicity devices run --command \"sudo reboot\"` if your device policy allows shell reboot."
+    )
     if state.json_output:
-        _print_json(response.data or {"ok": True})
+        _print_json({"ok": False, "detail": message})
     else:
-        state.console.print(f"[green]Reboot command sent to {resolved_hash}.[/green]")
+        _show_error(state.console, message)
+    raise typer.Exit(code=2)
 
 
 @devices_app.command("provisioning-key")
@@ -2603,16 +2660,26 @@ def endpoint_monitors_list(
       dataplicity endpoint-monitors list
       dataplicity endpoint-monitors list --search production
     """
-    params: Dict[str, Any] = {"page_size": page_size}
-    if search:
-        params["search"] = search
     state = _ctx(ctx)
-    endpoint = _resolve_monitor_collection_endpoint(
-        state,
-        statuspages_resource="status-endpoints",
-        legacy_endpoint="/api/developer/endpoint-monitors/",
-    )
-    _list_resource(state, endpoint=endpoint, title="Endpoint monitors", params=params)
+    _require_auth(state)
+    endpoint = _incident_automation_endpoint(state, "signals")
+    response = state.api.get(endpoint)
+    if not response.ok:
+        message = _friendly_response_message("Unable to list endpoint monitors.", response.data, response.text)
+        if state.json_output:
+            _print_json({"ok": False, "detail": message})
+        else:
+            _show_error(state.console, message)
+        raise typer.Exit(code=1)
+    rows = [row for row in _extract_objects(response.data or []) if str(row.get("kind") or "").lower() == "service"]
+    if search:
+        search_lower = search.lower()
+        rows = [row for row in rows if search_lower in json.dumps(row).lower()]
+    rows = rows[:page_size]
+    if state.json_output:
+        _print_json(rows)
+        return
+    _render_resource_table(state, "Endpoint monitors", rows)
 
 
 @endpoint_monitors_app.command("show")
@@ -2623,12 +2690,18 @@ def endpoint_monitors_show(ctx: typer.Context, monitor_id: str = typer.Argument(
       dataplicity endpoint-monitors show <monitor-id>
     """
     state = _ctx(ctx)
-    endpoint = _resolve_monitor_collection_endpoint(
-        state,
-        statuspages_resource="status-endpoints",
-        legacy_endpoint="/api/developer/endpoint-monitors/",
-    )
-    _show_resource(state, endpoint=endpoint, resource_id=monitor_id, not_found_label="endpoint monitor")
+    _require_auth(state)
+    endpoint = _incident_automation_endpoint(state, "signals")
+    response = state.api.get(endpoint)
+    if not response.ok:
+        message = _friendly_response_message("Unable to fetch endpoint monitor.", response.data, response.text)
+        if state.json_output:
+            _print_json({"ok": False, "detail": message})
+        else:
+            _show_error(state.console, message)
+        raise typer.Exit(code=1)
+    rows = [row for row in _extract_objects(response.data or []) if str(row.get("kind") or "").lower() == "service"]
+    _show_item_from_list_payload(state, rows, resource_id=monitor_id, label="endpoint monitor")
 
 
 @endpoint_monitors_app.command("create")
@@ -2642,12 +2715,22 @@ def endpoint_monitors_create(
       dataplicity endpoint-monitors create --data '{"name":"api-check","url":"https://example.com/health"}'
     """
     state = _ctx(ctx)
-    endpoint = _resolve_monitor_collection_endpoint(
-        state,
-        statuspages_resource="status-endpoints",
-        legacy_endpoint="/api/developer/endpoint-monitors/",
-    )
-    _create_resource(state, endpoint=endpoint, data=data, label="endpoint monitor")
+    _require_auth(state)
+    payload = _parse_json_payload_or_exit(state, data)
+    payload.setdefault("kind", "service")
+    endpoint = _incident_automation_endpoint(state, "rules")
+    response = state.api.post(endpoint, json_data=payload)
+    if not response.ok:
+        message = _friendly_response_message("Unable to create endpoint monitor.", response.data, response.text)
+        if state.json_output:
+            _print_json({"ok": False, "detail": message})
+        else:
+            _show_error(state.console, message)
+        raise typer.Exit(code=1)
+    if state.json_output:
+        _print_json(response.data or {"ok": True})
+    else:
+        state.console.print("[green]Endpoint monitor created.[/green]")
 
 
 @endpoint_monitors_app.command("delete")
@@ -2658,12 +2741,12 @@ def endpoint_monitors_delete(ctx: typer.Context, monitor_id: str = typer.Argumen
       dataplicity endpoint-monitors delete <monitor-id>
     """
     state = _ctx(ctx)
-    endpoint = _resolve_monitor_collection_endpoint(
+    _delete_resource(
         state,
-        statuspages_resource="status-endpoints",
-        legacy_endpoint="/api/developer/endpoint-monitors/",
+        endpoint=_incident_automation_endpoint(state, "rules"),
+        resource_id=monitor_id,
+        label="endpoint monitor",
     )
-    _delete_resource(state, endpoint=endpoint, resource_id=monitor_id, label="endpoint monitor")
 
 
 @user_impact_app.command("list")
@@ -2679,14 +2762,9 @@ def user_impact_list(
       dataplicity user-impact list --unresolved-only
     """
     state = _ctx(ctx)
-    endpoint = _resolve_monitor_collection_endpoint(
-        state,
-        statuspages_resource="user-impact",
-        legacy_endpoint="/api/developer/user-impact/",
-    )
     _require_auth(state)
-    params: Dict[str, Any] = {"page_size": page_size}
-    response = state.api.get(endpoint, params=params)
+    endpoint = _incident_automation_endpoint(state, "signals")
+    response = state.api.get(endpoint)
     if not response.ok:
         message = _friendly_response_message("Unable to list user impact.", response.data, response.text)
         if state.json_output:
@@ -2694,11 +2772,10 @@ def user_impact_list(
         else:
             _show_error(state.console, message)
         raise typer.Exit(code=1)
-    payload = response.data or []
+    payload = [row for row in _extract_objects(response.data or []) if str(row.get("kind") or "").lower() == "user-impact"]
     if unresolved_only:
-        rows = _extract_objects(payload)
-        unresolved = [row for row in rows if str(row.get("last_error") or "").strip()]
-        payload = unresolved
+        payload = [row for row in payload if str(row.get("sentiment") or "").strip().lower() not in {"ok", "healthy", "resolved"}]
+    payload = payload[:page_size]
     if state.json_output:
         _print_json(payload)
         return
@@ -2713,12 +2790,18 @@ def user_impact_show(ctx: typer.Context, impact_id: str = typer.Argument(...)) -
       dataplicity user-impact show <impact-id>
     """
     state = _ctx(ctx)
-    endpoint = _resolve_monitor_collection_endpoint(
-        state,
-        statuspages_resource="user-impact",
-        legacy_endpoint="/api/developer/user-impact/",
-    )
-    _show_resource(state, endpoint=endpoint, resource_id=impact_id, not_found_label="user impact item")
+    _require_auth(state)
+    endpoint = _incident_automation_endpoint(state, "signals")
+    response = state.api.get(endpoint)
+    if not response.ok:
+        message = _friendly_response_message("Unable to fetch user impact item.", response.data, response.text)
+        if state.json_output:
+            _print_json({"ok": False, "detail": message})
+        else:
+            _show_error(state.console, message)
+        raise typer.Exit(code=1)
+    rows = [row for row in _extract_objects(response.data or []) if str(row.get("kind") or "").lower() == "user-impact"]
+    _show_item_from_list_payload(state, rows, resource_id=impact_id, label="user impact item")
 
 
 @heartbeat_monitors_app.command("list")
@@ -2733,16 +2816,26 @@ def heartbeat_monitors_list(
       dataplicity heartbeat-monitors list
       dataplicity heartbeat-monitors list --search cron
     """
-    params: Dict[str, Any] = {"page_size": page_size}
-    if search:
-        params["search"] = search
     state = _ctx(ctx)
-    endpoint = _resolve_monitor_collection_endpoint(
-        state,
-        statuspages_resource="heartbeats",
-        legacy_endpoint="/api/developer/heartbeat-monitors/",
-    )
-    _list_resource(state, endpoint=endpoint, title="Heartbeat monitors", params=params)
+    _require_auth(state)
+    endpoint = _incident_automation_endpoint(state, "signals")
+    response = state.api.get(endpoint)
+    if not response.ok:
+        message = _friendly_response_message("Unable to list heartbeat monitors.", response.data, response.text)
+        if state.json_output:
+            _print_json({"ok": False, "detail": message})
+        else:
+            _show_error(state.console, message)
+        raise typer.Exit(code=1)
+    payload = [row for row in _extract_objects(response.data or []) if str(row.get("kind") or "").lower() == "heartbeat"]
+    if search:
+        search_lower = search.lower()
+        payload = [row for row in payload if search_lower in json.dumps(row).lower()]
+    payload = payload[:page_size]
+    if state.json_output:
+        _print_json(payload)
+        return
+    _render_resource_table(state, "Heartbeat monitors", payload)
 
 
 @heartbeat_monitors_app.command("show")
@@ -2753,12 +2846,18 @@ def heartbeat_monitors_show(ctx: typer.Context, monitor_id: str = typer.Argument
       dataplicity heartbeat-monitors show <monitor-id>
     """
     state = _ctx(ctx)
-    endpoint = _resolve_monitor_collection_endpoint(
-        state,
-        statuspages_resource="heartbeats",
-        legacy_endpoint="/api/developer/heartbeat-monitors/",
-    )
-    _show_resource(state, endpoint=endpoint, resource_id=monitor_id, not_found_label="heartbeat monitor")
+    _require_auth(state)
+    endpoint = _incident_automation_endpoint(state, "signals")
+    response = state.api.get(endpoint)
+    if not response.ok:
+        message = _friendly_response_message("Unable to fetch heartbeat monitor.", response.data, response.text)
+        if state.json_output:
+            _print_json({"ok": False, "detail": message})
+        else:
+            _show_error(state.console, message)
+        raise typer.Exit(code=1)
+    rows = [row for row in _extract_objects(response.data or []) if str(row.get("kind") or "").lower() == "heartbeat"]
+    _show_item_from_list_payload(state, rows, resource_id=monitor_id, label="heartbeat monitor")
 
 
 @heartbeat_monitors_app.command("create")
@@ -2772,12 +2871,22 @@ def heartbeat_monitors_create(
       dataplicity heartbeat-monitors create --data '{"name":"daily-job","interval_seconds":86400}'
     """
     state = _ctx(ctx)
-    endpoint = _resolve_monitor_collection_endpoint(
-        state,
-        statuspages_resource="heartbeats",
-        legacy_endpoint="/api/developer/heartbeat-monitors/",
-    )
-    _create_resource(state, endpoint=endpoint, data=data, label="heartbeat monitor")
+    _require_auth(state)
+    payload = _parse_json_payload_or_exit(state, data)
+    payload.setdefault("kind", "heartbeat")
+    endpoint = _incident_automation_endpoint(state, "rules")
+    response = state.api.post(endpoint, json_data=payload)
+    if not response.ok:
+        message = _friendly_response_message("Unable to create heartbeat monitor.", response.data, response.text)
+        if state.json_output:
+            _print_json({"ok": False, "detail": message})
+        else:
+            _show_error(state.console, message)
+        raise typer.Exit(code=1)
+    if state.json_output:
+        _print_json(response.data or {"ok": True})
+    else:
+        state.console.print("[green]Heartbeat monitor created.[/green]")
 
 
 @heartbeat_monitors_app.command("delete")
@@ -2788,12 +2897,12 @@ def heartbeat_monitors_delete(ctx: typer.Context, monitor_id: str = typer.Argume
       dataplicity heartbeat-monitors delete <monitor-id>
     """
     state = _ctx(ctx)
-    endpoint = _resolve_monitor_collection_endpoint(
+    _delete_resource(
         state,
-        statuspages_resource="heartbeats",
-        legacy_endpoint="/api/developer/heartbeat-monitors/",
+        endpoint=_incident_automation_endpoint(state, "rules"),
+        resource_id=monitor_id,
+        label="heartbeat monitor",
     )
-    _delete_resource(state, endpoint=endpoint, resource_id=monitor_id, label="heartbeat monitor")
 
 
 @fleet_jobs_app.command("list")
@@ -2808,10 +2917,11 @@ def fleet_jobs_list(
       dataplicity fleet-jobs list
       dataplicity fleet-jobs list --status running
     """
+    state = _ctx(ctx)
     params: Dict[str, Any] = {"page_size": page_size}
     if status:
         params["status"] = status
-    _list_resource(_ctx(ctx), endpoint="/api/developer/fleet-jobs/", title="Fleet jobs", params=params)
+    _list_resource(state, endpoint=_incident_automation_endpoint(state, "rules"), title="Fleet jobs", params=params)
 
 
 @fleet_jobs_app.command("show")
@@ -2821,7 +2931,13 @@ def fleet_jobs_show(ctx: typer.Context, job_id: str = typer.Argument(...)) -> No
     Examples:
       dataplicity fleet-jobs show <job-id>
     """
-    _show_resource(_ctx(ctx), endpoint="/api/developer/fleet-jobs/", resource_id=job_id, not_found_label="fleet job")
+    state = _ctx(ctx)
+    _show_resource(
+        state,
+        endpoint=_incident_automation_endpoint(state, "rules"),
+        resource_id=job_id,
+        not_found_label="fleet job",
+    )
 
 
 @fleet_jobs_app.command("run")
@@ -2834,7 +2950,9 @@ def fleet_jobs_run(
     Examples:
       dataplicity fleet-jobs run --data '{"name":"restart-edge","device_hashes":["abc123"],"command":"restart"}'
     """
-    _create_resource(_ctx(ctx), endpoint="/api/developer/fleet-jobs/", data=data, label="fleet job")
+    state = _ctx(ctx)
+    endpoint = _incident_automation_endpoint(state, "rule-simulations")
+    _create_resource(state, endpoint=endpoint, data=data, label="fleet job simulation")
 
 
 @fleet_jobs_app.command("cancel")
@@ -2846,7 +2964,11 @@ def fleet_jobs_cancel(ctx: typer.Context, job_id: str = typer.Argument(...)) -> 
     """
     state = _ctx(ctx)
     _require_auth(state)
-    response = state.api.post(f"/api/developer/fleet-jobs/{job_id}/cancel/")
+    response = state.api.request(
+        "PATCH",
+        f"{_incident_automation_endpoint(state, 'rules')}{job_id}/",
+        json_data={"enabled": False},
+    )
     if not response.ok:
         message = _friendly_response_message("Unable to cancel fleet job.", response.data, response.text)
         if state.json_output:
@@ -2931,7 +3053,7 @@ def logging_list(
         params["path"] = path
     if search:
         params["search"] = search
-    response = state.api.get("/api/developer/logging/", params=params)
+    response = state.api.get(_incident_automation_endpoint(state, "insights"), params=params)
     if not response.ok:
         message = _friendly_response_message("Unable to list logging.", response.data, response.text)
         if state.json_output:
@@ -2944,7 +3066,7 @@ def logging_list(
     if state.json_output:
         _print_json(safe_payload)
         return
-    _render_resource_table(state, "Logging", safe_payload)
+    _render_resource_table(state, "Logging insights", safe_payload)
     if was_truncated:
         state.console.print(
             f"[yellow]Output truncated:[/yellow] showing first {LOGGING_MAX_OUTPUT_ITEMS} records "
@@ -3097,7 +3219,17 @@ def logging_show(ctx: typer.Context, log_id: str = typer.Argument(...)) -> None:
     Examples:
       dataplicity logging show <log-id>
     """
-    _show_resource(_ctx(ctx), endpoint="/api/developer/logging/", resource_id=log_id, not_found_label="log event")
+    state = _ctx(ctx)
+    _require_auth(state)
+    response = state.api.get(_incident_automation_endpoint(state, "insights"))
+    if not response.ok:
+        message = _friendly_response_message("Unable to fetch log event.", response.data, response.text)
+        if state.json_output:
+            _print_json({"ok": False, "detail": message})
+        else:
+            _show_error(state.console, message)
+        raise typer.Exit(code=1)
+    _show_item_from_list_payload(state, response.data or [], resource_id=log_id, label="log event")
 
 
 @api_app.command("get")

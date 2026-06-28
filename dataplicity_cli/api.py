@@ -35,6 +35,53 @@ class ApiClient:
             return {"Authorization": f"ApiKey {self.config.api_key}"}
         return {}
 
+    @staticmethod
+    def _extract_error_message(response: requests.Response) -> str:
+        text = response.text or ""
+        try:
+            payload = response.json()
+        except Exception:
+            payload = None
+        if isinstance(payload, dict):
+            detail = payload.get("detail") or payload.get("error") or payload.get("message")
+            if isinstance(detail, str) and detail.strip():
+                return detail
+            non_field = payload.get("non_field_errors")
+            if isinstance(non_field, list) and non_field:
+                first = non_field[0]
+                if isinstance(first, str) and first.strip():
+                    return first
+        return text
+
+    @staticmethod
+    def _looks_like_invalid_token_message(message: str) -> bool:
+        normalized = (message or "").strip().lower()
+        if not normalized:
+            return False
+        token_markers = (
+            "token not valid",
+            "not valid for any token type",
+            "invalid token",
+            "token is invalid or expired",
+            "token has expired",
+            "signature has expired",
+            "expired token",
+        )
+        return any(marker in normalized for marker in token_markers)
+
+    def _response_indicates_invalid_jwt(self, response: requests.Response) -> bool:
+        if response.status_code not in {400, 401, 403}:
+            return False
+        return self._looks_like_invalid_token_message(self._extract_error_message(response))
+
+    def _invalidate_jwt_session(self) -> None:
+        self.config.clear_tokens()
+        if self._on_token_update is not None:
+            try:
+                self._on_token_update()
+            except Exception:
+                pass
+
     def _refresh_access_token(self) -> bool:
         if not self.config.refresh_token:
             return False
@@ -44,6 +91,8 @@ class ApiClient:
         except Exception:
             return False
         if resp.status_code >= 400:
+            if self._response_indicates_invalid_jwt(resp):
+                self._invalidate_jwt_session()
             return False
         try:
             payload = resp.json()
@@ -98,7 +147,12 @@ class ApiClient:
         except requests.RequestException as exc:
             return ApiResponse(False, 0, None, str(exc))
 
-        if resp.status_code == 401 and allow_refresh and self.config.auth_method == "jwt":
+        should_retry_with_refresh = (
+            allow_refresh
+            and self.config.auth_method == "jwt"
+            and (resp.status_code == 401 or self._response_indicates_invalid_jwt(resp))
+        )
+        if should_retry_with_refresh:
             if self._refresh_access_token():
                 return self.request(
                     method,
@@ -110,6 +164,8 @@ class ApiClient:
                     timeout=timeout,
                     allow_refresh=False,
                 )
+        if self.config.auth_method == "jwt" and self._response_indicates_invalid_jwt(resp):
+            self._invalidate_jwt_session()
 
         text = resp.text or ""
         try:
