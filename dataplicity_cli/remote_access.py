@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import secrets
 import select
 import sys
 import termios
@@ -113,23 +114,40 @@ async def run_single_command(
     if not command_text:
         raise RuntimeError("Command cannot be empty.")
 
-    done_marker = "__DP_CLI_DONE__"
-    prompt_marker = "__DP_CLI_PROMPT__"
+    marker_token = secrets.token_hex(8)
+    begin_marker = f"__DP_CLI_BEGIN_{marker_token}__"
+    done_marker = f"__DP_CLI_DONE_{marker_token}__"
     wrapped_command = (
-        "__dp_cli_prev_ps1=\"$PS1\"\n"
-        + f"PS1='{prompt_marker} '\n"
-        + f"PROMPT='{prompt_marker} '\n"
+        "stty -echo 2>/dev/null || true\n"
+        + "PS1=''\n"
+        + "PROMPT=''\n"
+        + "PROMPT_COMMAND=''\n"
+        + f"printf '\\n__DP_''CLI_BEGIN_{marker_token}__\\n'\n"
         + command_text
         + "\n"
         + "__dp_cli_status=$?\n"
-        + "printf '\\n__DP_' 'CLI_DONE__%s\\n' \"$__dp_cli_status\"\n"
+        + "stty echo 2>/dev/null || true\n"
+        + f"printf '\\n__DP_''CLI_DONE_{marker_token}__%s\\n' \"$__dp_cli_status\"\n"
     )
     await m2m.send_route(channel_port, wrapped_command.encode("utf-8"))
+
+    def captured_output(merged: bytes, end_at: Optional[int] = None) -> bytes:
+        if end_at is None:
+            end_at = len(merged)
+        begin_at = merged.find(begin_marker.encode("utf-8"))
+        if begin_at != -1 and begin_at < end_at:
+            output = merged[begin_at + len(begin_marker) : end_at]
+            if output.startswith(b"\r\n"):
+                output = output[2:]
+            elif output.startswith((b"\n", b"\r")):
+                output = output[1:]
+        else:
+            output = merged[:end_at]
+        return output.rstrip(b"\r\n")
 
     async def read_output() -> bytes:
         chunks = []
         marker_bytes = done_marker.encode("utf-8")
-        prompt_marker_bytes = prompt_marker.encode("utf-8")
         saw_any_data = False
         while True:
             if not saw_any_data:
@@ -151,7 +169,7 @@ async def run_single_command(
                             await m2m.close_channel(channel_port)
                         except Exception:
                             pass
-                        return b"".join(chunks).rstrip(b"\r\n")
+                        return captured_output(b"".join(chunks))
                     raise RuntimeError(
                         "Remote shell became idle before command completion; no completion marker was observed."
                     ) from exc
@@ -163,13 +181,8 @@ async def run_single_command(
             marker_at = merged.find(marker_bytes)
             if marker_at != -1:
                 # Stop at sentinel instead of waiting for socket teardown.
-                return merged[:marker_at].rstrip(b"\r\n")
-            prompt_marker_at = merged.find(prompt_marker_bytes)
-            if prompt_marker_at != -1 and saw_any_data:
-                # Prompt marker can be more reliable on some shells where our
-                # done marker is buffered or dropped.
-                return merged[:prompt_marker_at].rstrip(b"\r\n")
-        return b"".join(chunks).rstrip(b"\r\n")
+                return captured_output(merged, marker_at)
+        return captured_output(b"".join(chunks))
 
     if timeout_seconds is None:
         return await read_output()
