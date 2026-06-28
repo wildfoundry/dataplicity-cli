@@ -126,8 +126,8 @@ async def run_single_command(
         + command_text
         + "\n"
         + "__dp_cli_status=$?\n"
-        + "stty echo 2>/dev/null || true\n"
         + f"printf '\\n__DP_''CLI_DONE_{marker_token}__%s\\n' \"$__dp_cli_status\"\n"
+        + "stty echo 2>/dev/null || true\n"
     )
     await m2m.send_route(channel_port, wrapped_command.encode("utf-8"))
 

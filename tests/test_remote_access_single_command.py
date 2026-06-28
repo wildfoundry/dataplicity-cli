@@ -122,6 +122,33 @@ class RunSingleCommandTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(b"__DP_CLI_BEGIN_abc123ef__", payload)
         self.assertNotIn(b"__DP_CLI_DONE_abc123ef__", payload)
 
+    async def test_terminal_echo_is_restored_after_done_marker(self) -> None:
+        fake = _FakeM2M()
+        queue = fake.channel_queue(15)
+        await queue.put(
+            b"\r\n__DP_CLI_BEGIN_abc123ef__\r\n"
+            b"Linux test-host 6.6.0\r\n"
+            b"\r\n__DP_CLI_DONE_abc123ef__0\r\n"
+            b"stty echo 2>/dev/null || true\r\n"
+        )
+
+        with patch("dataplicity_cli.remote_access.secrets.token_hex", return_value="abc123ef"):
+            output = await run_single_command(
+                fake,
+                15,
+                "uname -a",
+                timeout_seconds=1.0,
+                first_response_timeout_seconds=0.1,
+                idle_timeout_seconds=0.1,
+            )
+
+        payload = fake.sent_payloads[0]
+        self.assertEqual(output, b"Linux test-host 6.6.0")
+        self.assertLess(
+            payload.index(b"__DP_''CLI_DONE_abc123ef__"),
+            payload.index(b"stty echo 2>/dev/null || true"),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
