@@ -137,7 +137,7 @@ class CliUxSnapshotsTest(unittest.TestCase):
         self.assertEqual(payload.get("ok"), False)
         self.assertEqual(
             payload.get("detail"),
-            "Authentication required. Use `dataplicity auth login` or `dataplicity auth api-key`.",
+            "Authentication required. Use `dataplicity auth sso`, `dataplicity auth login`, or `dataplicity auth api-key`.",
         )
 
     def test_logging_scope_guard_snapshot_json(self) -> None:

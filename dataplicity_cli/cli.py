@@ -599,6 +599,43 @@ def _friendly_response_message(default_message: str, response_data: Any, respons
     return message
 
 
+def _normalize_email(value: Optional[str]) -> str:
+    return str(value or "").strip().lower()
+
+
+def _remember_login_preference(state: AppContext, *, email: Optional[str], method: str) -> None:
+    normalized_email = _normalize_email(email)
+    if normalized_email:
+        state.config.last_email = normalized_email
+    state.config.preferred_login_method = method
+    state.config.save(state.config_path)
+
+
+def _resolve_email_for_auth(
+    state: AppContext,
+    *,
+    provided_email: Optional[str],
+    prompt_label: str = "Email",
+) -> str:
+    normalized_provided = _normalize_email(provided_email)
+    if normalized_provided:
+        return normalized_provided
+    remembered_email = _normalize_email(state.config.last_email)
+    if state.json_output:
+        message = "Email is required in --json mode. Pass `--email`."
+        _print_json({"ok": False, "detail": message})
+        raise typer.Exit(code=2)
+    if remembered_email:
+        entered = typer.prompt(prompt_label, default=remembered_email)
+        return _normalize_email(entered) or remembered_email
+    entered = typer.prompt(prompt_label)
+    normalized_entered = _normalize_email(entered)
+    if normalized_entered:
+        return normalized_entered
+    _show_error(state.console, "Email is required.")
+    raise typer.Exit(code=2)
+
+
 def _looks_like_invalid_auth_message(message: str) -> bool:
     normalized = (message or "").strip().lower()
     if not normalized:
@@ -952,7 +989,7 @@ def _require_auth(ctx: AppContext) -> None:
         return
     if ctx.config.auth_method == "api_key" and ctx.config.api_key:
         return
-    message = "Authentication required. Use `dataplicity auth login` or `dataplicity auth api-key`."
+    message = "Authentication required. Use `dataplicity auth sso`, `dataplicity auth login`, or `dataplicity auth api-key`."
     if ctx.json_output:
         _print_json({"ok": False, "detail": message})
     else:
@@ -1248,18 +1285,20 @@ def setup(ctx: typer.Context) -> None:
 
     state.console.print("[bold]Welcome to Dataplicity CLI setup[/bold]")
     state.console.print(f"API host: [blue]{state.config.base_url}[/blue]")
+    default_method = "sso" if state.config.preferred_login_method == "sso" else "email-password"
     method = Prompt.ask(
         "How would you like to authenticate?",
         choices=["email-password", "sso", "api-key"],
-        default="email-password",
+        default=default_method,
     )
     if method == "api-key":
+        _remember_login_preference(state, email=state.config.last_email, method="api-key")
         auth_api_key_set(ctx)
     elif method == "sso":
-        email = typer.prompt("Email")
+        email = _resolve_email_for_auth(state, provided_email=None)
         auth_sso(ctx, email=email, open_browser=True)
     else:
-        email = typer.prompt("Email")
+        email = _resolve_email_for_auth(state, provided_email=None)
         password = typer.prompt("Password", hide_input=True)
         auth_login(ctx, email=email, password=password, mfa_code=None, mfa_type=None)
     state.console.print("[green]Setup complete.[/green] Try `dataplicity devices list` next.")
@@ -1453,8 +1492,8 @@ def config_show(ctx: typer.Context) -> None:
 @auth_app.command("login")
 def auth_login(
     ctx: typer.Context,
-    email: str = typer.Option(..., "--email", prompt=True),
-    password: str = typer.Option(..., "--password", prompt=True, hide_input=True),
+    email: Optional[str] = typer.Option(None, "--email", help="Account email"),
+    password: Optional[str] = typer.Option(None, "--password", help="Account password"),
     mfa_code: Optional[str] = typer.Option(None, "--mfa-code"),
     mfa_type: Optional[str] = typer.Option(None, "--mfa-type"),
 ) -> None:
@@ -1465,14 +1504,21 @@ def auth_login(
       dataplicity auth login --email you@example.com --mfa-code 123456
     """
     state = _ctx(ctx)
+    email = _resolve_email_for_auth(state, provided_email=email)
+    if password is None:
+        if state.json_output:
+            _print_json({"ok": False, "detail": "Password is required in --json mode. Pass `--password`."})
+            raise typer.Exit(code=2)
+        password = typer.prompt("Password", hide_input=True)
     bootstrap = state.api.post("/api/auth/bootstrap/", json_data={"email": email})
     if bootstrap.ok and isinstance(bootstrap.data, dict) and bootstrap.data.get("status") == "sso_redirect":
-        message = "SSO is required for this account. Use `dataplicity auth sso --email ...`."
         if state.json_output:
+            message = "SSO is required for this account. Use `dataplicity auth sso --email ...`."
             _print_json({"ok": False, "detail": message})
-        else:
-            _show_error(state.console, message)
-        raise typer.Exit(code=3)
+            raise typer.Exit(code=3)
+        state.console.print("[yellow]SSO is required for this account.[/yellow] Redirecting to SSO login...")
+        auth_sso(ctx, email=email, open_browser=True)
+        return
 
     payload: Dict[str, Any] = {"email": email, "password": password}
     if mfa_code:
@@ -1505,6 +1551,8 @@ def auth_login(
     state.config.access_token = access
     state.config.refresh_token = refresh
     state.config.auth_method = "jwt"
+    state.config.last_email = email
+    state.config.preferred_login_method = "email-password"
     state.config.save(state.config_path)
     if state.json_output:
         _print_json({"ok": True, "detail": "Logged in"})
@@ -1515,7 +1563,7 @@ def auth_login(
 @auth_app.command("sso")
 def auth_sso(
     ctx: typer.Context,
-    email: str = typer.Option(..., "--email", prompt=True),
+    email: Optional[str] = typer.Option(None, "--email", help="Account email"),
     open_browser: bool = typer.Option(True, "--open-browser/--no-open-browser", help="Open SSO login in the browser"),
     timeout: int = typer.Option(180, "--timeout", help="Seconds to wait for automatic browser callback"),
 ) -> None:
@@ -1527,6 +1575,7 @@ def auth_sso(
       dataplicity auth sso --email you@example.com --timeout 300
     """
     state = _ctx(ctx)
+    email = _resolve_email_for_auth(state, provided_email=email)
     timeout_seconds = _coerce_timeout_seconds(timeout)
     response = state.api.post("/api/auth/bootstrap/", json_data={"email": email})
     if not response.ok:
@@ -1570,6 +1619,9 @@ def auth_sso(
         state.console.print("Waiting for browser sign-in to complete...")
     try:
         if _attempt_sso_auto_complete(state, listener, timeout_seconds=timeout_seconds):
+            state.config.last_email = email
+            state.config.preferred_login_method = "sso"
+            state.config.save(state.config_path)
             if state.json_output:
                 _print_json({"ok": True, "detail": "SSO login complete"})
             else:
@@ -1603,6 +1655,9 @@ def auth_sso(
     if not _apply_tokens_or_none(state, payload) and not _try_complete_sso_from_code(state, payload):
         _show_error(state.console, "No access token found in payload.")
         raise typer.Exit(code=1)
+    state.config.last_email = email
+    state.config.preferred_login_method = "sso"
+    state.config.save(state.config_path)
     state.console.print("[green]SSO login complete.[/green]")
 
 
@@ -1617,6 +1672,7 @@ def auth_api_key_set(ctx: typer.Context) -> None:
     api_key = typer.prompt("API key", hide_input=True)
     state.config.api_key = api_key.strip()
     state.config.auth_method = "api_key"
+    state.config.preferred_login_method = "api-key"
     state.config.save(state.config_path)
     if state.json_output:
         _print_json({"ok": True, "detail": "API key saved"})
