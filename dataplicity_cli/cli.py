@@ -27,7 +27,7 @@ from rich.prompt import Prompt
 from rich.table import Table
 
 from . import __version__
-from .api import ApiClient
+from .api import ApiClient, ApiResponse
 from .config import Config, default_config_path
 from .m2m import M2MClient
 
@@ -3390,6 +3390,67 @@ def fleet_jobs_delete(ctx: typer.Context, job_id: str = typer.Argument(...)) -> 
     fleet_jobs_cancel(ctx, job_id=job_id)
 
 
+def _org_logs_params_from_developer_params(params: Dict[str, Any]) -> Dict[str, Any]:
+    mapped: Dict[str, Any] = {}
+    if "page_size" in params:
+        mapped["limit"] = params["page_size"]
+    if "device" in params:
+        mapped["device_hash"] = params["device"]
+    if "path" in params and "search" not in params:
+        mapped["search"] = params["path"]
+    if "search" in params:
+        mapped["search"] = params["search"]
+    if "level" in params:
+        mapped["level"] = params["level"]
+    if "since" in params:
+        mapped["after"] = params["since"]
+    if "until" in params:
+        mapped["before"] = params["until"]
+    return mapped
+
+
+def _request_raw_logs_list(state: AppContext, params: Dict[str, Any]) -> Tuple[ApiResponse, List[str]]:
+    attempted: List[str] = []
+    response = state.api.get("/api/developer/logging/", params=params)
+    attempted.append("/api/developer/logging/")
+    if response.ok or response.status_code != 404:
+        return response, attempted
+
+    try:
+        org_hash = _resolve_primary_org_hash(state)
+    except typer.Exit:
+        return response, attempted
+
+    org_endpoint = f"/api/organisations/{org_hash}/logs/"
+    org_response = state.api.get(org_endpoint, params=_org_logs_params_from_developer_params(params))
+    attempted.append(org_endpoint)
+    return org_response, attempted
+
+
+def _request_raw_log_detail(state: AppContext, log_id: str) -> Tuple[ApiResponse, List[str]]:
+    attempted: List[str] = []
+    detail_endpoint = f"/api/developer/logging/{log_id}/"
+    response = state.api.get(detail_endpoint)
+    attempted.append(detail_endpoint)
+    if response.ok or response.status_code != 404:
+        return response, attempted
+
+    try:
+        org_hash = _resolve_primary_org_hash(state)
+    except typer.Exit:
+        return response, attempted
+    org_endpoint = f"/api/organisations/{org_hash}/logs/"
+    list_response = state.api.get(org_endpoint, params={"limit": 4000})
+    attempted.append(org_endpoint)
+    if not list_response.ok:
+        return list_response, attempted
+    rows = _extract_objects(list_response.data)
+    row = next((item for item in rows if str(item.get("id") or "") == log_id), None)
+    if row is None:
+        return ApiResponse(False, 404, None, "Not found"), attempted
+    return ApiResponse(True, 200, row, ""), attempted
+
+
 @logging_app.command("list")
 def logging_list(
     ctx: typer.Context,
@@ -3457,8 +3518,18 @@ def logging_list(
         params["path"] = path
     if search:
         params["search"] = search
-    response = state.api.get("/api/developer/logging/", params=params)
+    response, attempted_endpoints = _request_raw_logs_list(state, params)
     if not response.ok:
+        if response.status_code == 404:
+            message = (
+                "Raw logs API is not enabled on this gateway yet. "
+                f"Tried: {', '.join(attempted_endpoints)}"
+            )
+            if state.json_output:
+                _print_json({"ok": False, "detail": message})
+            else:
+                _show_error(state.console, message)
+            raise typer.Exit(code=1)
         message = _friendly_response_message("Unable to list logging.", response.data, response.text)
         if state.json_output:
             _print_json({"ok": False, "detail": message})
@@ -3470,7 +3541,7 @@ def logging_list(
     if state.json_output:
         _print_json(safe_payload)
         return
-    _render_resource_table(state, "Log events", safe_payload)
+    _render_log_events_table(state, safe_payload)
     if was_truncated:
         state.console.print(
             f"[yellow]Output truncated:[/yellow] showing first {LOGGING_MAX_OUTPUT_ITEMS} records "
@@ -3588,6 +3659,52 @@ def _truncate_logging_payload(payload: Any) -> Tuple[Any, bool, int]:
     return container, truncated, dropped
 
 
+def _format_log_ts(ts_value: Any) -> str:
+    try:
+        ts_ms = int(ts_value)
+    except Exception:
+        return ""
+    ts = dt.datetime.fromtimestamp(ts_ms / 1000.0, tz=dt.timezone.utc)
+    return ts.isoformat().replace("+00:00", "Z")
+
+
+def _extract_log_device(row: Dict[str, Any]) -> str:
+    explicit = str(row.get("device_hash") or row.get("device") or "").strip()
+    if explicit:
+        return explicit
+    message = str(row.get("message") or "")
+    for pattern in (r"\bdevice=([^\s,]+)", r"\bdevice_hash=([^\s,]+)"):
+        match = re.search(pattern, message)
+        if match:
+            return str(match.group(1)).strip()
+    return ""
+
+
+def _render_log_events_table(state: AppContext, payload: Any) -> None:
+    rows = _extract_objects(payload)
+    table = Table(title="Log events")
+    table.add_column("Time", style="cyan")
+    table.add_column("Level")
+    table.add_column("Source")
+    table.add_column("Device")
+    table.add_column("Message", overflow="fold")
+    for row in rows:
+        app_name = str(row.get("app") or "").strip()
+        source_name = str(row.get("source") or "").strip()
+        source_value = source_name or app_name
+        if app_name and source_name and app_name != source_name:
+            source_value = f"{app_name}/{source_name}"
+        table.add_row(
+            _format_log_ts(row.get("ts")),
+            str(row.get("level") or ""),
+            source_value,
+            _extract_log_device(row),
+            str(row.get("message") or ""),
+        )
+    state.console.print(table)
+    state.console.print(f"Showing {len(rows)} results.")
+
+
 @logging_app.command("path-map")
 def logging_path_map(ctx: typer.Context) -> None:
     """Show recommended path filters for scoped log queries.
@@ -3651,8 +3768,18 @@ def logging_show(ctx: typer.Context, log_id: str = typer.Argument(...)) -> None:
     """
     state = _ctx(ctx)
     _require_auth(state)
-    response = state.api.get(f"/api/developer/logging/{log_id}/")
+    response, attempted_endpoints = _request_raw_log_detail(state, log_id)
     if not response.ok:
+        if response.status_code == 404:
+            message = (
+                "Raw log detail API is not enabled on this gateway yet. "
+                f"Tried: {', '.join(attempted_endpoints)}"
+            )
+            if state.json_output:
+                _print_json({"ok": False, "detail": message})
+            else:
+                _show_error(state.console, message)
+            raise typer.Exit(code=1)
         message = _friendly_response_message("Unable to fetch log event.", response.data, response.text)
         if state.json_output:
             _print_json({"ok": False, "detail": message})
