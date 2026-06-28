@@ -56,9 +56,11 @@ class CliUxSnapshotsTest(unittest.TestCase):
         result = self._invoke(["devices", "run", "--help"])
         self.assertEqual(result.exit_code, 0, msg=result.output)
         expected_snippets = [
-            "Run a single command on a device and print output.",
+            "Run a single command on a selected device and print output.",
             "dataplicity devices run --command",
             "dataplicity devices run <device-hash> --command",
+            "optional in interactive mode",
+            "--connect-timeout",
             "--no-timeout",
         ]
         for snippet in expected_snippets:

@@ -492,7 +492,7 @@ class _SsoCallbackListener:
                 payload = self._capture_payload()
                 if payload:
                     payload_queue.put(payload)
-                    self._write_html(200, "Authentication received.")
+                    self._write_html(200, "Sign-in complete.")
                     return
                 self._write_html(200, "Waiting for authentication callback.")
 
@@ -500,7 +500,7 @@ class _SsoCallbackListener:
                 payload = self._capture_payload()
                 if payload:
                     payload_queue.put(payload)
-                    self._write_html(200, "Authentication received.")
+                    self._write_html(200, "Sign-in complete.")
                     return
                 self._write_html(400, "No authentication payload was provided.")
 
@@ -1754,6 +1754,40 @@ def _infer_primary_org_from_devices(devices: List[Dict[str, Any]]) -> Optional[D
     return {"hash_id": org_hash, "name": org_name}
 
 
+def _extract_org_summary_from_profile(profile: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not isinstance(profile, dict):
+        return None
+    org = profile.get("organisation")
+    if not isinstance(org, dict):
+        return None
+    org_hash = str(org.get("hash_id") or org.get("id") or "").strip()
+    name = str(org.get("name") or "").strip()
+    slug = str(org.get("slug") or "").strip()
+    admin_email = str(org.get("org_admin_email") or "").strip()
+    if not any([org_hash, name, slug, admin_email]):
+        return None
+    return {
+        "hash_id": org_hash,
+        "name": name,
+        "slug": slug,
+        "org_admin_email": admin_email,
+        "current_user_email": str(profile.get("email") or "").strip(),
+        "current_user_role": str(profile.get("role_label") or profile.get("role") or "").strip(),
+    }
+
+
+def _org_matches_selector(org: Dict[str, Any], selector: str) -> bool:
+    target = selector.strip().lower()
+    if not target:
+        return True
+    candidates = [
+        str(org.get("hash_id") or "").strip().lower(),
+        str(org.get("name") or "").strip().lower(),
+        str(org.get("slug") or "").strip().lower(),
+    ]
+    return target in {candidate for candidate in candidates if candidate}
+
+
 def _resolve_primary_org_hash(state: AppContext) -> str:
     _require_auth(state)
     devices_response = state.api.get("/api/developer/devices/", params={"page_size": 1})
@@ -1810,36 +1844,83 @@ def _show_item_from_list_payload(
 
 
 @orgs_app.command("show")
-def orgs_show(ctx: typer.Context) -> None:
+def orgs_show(
+    ctx: typer.Context,
+    organisation: Optional[str] = typer.Argument(None, help="Optional org hash/name/slug selector"),
+) -> None:
     """Show your primary organisation details.
 
     Examples:
       dataplicity org show
+      dataplicity org show <org-hash-or-slug>
       dataplicity --json org show
     """
     state = _ctx(ctx)
     _require_auth(state)
-    devices_response = state.api.get("/api/developer/devices/", params={"page_size": 1})
-    if devices_response.ok:
-        devices = _extract_devices(devices_response.data or [])
-        inferred = _infer_primary_org_from_devices(devices)
-        if inferred:
-            if state.json_output:
-                _print_json(inferred)
-                return
-            table = Table(title="Organisation")
-            table.add_column("Hash")
-            table.add_column("Name")
-            table.add_row(str(inferred.get("hash_id") or ""), str(inferred.get("name") or "(inferred)"))
-            state.console.print(table)
-            state.console.print("[yellow]Note:[/yellow] Organisation details inferred from device metadata.")
-            return
-    message = _friendly_response_message("Unable to fetch organisation.", devices_response.data, devices_response.text)
-    if state.json_output:
-        _print_json({"ok": False, "detail": message})
+    profile_payload = _load_user_profile_payload(state)
+    org_from_profile = _extract_org_summary_from_profile(profile_payload)
+    inferred_note = False
+    org_details: Optional[Dict[str, Any]] = None
+
+    if org_from_profile:
+        org_details = org_from_profile
     else:
-        _show_error(state.console, message)
-    raise typer.Exit(code=1)
+        devices_response = state.api.get("/api/developer/devices/", params={"page_size": 1})
+        if devices_response.ok:
+            devices = _extract_devices(devices_response.data or [])
+            inferred = _infer_primary_org_from_devices(devices)
+            if inferred:
+                org_details = inferred
+                inferred_note = True
+
+    if not org_details:
+        message = "Unable to fetch organisation details from current account context."
+        if state.json_output:
+            _print_json({"ok": False, "detail": message})
+        else:
+            _show_error(state.console, message)
+        raise typer.Exit(code=1)
+
+    if organisation and (not _org_matches_selector(org_details, organisation)):
+        message = (
+            f"Requested organisation `{organisation}` not found in this account context. "
+            f"Current org is `{org_details.get('name') or org_details.get('hash_id')}`."
+        )
+        if state.json_output:
+            _print_json({"ok": False, "detail": message, "organisation": org_details})
+        else:
+            _show_error(state.console, message)
+        raise typer.Exit(code=2)
+
+    payload = {
+        "hash_id": str(org_details.get("hash_id") or ""),
+        "name": str(org_details.get("name") or ""),
+        "slug": str(org_details.get("slug") or ""),
+        "org_admin_email": str(org_details.get("org_admin_email") or ""),
+        "current_user_email": str(org_details.get("current_user_email") or ""),
+        "current_user_role": str(org_details.get("current_user_role") or ""),
+        "inferred_from_devices": inferred_note,
+    }
+    if state.json_output:
+        _print_json(payload)
+        return
+
+    table = Table(title="Organisation")
+    table.add_column("Key")
+    table.add_column("Value")
+    table.add_row("Hash", payload["hash_id"])
+    table.add_row("Name", payload["name"])
+    if payload["slug"]:
+        table.add_row("Slug", payload["slug"])
+    if payload["org_admin_email"]:
+        table.add_row("Org admin", payload["org_admin_email"])
+    if payload["current_user_email"]:
+        table.add_row("Current user", payload["current_user_email"])
+    if payload["current_user_role"]:
+        table.add_row("Current role", payload["current_user_role"])
+    state.console.print(table)
+    if inferred_note:
+        state.console.print("[yellow]Note:[/yellow] Organisation details inferred from device metadata.")
 
 
 @devices_app.command("list")
@@ -2434,16 +2515,25 @@ def devices_connect(ctx: typer.Context, device_hash: Optional[str] = typer.Argum
 @devices_app.command("run")
 def devices_run(
     ctx: typer.Context,
-    device_hash: Optional[str] = typer.Argument(None),
+    device_hash: Optional[str] = typer.Argument(
+        None,
+        help="Device hash (optional in interactive mode; required with --json).",
+    ),
     command: str = typer.Option(..., "--command", "-c", help="Single shell command to run"),
     timeout: int = typer.Option(30, "--timeout", min=1, help="Seconds before command times out"),
+    connect_timeout: int = typer.Option(
+        15,
+        "--connect-timeout",
+        min=1,
+        help="Seconds to wait for remote session setup before failing",
+    ),
     no_timeout: bool = typer.Option(
         False,
         "--no-timeout",
         help="Disable timeout and wait until command completes",
     ),
 ) -> None:
-    """Run a single command on a device and print output.
+    """Run a single command on a selected device and print output.
 
     Examples:
       dataplicity devices run --command "uname -a"
@@ -2458,11 +2548,25 @@ def devices_run(
     async def runner() -> str:
         from .remote_access import run_single_command
 
-        ws_url = await _resolve_m2m_url(state, resolved_hash)
-        m2m = M2MClient(ws_url)
-        await m2m.connect()
+        if not state.json_output:
+            state.console.print(f"[blue]Connecting to {resolved_hash}...[/blue]")
         try:
-            identity = await m2m.wait_for_identity()
+            ws_url = await asyncio.wait_for(_resolve_m2m_url(state, resolved_hash), timeout=float(connect_timeout))
+        except asyncio.TimeoutError as exc:
+            raise RuntimeError(
+                f"Timed out after {connect_timeout}s while resolving remote host."
+            ) from exc
+        m2m = M2MClient(ws_url)
+        try:
+            await asyncio.wait_for(m2m.connect(), timeout=float(connect_timeout))
+        except asyncio.TimeoutError as exc:
+            raise RuntimeError(
+                f"Timed out after {connect_timeout}s while opening remote transport."
+            ) from exc
+        try:
+            if not state.json_output:
+                state.console.print("[blue]Authorising remote session...[/blue]")
+            identity = await m2m.wait_for_identity(timeout=float(connect_timeout))
             response = _open_remote_access_port(
                 state,
                 resolved_hash,
@@ -2470,7 +2574,12 @@ def devices_run(
             )
             if not response.ok:
                 raise RuntimeError(response.text or "Unable to open terminal")
-            channel_port = await m2m.wait_for_channel_open()
+            channel_port = await m2m.wait_for_channel_open(timeout=float(connect_timeout))
+            if not state.json_output:
+                if timeout_seconds is None:
+                    state.console.print("[blue]Running command (no timeout)...[/blue]")
+                else:
+                    state.console.print(f"[blue]Running command (timeout {int(timeout_seconds)}s)...[/blue]")
             output_bytes = await run_single_command(
                 m2m,
                 channel_port,
@@ -2602,6 +2711,14 @@ def _resource_status(item: Dict[str, Any]) -> str:
             text = str(value).strip()
             if text:
                 return text
+    metadata = item.get("metadata")
+    if isinstance(metadata, dict):
+        for key in ("last_status", "status", "state", "health", "severity"):
+            value = metadata.get(key)
+            if value is not None:
+                text = str(value).strip()
+                if text:
+                    return text
     return ""
 
 
@@ -2738,6 +2855,16 @@ def endpoint_monitors_list(
     _render_resource_table(state, "Endpoint monitors", rows)
 
 
+@endpoint_monitors_app.command("ls")
+def endpoint_monitors_ls(
+    ctx: typer.Context,
+    page_size: int = typer.Option(100, "--page-size", help="Page size"),
+    search: Optional[str] = typer.Option(None, "--search", help="Search term"),
+) -> None:
+    """Alias for `endpoint-monitors list`."""
+    endpoint_monitors_list(ctx, page_size=page_size, search=search)
+
+
 @endpoint_monitors_app.command("show")
 def endpoint_monitors_show(ctx: typer.Context, monitor_id: str = typer.Argument(...)) -> None:
     """Show an endpoint monitor.
@@ -2758,6 +2885,12 @@ def endpoint_monitors_show(ctx: typer.Context, monitor_id: str = typer.Argument(
         raise typer.Exit(code=1)
     rows = [row for row in _extract_objects(response.data or []) if str(row.get("kind") or "").lower() == "service"]
     _show_item_from_list_payload(state, rows, resource_id=monitor_id, label="endpoint monitor")
+
+
+@endpoint_monitors_app.command("get")
+def endpoint_monitors_get(ctx: typer.Context, monitor_id: str = typer.Argument(...)) -> None:
+    """Alias for `endpoint-monitors show`."""
+    endpoint_monitors_show(ctx, monitor_id=monitor_id)
 
 
 @endpoint_monitors_app.command("create")
@@ -2838,6 +2971,16 @@ def user_impact_list(
     _render_resource_table(state, "User impact", payload)
 
 
+@user_impact_app.command("ls")
+def user_impact_ls(
+    ctx: typer.Context,
+    page_size: int = typer.Option(100, "--page-size", help="Page size"),
+    unresolved_only: bool = typer.Option(False, "--unresolved-only", help="Show unresolved impact items"),
+) -> None:
+    """Alias for `user-impact list`."""
+    user_impact_list(ctx, page_size=page_size, unresolved_only=unresolved_only)
+
+
 @user_impact_app.command("show")
 def user_impact_show(ctx: typer.Context, impact_id: str = typer.Argument(...)) -> None:
     """Show a user impact item.
@@ -2858,6 +3001,12 @@ def user_impact_show(ctx: typer.Context, impact_id: str = typer.Argument(...)) -
         raise typer.Exit(code=1)
     rows = [row for row in _extract_objects(response.data or []) if str(row.get("kind") or "").lower() == "user-impact"]
     _show_item_from_list_payload(state, rows, resource_id=impact_id, label="user impact item")
+
+
+@user_impact_app.command("get")
+def user_impact_get(ctx: typer.Context, impact_id: str = typer.Argument(...)) -> None:
+    """Alias for `user-impact show`."""
+    user_impact_show(ctx, impact_id=impact_id)
 
 
 @heartbeat_monitors_app.command("list")
@@ -2894,6 +3043,16 @@ def heartbeat_monitors_list(
     _render_resource_table(state, "Heartbeat monitors", payload)
 
 
+@heartbeat_monitors_app.command("ls")
+def heartbeat_monitors_ls(
+    ctx: typer.Context,
+    page_size: int = typer.Option(100, "--page-size", help="Page size"),
+    search: Optional[str] = typer.Option(None, "--search", help="Search term"),
+) -> None:
+    """Alias for `heartbeat-monitors list`."""
+    heartbeat_monitors_list(ctx, page_size=page_size, search=search)
+
+
 @heartbeat_monitors_app.command("show")
 def heartbeat_monitors_show(ctx: typer.Context, monitor_id: str = typer.Argument(...)) -> None:
     """Show a heartbeat monitor.
@@ -2914,6 +3073,12 @@ def heartbeat_monitors_show(ctx: typer.Context, monitor_id: str = typer.Argument
         raise typer.Exit(code=1)
     rows = [row for row in _extract_objects(response.data or []) if str(row.get("kind") or "").lower() == "heartbeat"]
     _show_item_from_list_payload(state, rows, resource_id=monitor_id, label="heartbeat monitor")
+
+
+@heartbeat_monitors_app.command("get")
+def heartbeat_monitors_get(ctx: typer.Context, monitor_id: str = typer.Argument(...)) -> None:
+    """Alias for `heartbeat-monitors show`."""
+    heartbeat_monitors_show(ctx, monitor_id=monitor_id)
 
 
 @heartbeat_monitors_app.command("create")
@@ -2980,6 +3145,16 @@ def fleet_jobs_list(
     _list_resource(state, endpoint=_incident_automation_endpoint(state, "rules"), title="Fleet jobs", params=params)
 
 
+@fleet_jobs_app.command("ls")
+def fleet_jobs_ls(
+    ctx: typer.Context,
+    page_size: int = typer.Option(100, "--page-size", help="Page size"),
+    status: Optional[str] = typer.Option(None, "--status", help="Filter by status"),
+) -> None:
+    """Alias for `fleet-jobs list`."""
+    fleet_jobs_list(ctx, page_size=page_size, status=status)
+
+
 @fleet_jobs_app.command("show")
 def fleet_jobs_show(ctx: typer.Context, job_id: str = typer.Argument(...)) -> None:
     """Show a fleet job.
@@ -2996,6 +3171,12 @@ def fleet_jobs_show(ctx: typer.Context, job_id: str = typer.Argument(...)) -> No
     )
 
 
+@fleet_jobs_app.command("get")
+def fleet_jobs_get(ctx: typer.Context, job_id: str = typer.Argument(...)) -> None:
+    """Alias for `fleet-jobs show`."""
+    fleet_jobs_show(ctx, job_id=job_id)
+
+
 @fleet_jobs_app.command("run")
 def fleet_jobs_run(
     ctx: typer.Context,
@@ -3009,6 +3190,15 @@ def fleet_jobs_run(
     state = _ctx(ctx)
     endpoint = _incident_automation_endpoint(state, "rule-simulations")
     _create_resource(state, endpoint=endpoint, data=data, label="fleet job simulation")
+
+
+@fleet_jobs_app.command("create")
+def fleet_jobs_create(
+    ctx: typer.Context,
+    data: str = typer.Option(..., "--data", help="JSON payload"),
+) -> None:
+    """Alias for `fleet-jobs run`."""
+    fleet_jobs_run(ctx, data=data)
 
 
 @fleet_jobs_app.command("cancel")
@@ -3036,6 +3226,12 @@ def fleet_jobs_cancel(ctx: typer.Context, job_id: str = typer.Argument(...)) -> 
         _print_json(response.data if response.data is not None else {"ok": True})
     else:
         state.console.print("[green]Fleet job cancellation requested.[/green]")
+
+
+@fleet_jobs_app.command("delete")
+def fleet_jobs_delete(ctx: typer.Context, job_id: str = typer.Argument(...)) -> None:
+    """Alias for `fleet-jobs cancel`."""
+    fleet_jobs_cancel(ctx, job_id=job_id)
 
 
 @logging_app.command("list")
@@ -3128,6 +3324,32 @@ def logging_list(
             f"[yellow]Output truncated:[/yellow] showing first {LOGGING_MAX_OUTPUT_ITEMS} records "
             f"(dropped {dropped_items}). Narrow with --device/--path/--search or reduce the time window."
         )
+
+
+@logging_app.command("ls")
+def logging_ls(
+    ctx: typer.Context,
+    page_size: int = typer.Option(200, "--page-size", help="Number of records to request (max 200)"),
+    device_hash: Optional[str] = typer.Option(None, "--device", help="Filter by device hash"),
+    level: Optional[str] = typer.Option(None, "--level", help="Filter by log level"),
+    path: Optional[str] = typer.Option(None, "--path", help="Filter by web-style path scope (for example /devices/<hash>)"),
+    search: Optional[str] = typer.Option(None, "--search", help="Free-text search term"),
+    since: str = typer.Option("1h", "--since", help="Start of time window (relative like 15m, 2h, 1d, or ISO timestamp)"),
+    until: Optional[str] = typer.Option(None, "--until", help="End of time window (relative or ISO timestamp)"),
+    all_scopes: bool = typer.Option(False, "--all-scopes", help="Allow broad cross-fleet queries. Requires a bounded time window."),
+) -> None:
+    """Alias for `logging list`."""
+    logging_list(
+        ctx,
+        page_size=page_size,
+        device_hash=device_hash,
+        level=level,
+        path=path,
+        search=search,
+        since=since,
+        until=until,
+        all_scopes=all_scopes,
+    )
 
 
 def _parse_log_time_expr(value: Optional[str], *, now: dt.datetime) -> str:
@@ -3286,6 +3508,12 @@ def logging_show(ctx: typer.Context, log_id: str = typer.Argument(...)) -> None:
             _show_error(state.console, message)
         raise typer.Exit(code=1)
     _show_item_from_list_payload(state, response.data or [], resource_id=log_id, label="log event")
+
+
+@logging_app.command("get")
+def logging_get(ctx: typer.Context, log_id: str = typer.Argument(...)) -> None:
+    """Alias for `logging show`."""
+    logging_show(ctx, log_id=log_id)
 
 
 @api_app.command("get")
