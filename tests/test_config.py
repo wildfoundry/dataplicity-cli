@@ -72,6 +72,19 @@ class ConfigTest(unittest.TestCase):
             with patch.dict("os.environ", {"DATAPLICITY_CONFIG_DIR": temp_dir}, clear=False):
                 self.assertEqual(default_config_path(), Path(temp_dir) / "cli.json")
 
+    def test_default_config_path_uses_xdg_when_platformdirs_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch("dataplicity_cli.config.user_config_dir", None):
+                with patch.dict("os.environ", {"XDG_CONFIG_HOME": temp_dir}, clear=False):
+                    self.assertEqual(default_config_path(), Path(temp_dir) / "dataplicity" / "cli.json")
+
+    def test_default_config_path_falls_back_to_home_config(self) -> None:
+        fake_home = Path("/tmp/fake-home")
+        with patch("dataplicity_cli.config.user_config_dir", None):
+            with patch.dict("os.environ", {}, clear=True):
+                with patch("pathlib.Path.home", return_value=fake_home):
+                    self.assertEqual(default_config_path(), fake_home / ".config" / "dataplicity" / "cli.json")
+
 
 if __name__ == "__main__":
     unittest.main()
