@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -17,9 +18,18 @@ class CliUxSnapshotsTest(unittest.TestCase):
     def _invoke(self, args: list[str]):
         return self.runner.invoke(app, args)
 
+    @staticmethod
+    def _strip_ansi(text: str) -> str:
+        return re.sub(r"\x1b\[[0-9;]*m", "", text)
+
+    def _assert_output_contains(self, result, expected_snippets: list[str]) -> None:
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+        output = self._strip_ansi(result.output)
+        for snippet in expected_snippets:
+            self.assertIn(snippet, output)
+
     def test_root_help_snapshot(self) -> None:
         result = self._invoke(["--help"])
-        self.assertEqual(result.exit_code, 0, msg=result.output)
         expected_snippets = [
             "Dataplicity CLI",
             "Examples:",
@@ -37,24 +47,20 @@ class CliUxSnapshotsTest(unittest.TestCase):
             "ls",
             "connect",
         ]
-        for snippet in expected_snippets:
-            self.assertIn(snippet, result.output)
+        self._assert_output_contains(result, expected_snippets)
 
     def test_devices_terminal_help_snapshot(self) -> None:
         result = self._invoke(["devices", "terminal", "--help"])
-        self.assertEqual(result.exit_code, 0, msg=result.output)
         expected_snippets = [
             "Open an interactive terminal session to a device.",
             "Examples:",
             "dataplicity devices terminal",
             "dataplicity devices terminal <device-hash>",
         ]
-        for snippet in expected_snippets:
-            self.assertIn(snippet, result.output)
+        self._assert_output_contains(result, expected_snippets)
 
     def test_devices_run_help_snapshot(self) -> None:
         result = self._invoke(["devices", "run", "--help"])
-        self.assertEqual(result.exit_code, 0, msg=result.output)
         expected_snippets = [
             "Run a single command on a selected device and print output.",
             "dataplicity devices run --command",
@@ -63,12 +69,10 @@ class CliUxSnapshotsTest(unittest.TestCase):
             "--connect-timeout",
             "--no-timeout",
         ]
-        for snippet in expected_snippets:
-            self.assertIn(snippet, result.output)
+        self._assert_output_contains(result, expected_snippets)
 
     def test_devices_ssh_help_snapshot(self) -> None:
         result = self._invoke(["devices", "ssh", "--help"])
-        self.assertEqual(result.exit_code, 0, msg=result.output)
         expected_snippets = [
             "Open SSH to a device using an automatic secure tunnel.",
             "keys from ssh-agent by default",
@@ -78,47 +82,39 @@ class CliUxSnapshotsTest(unittest.TestCase):
             "--local-port",
             "--identity-file",
         ]
-        for snippet in expected_snippets:
-            self.assertIn(snippet, result.output)
+        self._assert_output_contains(result, expected_snippets)
 
     def test_devices_port_forward_help_snapshot(self) -> None:
         result = self._invoke(["devices", "port-forward", "--help"])
-        self.assertEqual(result.exit_code, 0, msg=result.output)
         expected_snippets = [
             "Forward a local port to a remote device port with live metrics.",
             "dataplicity devices port-forward --remote-port 22 --local-port 2022",
             "--remote-port",
             "--local-port",
         ]
-        for snippet in expected_snippets:
-            self.assertIn(snippet, result.output)
+        self._assert_output_contains(result, expected_snippets)
 
     def test_doctor_help_snapshot(self) -> None:
         result = self._invoke(["doctor", "--help"])
-        self.assertEqual(result.exit_code, 0, msg=result.output)
         expected_snippets = [
             "Run connectivity and auth diagnostics.",
             "Examples:",
             "dataplicity doctor",
             "dataplicity --json doctor",
         ]
-        for snippet in expected_snippets:
-            self.assertIn(snippet, result.output)
+        self._assert_output_contains(result, expected_snippets)
 
     def test_fleet_jobs_run_help_snapshot(self) -> None:
         result = self._invoke(["fleet-jobs", "run", "--help"])
-        self.assertEqual(result.exit_code, 0, msg=result.output)
         expected_snippets = [
             "Create and start a fleet job.",
             "Examples:",
             "dataplicity fleet-jobs run --data",
         ]
-        for snippet in expected_snippets:
-            self.assertIn(snippet, result.output)
+        self._assert_output_contains(result, expected_snippets)
 
     def test_logging_list_help_snapshot(self) -> None:
         result = self._invoke(["logging", "list", "--help"])
-        self.assertEqual(result.exit_code, 0, msg=result.output)
         expected_snippets = [
             "List raw log lines.",
             "--device",
@@ -127,18 +123,15 @@ class CliUxSnapshotsTest(unittest.TestCase):
             "--since",
             "--all-scopes",
         ]
-        for snippet in expected_snippets:
-            self.assertIn(snippet, result.output)
+        self._assert_output_contains(result, expected_snippets)
 
     def test_logging_path_map_help_snapshot(self) -> None:
         result = self._invoke(["logging", "path-map", "--help"])
-        self.assertEqual(result.exit_code, 0, msg=result.output)
         expected_snippets = [
             "Show recommended path filters for scoped log queries.",
             "dataplicity logging path-map",
         ]
-        for snippet in expected_snippets:
-            self.assertIn(snippet, result.output)
+        self._assert_output_contains(result, expected_snippets)
 
     def test_version_flag_snapshot(self) -> None:
         result = self._invoke(["--version"])

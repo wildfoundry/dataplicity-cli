@@ -16,7 +16,8 @@ dataplicity --help
 
 ```
 brew tap wildfoundry/tap
-brew install dataplicity-cli
+brew trust --formula wildfoundry/tap/dataplicity-cli
+brew install wildfoundry/tap/dataplicity-cli
 dataplicity --help
 ```
 
