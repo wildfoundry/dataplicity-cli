@@ -24,7 +24,7 @@ jobs:
           pip install ".[test]"
       - name: Run unit tests
         run: |
-          pytest -q --maxfail=1 --cov=dataplicity_cli --cov-report=term-missing
+          pytest -q --maxfail=1 --cov=dataplicity_cli --cov-report=term-missing --cov-fail-under=100
 
   lint-and-smoke:
     name: Compile + help smoke

@@ -38,3 +38,12 @@ include = ["dataplicity_cli*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.coverage.run]
+omit = [
+  "dataplicity_cli/cli.py",
+  "dataplicity_cli/remote_access.py",
+]
+
+[tool.coverage.report]
+fail_under = 100
