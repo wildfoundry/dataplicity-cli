@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -16,6 +17,10 @@ class CliUxSnapshotsTest(unittest.TestCase):
 
     def _invoke(self, args: list[str]):
         return self.runner.invoke(app, args)
+
+    @staticmethod
+    def _strip_ansi(text: str) -> str:
+        return re.sub(r"\x1b\[[0-9;]*m", "", text)
 
     def test_root_help_snapshot(self) -> None:
         result = self._invoke(["--help"])
@@ -84,6 +89,7 @@ class CliUxSnapshotsTest(unittest.TestCase):
     def test_devices_port_forward_help_snapshot(self) -> None:
         result = self._invoke(["devices", "port-forward", "--help"])
         self.assertEqual(result.exit_code, 0, msg=result.output)
+        output = self._strip_ansi(result.output)
         expected_snippets = [
             "Forward a local port to a remote device port with live metrics.",
             "dataplicity devices port-forward --remote-port 22 --local-port 2022",
@@ -91,7 +97,7 @@ class CliUxSnapshotsTest(unittest.TestCase):
             "--local-port",
         ]
         for snippet in expected_snippets:
-            self.assertIn(snippet, result.output)
+            self.assertIn(snippet, output)
 
     def test_doctor_help_snapshot(self) -> None:
         result = self._invoke(["doctor", "--help"])
