@@ -20,6 +20,12 @@ dependencies = [
   "platformdirs>=4.0.0",
 ]
 
+[project.optional-dependencies]
+test = [
+  "pytest>=9.0.0",
+  "pytest-cov>=7.0.0",
+]
+
 [project.scripts]
 dataplicity = "dataplicity_cli.cli:app"
 
@@ -29,3 +35,6 @@ package-dir = { "" = "." }
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["dataplicity_cli*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
