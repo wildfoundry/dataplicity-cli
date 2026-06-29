@@ -49,6 +49,7 @@ app = typer.Typer(
 auth_app = typer.Typer(help="Authentication commands")
 orgs_app = typer.Typer(help="Organisation commands")
 devices_app = typer.Typer(help="Device commands")
+devices_history_app = typer.Typer(help="Device history commands", no_args_is_help=True)
 config_app = typer.Typer(help="Configuration commands")
 api_app = typer.Typer(help="Raw API commands")
 endpoint_monitors_app = typer.Typer(help="Endpoint monitor commands")
@@ -64,6 +65,7 @@ LOGGING_MAX_FIELD_CHARS = 2000
 app.add_typer(auth_app, name="auth")
 app.add_typer(orgs_app, name="org")
 app.add_typer(devices_app, name="devices")
+devices_app.add_typer(devices_history_app, name="history")
 app.add_typer(config_app, name="config")
 app.add_typer(api_app, name="api")
 app.add_typer(endpoint_monitors_app, name="endpoint-monitors")
@@ -601,6 +603,57 @@ def _friendly_response_message(default_message: str, response_data: Any, respons
     if _looks_like_invalid_auth_message(message):
         return "Saved login appears expired or invalid. Run `dataplicity setup` to sign in again."
     return message
+
+
+def _incident_automation_org_hash(endpoint: str) -> str:
+    match = re.search(r"/api/organisations/([^/]+)/", endpoint)
+    if not match:
+        return ""
+    return str(match.group(1) or "").strip()
+
+
+def _is_incident_automation_endpoint(endpoint: str) -> bool:
+    return "/incident-automation/" in endpoint
+
+
+def _is_incident_automation_collection_endpoint(endpoint: str) -> bool:
+    trimmed = endpoint.strip().rstrip("/")
+    match = re.search(r"/incident-automation/([^/]+)$", trimmed)
+    return match is not None
+
+
+def _incident_automation_collection_endpoint(endpoint: str) -> str:
+    if not _is_incident_automation_endpoint(endpoint):
+        return endpoint
+    base = endpoint.split("/incident-automation/", 1)[0]
+    suffix = endpoint.split("/incident-automation/", 1)[1]
+    resource = suffix.strip("/").split("/", 1)[0]
+    return f"{base}/incident-automation/{resource}/"
+
+
+def _incident_automation_feature_unavailable_message(endpoint: str, *, feature_name: str) -> str:
+    org_hash = _incident_automation_org_hash(endpoint)
+    if org_hash:
+        return f"{feature_name} are not available for organisation `{org_hash}`."
+    return f"{feature_name} are not available for this organisation."
+
+
+def _endpoint_error_message(
+    state: AppContext,
+    *,
+    endpoint: str,
+    response: ApiResponse,
+    default_message: str,
+    feature_name: Optional[str] = None,
+) -> str:
+    if response.status_code == 404 and feature_name and _is_incident_automation_endpoint(endpoint):
+        if _is_incident_automation_collection_endpoint(endpoint):
+            return _incident_automation_feature_unavailable_message(endpoint, feature_name=feature_name)
+        probe_endpoint = _incident_automation_collection_endpoint(endpoint)
+        probe = state.api.get(probe_endpoint)
+        if probe.status_code == 404:
+            return _incident_automation_feature_unavailable_message(endpoint, feature_name=feature_name)
+    return _friendly_response_message(default_message, response.data, response.text)
 
 
 def _normalize_email(value: Optional[str]) -> str:
@@ -1214,6 +1267,63 @@ def _resolve_device_hash_interactive(
         _show_error(state.console, f"Please choose a number between 1 and {len(devices)}.")
         raise typer.Exit(code=2)
     return _device_hash(devices[idx - 1])
+
+
+def _extract_timeline_rows(payload: Any) -> List[Dict[str, Any]]:
+    if isinstance(payload, dict):
+        rows = payload.get("results")
+        if isinstance(rows, list):
+            return [item for item in rows if isinstance(item, dict)]
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+    return []
+
+
+def _timeline_event_id(row: Dict[str, Any]) -> Optional[int]:
+    raw = row.get("id")
+    if isinstance(raw, int):
+        return raw
+    if isinstance(raw, str):
+        with suppress(ValueError):
+            return int(raw)
+    return None
+
+
+def _timeline_entry_not_found_message(event_id: int) -> str:
+    return (
+        f"History entry `{event_id}` was not found in the latest device timeline window. "
+        "Use `devices history list --limit 500 --include-deleted` to inspect more rows."
+    )
+
+
+DEVICE_TIMELINE_ALLOWED_TYPES = {
+    "general",
+    "lifecycle",
+    "service",
+    "logistics",
+    "warranty",
+    "rma",
+    "shipping",
+    "diagnostics",
+    "customer",
+}
+DEVICE_TIMELINE_OPERATOR_RESERVED_TYPES = {"lifecycle"}
+DEVICE_TIMELINE_OPERATOR_ALLOWED_TYPES = tuple(
+    sorted(DEVICE_TIMELINE_ALLOWED_TYPES - DEVICE_TIMELINE_OPERATOR_RESERVED_TYPES)
+)
+
+
+def _normalize_timeline_type(raw_value: Optional[str]) -> str:
+    candidate = str(raw_value or "").strip().lower()
+    if candidate in DEVICE_TIMELINE_ALLOWED_TYPES:
+        return candidate
+    return "general"
+
+
+def _normalize_timeline_type_filters(raw_value: Optional[str]) -> List[str]:
+    pieces = [part.strip().lower() for part in str(raw_value or "").split(",")]
+    cleaned = [piece for piece in pieces if piece in DEVICE_TIMELINE_ALLOWED_TYPES]
+    return list(dict.fromkeys(cleaned))
 
 
 @app.callback()
@@ -2050,6 +2160,291 @@ def devices_show(ctx: typer.Context, device_hash: Optional[str] = typer.Argument
         for key, value in response.data.items():
             table.add_row(str(key), json.dumps(_sanitize_payload(value)))
     state.console.print(table)
+
+
+@devices_history_app.command("list")
+def devices_history_list(
+    ctx: typer.Context,
+    device_hash: Optional[str] = typer.Argument(None),
+    limit: int = typer.Option(120, "--limit", help="Maximum number of history entries (1-500)"),
+    source: Optional[str] = typer.Option(None, "--source", help="Filter by source: operator or system"),
+    timeline_type: Optional[str] = typer.Option(
+        None,
+        "--type",
+        help="Filter by timeline type (comma-separated values allowed)",
+    ),
+    search: Optional[str] = typer.Option(None, "--search", help="Search in message/event type"),
+    include_deleted: bool = typer.Option(False, "--include-deleted", help="Include soft-deleted operator comments"),
+) -> None:
+    """List history entries for a device.
+
+    Examples:
+      dataplicity devices history list
+      dataplicity devices history list <device-hash> --source operator --type logistics
+      dataplicity devices history list --search reboot --include-deleted
+    """
+    state = _ctx(ctx)
+    _require_auth(state)
+    resolved_hash = _resolve_device_hash_interactive(state, device_hash, action_name="history list")
+    params: Dict[str, Any] = {"limit": max(1, min(limit, 500))}
+    if source:
+        source_value = source.strip().lower()
+        if source_value not in {"operator", "system"}:
+            message = "`--source` must be either `operator` or `system`."
+            if state.json_output:
+                _print_json({"ok": False, "detail": message})
+            else:
+                _show_error(state.console, message)
+            raise typer.Exit(code=2)
+        params["source"] = source_value
+    if timeline_type:
+        filters = _normalize_timeline_type_filters(timeline_type)
+        if filters:
+            params["types"] = ",".join(filters)
+    if search:
+        params["q"] = search
+    if include_deleted:
+        params["include_deleted"] = "1"
+
+    response = state.api.get(f"/api/developer/devices/{resolved_hash}/timeline/", params=params)
+    if not response.ok:
+        message = _friendly_response_message("Unable to load device history.", response.data, response.text)
+        if state.json_output:
+            _print_json({"ok": False, "detail": message})
+        else:
+            _show_error(state.console, message)
+        raise typer.Exit(code=1)
+
+    payload = response.data or {}
+    if state.json_output:
+        _print_json(payload)
+        return
+
+    rows = _extract_timeline_rows(payload)
+    table = Table(title=f"Device history: {resolved_hash}")
+    table.add_column("ID", style="cyan")
+    table.add_column("Timestamp")
+    table.add_column("Source")
+    table.add_column("Type")
+    table.add_column("Author")
+    table.add_column("Message", overflow="fold")
+
+    for row in rows:
+        event_id = _timeline_event_id(row)
+        timestamp = str(row.get("timestamp") or "")
+        entry_source = str(row.get("source") or "")
+        entry_type = str(row.get("type") or "")
+        author = str(row.get("author_display") or row.get("author_username") or "")
+        message = str(row.get("message") or "")
+        deleted = bool(row.get("is_deleted"))
+        table.add_row(
+            str(event_id or ""),
+            timestamp,
+            entry_source,
+            entry_type,
+            author,
+            message,
+            style="dim" if deleted else "",
+        )
+
+    state.console.print(table)
+    state.console.print(f"Showing {len(rows)} history entries.")
+
+
+@devices_history_app.command("show")
+def devices_history_show(
+    ctx: typer.Context,
+    device_hash: Optional[str] = typer.Argument(None),
+    event_id: int = typer.Option(..., "--event-id", "-e", help="Timeline event ID"),
+    include_deleted: bool = typer.Option(True, "--include-deleted/--exclude-deleted", help="Include deleted comments"),
+) -> None:
+    """Show one history entry for a device.
+
+    Examples:
+      dataplicity devices history show --event-id 12345
+      dataplicity devices history show <device-hash> --event-id 12345
+    """
+    state = _ctx(ctx)
+    _require_auth(state)
+    resolved_hash = _resolve_device_hash_interactive(state, device_hash, action_name="history show")
+    params: Dict[str, Any] = {"limit": 500}
+    if include_deleted:
+        params["include_deleted"] = "1"
+    response = state.api.get(f"/api/developer/devices/{resolved_hash}/timeline/", params=params)
+    if not response.ok:
+        message = _friendly_response_message("Unable to load device history.", response.data, response.text)
+        if state.json_output:
+            _print_json({"ok": False, "detail": message})
+        else:
+            _show_error(state.console, message)
+        raise typer.Exit(code=1)
+
+    rows = _extract_timeline_rows(response.data or {})
+    row = next((item for item in rows if _timeline_event_id(item) == event_id), None)
+    if not row:
+        message = _timeline_entry_not_found_message(event_id)
+        if state.json_output:
+            _print_json({"ok": False, "detail": message, "event_id": event_id})
+        else:
+            _show_error(state.console, message)
+        raise typer.Exit(code=2)
+
+    if state.json_output:
+        _print_json(row)
+        return
+
+    table = Table(title=f"Device history entry {event_id}")
+    table.add_column("Key")
+    table.add_column("Value")
+    preferred_keys = [
+        "id",
+        "timestamp",
+        "source",
+        "type",
+        "event_type",
+        "author_display",
+        "author_username",
+        "is_deleted",
+        "message",
+    ]
+    seen: Set[str] = set()
+    for key in preferred_keys:
+        if key not in row:
+            continue
+        table.add_row(key, json.dumps(_sanitize_payload(row.get(key))))
+        seen.add(key)
+    for key in sorted(row.keys()):
+        if key in seen:
+            continue
+        table.add_row(str(key), json.dumps(_sanitize_payload(row.get(key))))
+    state.console.print(table)
+
+
+@devices_history_app.command("comment")
+def devices_history_comment(
+    ctx: typer.Context,
+    device_hash: Optional[str] = typer.Argument(None),
+    message: Optional[str] = typer.Option(None, "--message", "-m", help="Comment text"),
+    timeline_type: str = typer.Option("general", "--type", help="Comment type/category"),
+) -> None:
+    """Add a comment to device history.
+
+    Examples:
+      dataplicity devices history comment --message "Replaced PSU" --type service
+      dataplicity devices history comment <device-hash> --message "Moved to rack B"
+    """
+    state = _ctx(ctx)
+    _require_auth(state)
+    resolved_hash = _resolve_device_hash_interactive(state, device_hash, action_name="history comment")
+    comment = (message or "").strip()
+    if not comment:
+        if state.json_output:
+            _print_json({"ok": False, "detail": "`--message` is required in --json mode."})
+            raise typer.Exit(code=2)
+        comment = Prompt.ask("Comment")
+        comment = comment.strip()
+        if not comment:
+            _show_error(state.console, "Comment cannot be empty.")
+            raise typer.Exit(code=2)
+
+    payload = {"message": comment}
+    normalized_type = _normalize_timeline_type(timeline_type)
+    if normalized_type in DEVICE_TIMELINE_OPERATOR_RESERVED_TYPES:
+        allowed_types = ", ".join(DEVICE_TIMELINE_OPERATOR_ALLOWED_TYPES)
+        message = (
+            f"`--type {normalized_type}` is reserved for automatic system entries. "
+            f"Allowed manual comment types: {allowed_types}."
+        )
+        if state.json_output:
+            _print_json({"ok": False, "detail": message})
+        else:
+            _show_error(state.console, message)
+        raise typer.Exit(code=2)
+    payload["type"] = normalized_type
+    response = state.api.post(f"/api/developer/devices/{resolved_hash}/timeline/", json_data=payload)
+    if not response.ok:
+        message = _friendly_response_message("Unable to add device history comment.", response.data, response.text)
+        if state.json_output:
+            _print_json({"ok": False, "detail": message})
+        else:
+            _show_error(state.console, message)
+        raise typer.Exit(code=1)
+
+    row = response.data if isinstance(response.data, dict) else {"detail": "Comment created."}
+    if state.json_output:
+        _print_json(row)
+        return
+
+    table = Table(title=f"Comment added to {resolved_hash}")
+    table.add_column("Key")
+    table.add_column("Value")
+    for key in ["id", "timestamp", "type", "author_display", "author_username", "message"]:
+        if key in row:
+            table.add_row(key, json.dumps(_sanitize_payload(row.get(key))))
+    state.console.print(table)
+
+
+@devices_history_app.command("delete")
+def devices_history_delete(
+    ctx: typer.Context,
+    device_hash: Optional[str] = typer.Argument(None),
+    event_id: int = typer.Option(..., "--event-id", "-e", help="Timeline event ID"),
+) -> None:
+    """Mark a history comment as deleted (soft delete).
+
+    Examples:
+      dataplicity devices history delete --event-id 12345
+      dataplicity devices history delete <device-hash> --event-id 12345
+    """
+    state = _ctx(ctx)
+    _require_auth(state)
+    resolved_hash = _resolve_device_hash_interactive(state, device_hash, action_name="history delete")
+    response = state.api.request(
+        "DELETE",
+        f"/api/developer/devices/{resolved_hash}/timeline/{event_id}/",
+    )
+    if not response.ok:
+        message = _friendly_response_message("Unable to mark history entry as deleted.", response.data, response.text)
+        if state.json_output:
+            _print_json({"ok": False, "detail": message, "event_id": event_id})
+        else:
+            _show_error(state.console, message)
+        raise typer.Exit(code=1)
+
+    row = response.data if isinstance(response.data, dict) else {"id": event_id, "is_deleted": True}
+    if state.json_output:
+        _print_json(row)
+        return
+
+    table = Table(title=f"History entry {event_id} marked deleted")
+    table.add_column("Key")
+    table.add_column("Value")
+    for key in ["id", "timestamp", "type", "author_display", "author_username", "is_deleted", "message"]:
+        if key in row:
+            table.add_row(key, json.dumps(_sanitize_payload(row.get(key))))
+    state.console.print(table)
+    state.console.print("[dim]Deleted entries are retained in history and can be shown with --include-deleted.[/dim]")
+
+
+@devices_history_app.command("mark-deleted")
+def devices_history_mark_deleted(
+    ctx: typer.Context,
+    device_hash: Optional[str] = typer.Argument(None),
+    event_id: int = typer.Option(..., "--event-id", "-e", help="Timeline event ID"),
+) -> None:
+    """Alias for `devices history delete`."""
+    devices_history_delete(ctx, device_hash=device_hash, event_id=event_id)
+
+
+@devices_history_app.command("add-comment")
+def devices_history_add_comment(
+    ctx: typer.Context,
+    device_hash: Optional[str] = typer.Argument(None),
+    message: Optional[str] = typer.Option(None, "--message", "-m", help="Comment text"),
+    timeline_type: str = typer.Option("general", "--type", help="Comment type/category"),
+) -> None:
+    """Alias for `devices history comment`."""
+    devices_history_comment(ctx, device_hash=device_hash, message=message, timeline_type=timeline_type)
 
 
 @devices_app.command("wormhole-status")
@@ -2900,11 +3295,18 @@ def _list_resource(
     endpoint: str,
     title: str,
     params: Optional[Dict[str, Any]] = None,
+    feature_name: Optional[str] = None,
 ) -> None:
     _require_auth(state)
     response = state.api.get(endpoint, params=params)
     if not response.ok:
-        message = _friendly_response_message(f"Unable to list {title.lower()}.", response.data, response.text)
+        message = _endpoint_error_message(
+            state,
+            endpoint=endpoint,
+            response=response,
+            default_message=f"Unable to list {title.lower()}.",
+            feature_name=feature_name,
+        )
         if state.json_output:
             _print_json({"ok": False, "detail": message})
         else:
@@ -2922,11 +3324,19 @@ def _show_resource(
     endpoint: str,
     resource_id: str,
     not_found_label: str,
+    feature_name: Optional[str] = None,
 ) -> None:
     _require_auth(state)
-    response = state.api.get(f"{endpoint}{resource_id}/")
+    request_endpoint = f"{endpoint}{resource_id}/"
+    response = state.api.get(request_endpoint)
     if not response.ok:
-        message = _friendly_response_message(f"Unable to fetch {not_found_label}.", response.data, response.text)
+        message = _endpoint_error_message(
+            state,
+            endpoint=request_endpoint,
+            response=response,
+            default_message=f"Unable to fetch {not_found_label}.",
+            feature_name=feature_name,
+        )
         if state.json_output:
             _print_json({"ok": False, "detail": message})
         else:
@@ -2944,12 +3354,25 @@ def _show_resource(
     state.console.print(table)
 
 
-def _create_resource(state: AppContext, *, endpoint: str, data: str, label: str) -> None:
+def _create_resource(
+    state: AppContext,
+    *,
+    endpoint: str,
+    data: str,
+    label: str,
+    feature_name: Optional[str] = None,
+) -> None:
     _require_auth(state)
     payload = _parse_json_payload_or_exit(state, data)
     response = state.api.post(endpoint, json_data=payload)
     if not response.ok:
-        message = _friendly_response_message(f"Unable to create {label}.", response.data, response.text)
+        message = _endpoint_error_message(
+            state,
+            endpoint=endpoint,
+            response=response,
+            default_message=f"Unable to create {label}.",
+            feature_name=feature_name,
+        )
         if state.json_output:
             _print_json({"ok": False, "detail": message})
         else:
@@ -2961,11 +3384,25 @@ def _create_resource(state: AppContext, *, endpoint: str, data: str, label: str)
         state.console.print(f"[green]{label.title()} created.[/green]")
 
 
-def _delete_resource(state: AppContext, *, endpoint: str, resource_id: str, label: str) -> None:
+def _delete_resource(
+    state: AppContext,
+    *,
+    endpoint: str,
+    resource_id: str,
+    label: str,
+    feature_name: Optional[str] = None,
+) -> None:
     _require_auth(state)
-    response = state.api.request("DELETE", f"{endpoint}{resource_id}/")
+    request_endpoint = f"{endpoint}{resource_id}/"
+    response = state.api.request("DELETE", request_endpoint)
     if not response.ok:
-        message = _friendly_response_message(f"Unable to delete {label}.", response.data, response.text)
+        message = _endpoint_error_message(
+            state,
+            endpoint=request_endpoint,
+            response=response,
+            default_message=f"Unable to delete {label}.",
+            feature_name=feature_name,
+        )
         if state.json_output:
             _print_json({"ok": False, "detail": message})
         else:
@@ -2994,7 +3431,13 @@ def endpoint_monitors_list(
     endpoint = _incident_automation_endpoint(state, "signals")
     response = state.api.get(endpoint)
     if not response.ok:
-        message = _friendly_response_message("Unable to list endpoint monitors.", response.data, response.text)
+        message = _endpoint_error_message(
+            state,
+            endpoint=endpoint,
+            response=response,
+            default_message="Unable to list endpoint monitors.",
+            feature_name="Endpoint monitors",
+        )
         if state.json_output:
             _print_json({"ok": False, "detail": message})
         else:
@@ -3033,7 +3476,13 @@ def endpoint_monitors_show(ctx: typer.Context, monitor_id: str = typer.Argument(
     endpoint = _incident_automation_endpoint(state, "signals")
     response = state.api.get(endpoint)
     if not response.ok:
-        message = _friendly_response_message("Unable to fetch endpoint monitor.", response.data, response.text)
+        message = _endpoint_error_message(
+            state,
+            endpoint=endpoint,
+            response=response,
+            default_message="Unable to fetch endpoint monitor.",
+            feature_name="Endpoint monitors",
+        )
         if state.json_output:
             _print_json({"ok": False, "detail": message})
         else:
@@ -3066,7 +3515,13 @@ def endpoint_monitors_create(
     endpoint = _incident_automation_endpoint(state, "rules")
     response = state.api.post(endpoint, json_data=payload)
     if not response.ok:
-        message = _friendly_response_message("Unable to create endpoint monitor.", response.data, response.text)
+        message = _endpoint_error_message(
+            state,
+            endpoint=endpoint,
+            response=response,
+            default_message="Unable to create endpoint monitor.",
+            feature_name="Endpoint monitors",
+        )
         if state.json_output:
             _print_json({"ok": False, "detail": message})
         else:
@@ -3091,6 +3546,7 @@ def endpoint_monitors_delete(ctx: typer.Context, monitor_id: str = typer.Argumen
         endpoint=_incident_automation_endpoint(state, "rules"),
         resource_id=monitor_id,
         label="endpoint monitor",
+        feature_name="Endpoint monitors",
     )
 
 
@@ -3111,7 +3567,13 @@ def user_impact_list(
     endpoint = _incident_automation_endpoint(state, "signals")
     response = state.api.get(endpoint)
     if not response.ok:
-        message = _friendly_response_message("Unable to list user impact.", response.data, response.text)
+        message = _endpoint_error_message(
+            state,
+            endpoint=endpoint,
+            response=response,
+            default_message="Unable to list user impact.",
+            feature_name="User impact signals",
+        )
         if state.json_output:
             _print_json({"ok": False, "detail": message})
         else:
@@ -3149,7 +3611,13 @@ def user_impact_show(ctx: typer.Context, impact_id: str = typer.Argument(...)) -
     endpoint = _incident_automation_endpoint(state, "signals")
     response = state.api.get(endpoint)
     if not response.ok:
-        message = _friendly_response_message("Unable to fetch user impact item.", response.data, response.text)
+        message = _endpoint_error_message(
+            state,
+            endpoint=endpoint,
+            response=response,
+            default_message="Unable to fetch user impact item.",
+            feature_name="User impact signals",
+        )
         if state.json_output:
             _print_json({"ok": False, "detail": message})
         else:
@@ -3182,7 +3650,13 @@ def heartbeat_monitors_list(
     endpoint = _incident_automation_endpoint(state, "signals")
     response = state.api.get(endpoint)
     if not response.ok:
-        message = _friendly_response_message("Unable to list heartbeat monitors.", response.data, response.text)
+        message = _endpoint_error_message(
+            state,
+            endpoint=endpoint,
+            response=response,
+            default_message="Unable to list heartbeat monitors.",
+            feature_name="Heartbeat monitors",
+        )
         if state.json_output:
             _print_json({"ok": False, "detail": message})
         else:
@@ -3221,7 +3695,13 @@ def heartbeat_monitors_show(ctx: typer.Context, monitor_id: str = typer.Argument
     endpoint = _incident_automation_endpoint(state, "signals")
     response = state.api.get(endpoint)
     if not response.ok:
-        message = _friendly_response_message("Unable to fetch heartbeat monitor.", response.data, response.text)
+        message = _endpoint_error_message(
+            state,
+            endpoint=endpoint,
+            response=response,
+            default_message="Unable to fetch heartbeat monitor.",
+            feature_name="Heartbeat monitors",
+        )
         if state.json_output:
             _print_json({"ok": False, "detail": message})
         else:
@@ -3254,7 +3734,13 @@ def heartbeat_monitors_create(
     endpoint = _incident_automation_endpoint(state, "rules")
     response = state.api.post(endpoint, json_data=payload)
     if not response.ok:
-        message = _friendly_response_message("Unable to create heartbeat monitor.", response.data, response.text)
+        message = _endpoint_error_message(
+            state,
+            endpoint=endpoint,
+            response=response,
+            default_message="Unable to create heartbeat monitor.",
+            feature_name="Heartbeat monitors",
+        )
         if state.json_output:
             _print_json({"ok": False, "detail": message})
         else:
@@ -3279,6 +3765,7 @@ def heartbeat_monitors_delete(ctx: typer.Context, monitor_id: str = typer.Argume
         endpoint=_incident_automation_endpoint(state, "rules"),
         resource_id=monitor_id,
         label="heartbeat monitor",
+        feature_name="Heartbeat monitors",
     )
 
 
@@ -3298,7 +3785,13 @@ def fleet_jobs_list(
     params: Dict[str, Any] = {"page_size": page_size}
     if status:
         params["status"] = status
-    _list_resource(state, endpoint=_incident_automation_endpoint(state, "rules"), title="Fleet jobs", params=params)
+    _list_resource(
+        state,
+        endpoint=_incident_automation_endpoint(state, "rules"),
+        title="Fleet jobs",
+        params=params,
+        feature_name="Fleet jobs",
+    )
 
 
 @fleet_jobs_app.command("ls")
@@ -3324,6 +3817,7 @@ def fleet_jobs_show(ctx: typer.Context, job_id: str = typer.Argument(...)) -> No
         endpoint=_incident_automation_endpoint(state, "rules"),
         resource_id=job_id,
         not_found_label="fleet job",
+        feature_name="Fleet jobs",
     )
 
 
@@ -3345,7 +3839,13 @@ def fleet_jobs_run(
     """
     state = _ctx(ctx)
     endpoint = _incident_automation_endpoint(state, "rule-simulations")
-    _create_resource(state, endpoint=endpoint, data=data, label="fleet job simulation")
+    _create_resource(
+        state,
+        endpoint=endpoint,
+        data=data,
+        label="fleet job simulation",
+        feature_name="Fleet jobs",
+    )
 
 
 @fleet_jobs_app.command("create")
@@ -3366,13 +3866,21 @@ def fleet_jobs_cancel(ctx: typer.Context, job_id: str = typer.Argument(...)) -> 
     """
     state = _ctx(ctx)
     _require_auth(state)
+    rules_endpoint = _incident_automation_endpoint(state, "rules")
+    job_endpoint = f"{rules_endpoint}{job_id}/"
     response = state.api.request(
         "PATCH",
-        f"{_incident_automation_endpoint(state, 'rules')}{job_id}/",
+        job_endpoint,
         json_data={"enabled": False},
     )
     if not response.ok:
-        message = _friendly_response_message("Unable to cancel fleet job.", response.data, response.text)
+        message = _endpoint_error_message(
+            state,
+            endpoint=job_endpoint,
+            response=response,
+            default_message="Unable to cancel fleet job.",
+            feature_name="Fleet jobs",
+        )
         if state.json_output:
             _print_json({"ok": False, "detail": message})
         else:
