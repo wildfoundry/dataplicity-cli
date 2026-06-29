@@ -59,6 +59,7 @@ jobs:
       - name: Resolve tap metadata
         id: tap
         env:
+          GH_TOKEN: ${{ github.token }}
           TAP_REPOSITORY_INPUT: ${{ inputs.tap_repository }}
           FORMULA_NAME_INPUT: ${{ inputs.formula_name }}
           TAP_REPOSITORY_VAR: ${{ vars.HOMEBREW_TAP_REPOSITORY }}
@@ -67,6 +68,15 @@ jobs:
         run: |
           set -euo pipefail
           TAP_REPOSITORY="${TAP_REPOSITORY_INPUT:-${TAP_REPOSITORY_VAR:-wildfoundry/homebrew-tap}}"
+          OWNER="${TAP_REPOSITORY%%/*}"
+          REPO="${TAP_REPOSITORY##*/}"
+          if ! gh api "repos/${TAP_REPOSITORY}" >/dev/null 2>&1 && [[ "${REPO}" != homebrew-* ]]; then
+            CANDIDATE="${OWNER}/homebrew-${REPO}"
+            if gh api "repos/${CANDIDATE}" >/dev/null 2>&1; then
+              echo "Resolved Homebrew tap alias ${TAP_REPOSITORY} -> ${CANDIDATE}"
+              TAP_REPOSITORY="${CANDIDATE}"
+            fi
+          fi
           FORMULA_NAME="${FORMULA_NAME_INPUT:-${FORMULA_NAME_VAR:-dataplicity-cli}}"
           echo "tap_repository=${TAP_REPOSITORY}" >>"${GITHUB_OUTPUT}"
           echo "formula_name=${FORMULA_NAME}" >>"${GITHUB_OUTPUT}"
@@ -103,6 +113,7 @@ jobs:
           path: homebrew-tap
 
       - name: Update formula
+        id: formula
         env:
           FORMULA_PATH: homebrew-tap/Formula/${{ steps.tap.outputs.formula_name }}.rb
           VERSION: ${{ steps.release.outputs.version }}
@@ -125,14 +136,17 @@ jobs:
           updated = re.sub(r'^\s*url\s+"[^"]+"\s*$', f'  url "{url}"', raw, flags=re.MULTILINE)
           updated = re.sub(r'^\s*sha256\s+"[^"]+"\s*$', f'  sha256 "{sha}"', updated, flags=re.MULTILINE)
           updated = re.sub(r'^\s*version\s+"[^"]+"\s*$', f'  version "{version}"', updated, flags=re.MULTILINE)
-
-          if updated == raw:
-              raise SystemExit("Formula did not change; is it already up to date?")
-
           path.write_text(updated, encoding="utf-8")
           PY
+          if git diff --quiet -- "${FORMULA_PATH}"; then
+            echo "changed=false" >>"${GITHUB_OUTPUT}"
+            echo "Formula is already up to date; skipping PR creation."
+          else
+            echo "changed=true" >>"${GITHUB_OUTPUT}"
+          fi
 
       - name: Create pull request in tap
+        if: steps.formula.outputs.changed == 'true'
         env:
           GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           TAP_REPOSITORY: ${{ steps.tap.outputs.tap_repository }}
