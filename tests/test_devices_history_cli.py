@@ -223,6 +223,35 @@ class DevicesHistoryCliTest(unittest.TestCase):
         self.assertEqual(payload.get("id"), 777)
         self.assertEqual(payload.get("is_deleted"), True)
 
+    def test_history_list_debug_prints_endpoint(self) -> None:
+        timeline_payload = {"results": [], "count": 0}
+
+        def fake_get(_self, path: str, *, params=None):  # type: ignore[no-untyped-def]
+            _ = params
+            self.assertEqual(path, f"/api/developer/devices/{self.device_hash}/timeline/")
+            return ApiResponse(True, 200, timeline_payload, json.dumps(timeline_payload))
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "cli.json"
+            self._write_authed_config(config_path)
+            with patch("dataplicity_cli.cli.ApiClient.get", new=fake_get):
+                result = self.runner.invoke(
+                    app,
+                    [
+                        "--debug",
+                        "--config",
+                        str(config_path),
+                        "devices",
+                        "history",
+                        "list",
+                        self.device_hash,
+                    ],
+                )
+
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+        self.assertIn("/api/developer/devices/", result.output)
+        self.assertIn("/timeline/", result.output)
+
 
 if __name__ == "__main__":
     unittest.main()
