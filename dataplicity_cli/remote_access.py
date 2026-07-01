@@ -321,8 +321,8 @@ async def run_port_forward(
             if channel_for_client is not None:
                 try:
                     await m2m.close_channel(channel_for_client)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    emit("channel_close_failed", detail=f"{connection_label}: {exc}")
             writer.close()
             await writer.wait_closed()
             emit("connection_closed", detail=connection_label)

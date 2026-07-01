@@ -5,7 +5,6 @@ import io
 import socket
 import tempfile
 import unittest
-from contextlib import suppress
 from pathlib import Path
 from typing import Dict, Optional
 from unittest.mock import patch
@@ -157,8 +156,12 @@ class RemoteAccessHelpersTest(unittest.IsolatedAsyncioTestCase):
                 await writer_two.wait_closed()
         finally:
             forward_task.cancel()
-            with suppress(asyncio.CancelledError):
+            cancelled = False
+            try:
                 await forward_task
+            except asyncio.CancelledError:
+                cancelled = True
+            self.assertTrue(cancelled)
 
 
 if __name__ == "__main__":
