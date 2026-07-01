@@ -2,19 +2,22 @@ from __future__ import annotations
 
 import asyncio
 import io
+import socket
 import tempfile
 import unittest
 from pathlib import Path
 from typing import Dict, Optional
 from unittest.mock import patch
 
-from dataplicity_cli.remote_access import _detect_protocol, run_remote_file, run_single_command
+from dataplicity_cli.remote_access import _detect_protocol, run_port_forward, run_remote_file, run_single_command
 
 
 class _FakeM2M:
     def __init__(self) -> None:
         self.queues: Dict[int, asyncio.Queue[Optional[bytes]]] = {}
         self.sent_payloads: list[bytes] = []
+        self.sent_routes: list[tuple[int, bytes]] = []
+        self.closed_channels: list[int] = []
 
     def channel_queue(self, port: int) -> asyncio.Queue[Optional[bytes]]:
         if port not in self.queues:
@@ -22,16 +25,22 @@ class _FakeM2M:
         return self.queues[port]
 
     async def send_route(self, port: int, data: bytes) -> None:
-        _ = port
+        self.sent_routes.append((port, data))
         self.sent_payloads.append(data)
 
     async def close_channel(self, port: int) -> None:
-        _ = port
+        self.closed_channels.append(port)
 
 
 class _StdoutWithBuffer:
     def __init__(self) -> None:
         self.buffer = io.BytesIO()
+
+
+def _unused_local_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        return int(probe.getsockname()[1])
 
 
 class RemoteAccessHelpersTest(unittest.IsolatedAsyncioTestCase):
@@ -79,6 +88,80 @@ class RemoteAccessHelpersTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(_detect_protocol(b"SSH-2.0-OpenSSH_9.0"), "SSH")
         self.assertEqual(_detect_protocol(bytes([0x16, 0x03, 0x03, 0x00])), "TLS")
         self.assertIsNone(_detect_protocol(b"\x01\x02\x03"))
+
+    async def test_run_port_forward_allocates_channel_per_local_client(self) -> None:
+        fake = _FakeM2M()
+        events = []
+        next_channels = iter([102])
+
+        async def channel_factory() -> int:
+            return next(next_channels)
+
+        local_port = _unused_local_port()
+        forward_task = asyncio.create_task(
+            run_port_forward(
+                fake,
+                101,
+                local_port,
+                channel_factory=channel_factory,
+                event_callback=events.append,
+            )
+        )
+        try:
+            for _ in range(50):
+                if any(event.kind == "listener_started" for event in events):
+                    break
+                await asyncio.sleep(0.01)
+            self.assertTrue(any(event.kind == "listener_started" for event in events))
+
+            reader_one, writer_one = await asyncio.open_connection("127.0.0.1", local_port)
+            reader_two, writer_two = await asyncio.open_connection("127.0.0.1", local_port)
+            try:
+                writer_one.write(b"GET /one HTTP/1.1\r\n\r\n")
+                writer_two.write(b"GET /two HTTP/1.1\r\n\r\n")
+                await writer_one.drain()
+                await writer_two.drain()
+
+                for _ in range(50):
+                    if len(fake.sent_routes) >= 2:
+                        break
+                    await asyncio.sleep(0.01)
+
+                route_by_payload = {payload: port for port, payload in fake.sent_routes[:2]}
+                self.assertEqual(
+                    route_by_payload,
+                    {
+                        b"GET /one HTTP/1.1\r\n\r\n": 101,
+                        b"GET /two HTTP/1.1\r\n\r\n": 102,
+                    },
+                )
+
+                await fake.channel_queue(route_by_payload[b"GET /one HTTP/1.1\r\n\r\n"]).put(b"HTTP/1.1 200 OK\r\n\r\none")
+                await fake.channel_queue(route_by_payload[b"GET /one HTTP/1.1\r\n\r\n"]).put(None)
+                await fake.channel_queue(route_by_payload[b"GET /two HTTP/1.1\r\n\r\n"]).put(b"HTTP/1.1 200 OK\r\n\r\ntwo")
+                await fake.channel_queue(route_by_payload[b"GET /two HTTP/1.1\r\n\r\n"]).put(None)
+
+                self.assertEqual(await asyncio.wait_for(reader_one.read(1024), timeout=0.5), b"HTTP/1.1 200 OK\r\n\r\none")
+                self.assertEqual(await asyncio.wait_for(reader_two.read(1024), timeout=0.5), b"HTTP/1.1 200 OK\r\n\r\ntwo")
+                for _ in range(50):
+                    if sorted(set(fake.closed_channels)) == [101, 102]:
+                        break
+                    await asyncio.sleep(0.01)
+                self.assertEqual(sorted(set(fake.closed_channels)), [101, 102])
+                self.assertEqual(len([event for event in events if event.kind == "connection_rejected"]), 0)
+            finally:
+                writer_one.close()
+                writer_two.close()
+                await writer_one.wait_closed()
+                await writer_two.wait_closed()
+        finally:
+            forward_task.cancel()
+            cancelled = False
+            try:
+                await forward_task
+            except asyncio.CancelledError:
+                cancelled = True
+            self.assertTrue(cancelled)
 
 
 if __name__ == "__main__":

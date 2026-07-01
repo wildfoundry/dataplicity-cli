@@ -9,7 +9,7 @@ import termios
 import time
 import tty
 from dataclasses import dataclass
-from typing import Callable, Optional
+from typing import Awaitable, Callable, Optional
 
 from .m2m import M2MClient
 
@@ -43,6 +43,7 @@ class PortForwardEvent:
 
 
 PortForwardEventCallback = Callable[[PortForwardEvent], None]
+PortForwardChannelFactory = Callable[[], Awaitable[int]]
 
 
 def _detect_protocol(sample: bytes) -> Optional[str]:
@@ -226,13 +227,14 @@ async def run_remote_file(
 
 async def run_port_forward(
     m2m: M2MClient,
-    channel_port: int,
+    channel_port: Optional[int],
     local_port: int,
     *,
+    channel_factory: Optional[PortForwardChannelFactory] = None,
     event_callback: Optional[PortForwardEventCallback] = None,
 ) -> None:
-    queue = m2m.channel_queue(channel_port)
-    active_client = asyncio.Lock()
+    initial_channel_claimed = False
+    initial_channel_lock = asyncio.Lock()
 
     def emit(kind: str, *, bytes_count: int = 0, detail: str = "") -> None:
         if event_callback:
@@ -245,29 +247,35 @@ async def run_port_forward(
                 )
             )
 
+    async def allocate_channel() -> int:
+        nonlocal initial_channel_claimed
+        async with initial_channel_lock:
+            if channel_port is not None and not initial_channel_claimed:
+                initial_channel_claimed = True
+                return channel_port
+        if channel_factory is None:
+            raise RuntimeError("No remote channel available for this connection.")
+        return await channel_factory()
+
     async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         peer = writer.get_extra_info("peername")
         peer_label = str(peer) if peer else "unknown"
-        if active_client.locked():
-            emit("connection_rejected", detail=peer_label)
-            writer.close()
-            await writer.wait_closed()
-            return
-
-        await active_client.acquire()
-        acquired = True
-        emit("connection_opened", detail=peer_label)
+        connection_label = f"{peer_label}/{id(writer):x}"
+        channel_for_client: Optional[int] = None
+        emit("connection_opened", detail=connection_label)
         local_started = asyncio.Event()
         first_remote_byte_seen = False
         protocols_seen = set()
 
         async def local_to_remote() -> None:
+            if channel_for_client is None:
+                return
             while True:
                 data = await reader.read(65536)
                 if not data:
                     break
                 local_started.set()
-                await m2m.send_route(channel_port, data)
+                await m2m.send_route(channel_for_client, data)
                 emit("bytes_up", bytes_count=len(data))
                 protocol = _detect_protocol(data[:32])
                 if protocol and protocol not in protocols_seen:
@@ -276,13 +284,16 @@ async def run_port_forward(
 
         async def remote_to_local() -> None:
             nonlocal first_remote_byte_seen
+            if channel_for_client is None:
+                return
+            queue = m2m.channel_queue(channel_for_client)
             while True:
                 data = await queue.get()
                 if data is None:
                     break
                 if local_started.is_set() and not first_remote_byte_seen:
                     first_remote_byte_seen = True
-                    emit("first_remote_byte")
+                    emit("first_remote_byte", detail=connection_label)
                 writer.write(data)
                 await writer.drain()
                 emit("bytes_down", bytes_count=len(data))
@@ -292,13 +303,29 @@ async def run_port_forward(
                     emit("protocol_detected", detail=protocol)
 
         try:
-            await asyncio.gather(local_to_remote(), remote_to_local())
+            try:
+                channel_for_client = await allocate_channel()
+            except Exception as exc:
+                emit("connection_rejected", detail=f"{connection_label}: {exc}")
+                return
+            to_remote_task = asyncio.create_task(local_to_remote())
+            to_local_task = asyncio.create_task(remote_to_local())
+            done, pending = await asyncio.wait(
+                {to_remote_task, to_local_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*done, *pending, return_exceptions=True)
         finally:
+            if channel_for_client is not None:
+                try:
+                    await m2m.close_channel(channel_for_client)
+                except Exception as exc:
+                    emit("channel_close_failed", detail=f"{connection_label}: {exc}")
             writer.close()
             await writer.wait_closed()
-            emit("connection_closed", detail=peer_label)
-            if acquired and active_client.locked():
-                active_client.release()
+            emit("connection_closed", detail=connection_label)
 
     server = await asyncio.start_server(handle_client, host="127.0.0.1", port=local_port)
     emit("listener_started", detail=f"127.0.0.1:{local_port}")

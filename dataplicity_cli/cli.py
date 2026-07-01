@@ -605,6 +605,31 @@ def _friendly_response_message(default_message: str, response_data: Any, respons
     return message
 
 
+def _debug_api_request(
+    state: AppContext,
+    *,
+    method: str,
+    path: str,
+    params: Optional[Dict[str, Any]] = None,
+    json_data: Optional[Dict[str, Any]] = None,
+    data: Optional[Dict[str, Any]] = None,
+) -> None:
+    if not state.debug:
+        return
+    if path.startswith("http://") or path.startswith("https://"):
+        url = path
+    else:
+        url = f"{state.config.base_url.rstrip('/')}/{path.lstrip('/')}"
+    payload: Dict[str, Any] = {"method": method.upper(), "url": url}
+    if params:
+        payload["params"] = _sanitize_payload(params)
+    if json_data:
+        payload["json"] = _sanitize_payload(json_data)
+    if data:
+        payload["data"] = _sanitize_payload(data)
+    sys.stderr.write(f"[debug] API request {json.dumps(payload, sort_keys=True)}\n")
+
+
 def _incident_automation_org_hash(endpoint: str) -> str:
     match = re.search(r"/api/organisations/([^/]+)/", endpoint)
     if not match:
@@ -919,7 +944,7 @@ class _PortForwardDashboard:
     active_clients: int = 0
     total_connections: int = 0
     rejected_connections: int = 0
-    current_connection_started_at: Optional[float] = None
+    connection_started_at: Dict[str, float] = field(default_factory=dict)
     first_byte_latencies_ms: List[float] = field(default_factory=list)
     protocols_seen: List[str] = field(default_factory=list)
     listener_ready: bool = False
@@ -940,19 +965,25 @@ class _PortForwardDashboard:
             self.stop_reason = "stopped"
             return
         if kind == "connection_opened":
-            self.active_clients = 1
+            self.active_clients += 1
             self.total_connections += 1
-            self.current_connection_started_at = timestamp
+            self.connection_started_at[detail] = timestamp
             return
         if kind == "connection_closed":
-            self.active_clients = 0
-            self.current_connection_started_at = None
+            self.active_clients = max(0, self.active_clients - 1)
+            if detail:
+                self.connection_started_at.pop(detail, None)
             return
         if kind == "connection_rejected":
             self.rejected_connections += 1
             return
-        if kind == "first_remote_byte" and self.current_connection_started_at is not None:
-            latency_ms = (timestamp - self.current_connection_started_at) * 1000.0
+        if kind == "first_remote_byte":
+            started_at = self.connection_started_at.get(detail)
+            if started_at is None and self.connection_started_at:
+                started_at = next(iter(self.connection_started_at.values()))
+            if started_at is None:
+                return
+            latency_ms = (timestamp - started_at) * 1000.0
             self.first_byte_latencies_ms.append(latency_ms)
             self.first_byte_latencies_ms = self.first_byte_latencies_ms[-64:]
             return
@@ -2206,7 +2237,9 @@ def devices_history_list(
     if include_deleted:
         params["include_deleted"] = "1"
 
-    response = state.api.get(f"/api/developer/devices/{resolved_hash}/timeline/", params=params)
+    endpoint = f"/api/developer/devices/{resolved_hash}/timeline/"
+    _debug_api_request(state, method="GET", path=endpoint, params=params)
+    response = state.api.get(endpoint, params=params)
     if not response.ok:
         message = _friendly_response_message("Unable to load device history.", response.data, response.text)
         if state.json_output:
@@ -2270,7 +2303,9 @@ def devices_history_show(
     params: Dict[str, Any] = {"limit": 500}
     if include_deleted:
         params["include_deleted"] = "1"
-    response = state.api.get(f"/api/developer/devices/{resolved_hash}/timeline/", params=params)
+    endpoint = f"/api/developer/devices/{resolved_hash}/timeline/"
+    _debug_api_request(state, method="GET", path=endpoint, params=params)
+    response = state.api.get(endpoint, params=params)
     if not response.ok:
         message = _friendly_response_message("Unable to load device history.", response.data, response.text)
         if state.json_output:
@@ -2361,7 +2396,9 @@ def devices_history_comment(
             _show_error(state.console, message)
         raise typer.Exit(code=2)
     payload["type"] = normalized_type
-    response = state.api.post(f"/api/developer/devices/{resolved_hash}/timeline/", json_data=payload)
+    endpoint = f"/api/developer/devices/{resolved_hash}/timeline/"
+    _debug_api_request(state, method="POST", path=endpoint, json_data=payload)
+    response = state.api.post(endpoint, json_data=payload)
     if not response.ok:
         message = _friendly_response_message("Unable to add device history comment.", response.data, response.text)
         if state.json_output:
@@ -2399,9 +2436,11 @@ def devices_history_delete(
     state = _ctx(ctx)
     _require_auth(state)
     resolved_hash = _resolve_device_hash_interactive(state, device_hash, action_name="history delete")
+    endpoint = f"/api/developer/devices/{resolved_hash}/timeline/{event_id}/"
+    _debug_api_request(state, method="DELETE", path=endpoint)
     response = state.api.request(
         "DELETE",
-        f"/api/developer/devices/{resolved_hash}/timeline/{event_id}/",
+        endpoint,
     )
     if not response.ok:
         message = _friendly_response_message("Unable to mark history entry as deleted.", response.data, response.text)
@@ -2784,24 +2823,32 @@ def devices_port_forward(
         await m2m.connect()
         try:
             identity = await m2m.wait_for_identity()
-            response = _open_remote_access_port(
-                state,
-                resolved_hash,
-                {
-                    "m2m_identity": identity,
-                    "service": "redirect-port",
-                    "port": remote_port,
-                },
-            )
-            if not response.ok:
-                detail = _friendly_response_message("Unable to open port redirect", response.data, response.text)
-                raise RuntimeError(detail)
-            channel_port = await m2m.wait_for_channel_open()
+            open_channel_lock = asyncio.Lock()
+
+            async def open_redirect_channel() -> int:
+                async with open_channel_lock:
+                    response = await asyncio.to_thread(
+                        _open_remote_access_port,
+                        state,
+                        resolved_hash,
+                        {
+                            "m2m_identity": identity,
+                            "service": "redirect-port",
+                            "port": remote_port,
+                        },
+                    )
+                    if not response.ok:
+                        detail = _friendly_response_message("Unable to open port redirect", response.data, response.text)
+                        raise RuntimeError(detail)
+                    return await m2m.wait_for_channel_open()
+
+            channel_port = await open_redirect_channel()
             forward_task = asyncio.create_task(
                 run_port_forward(
                     m2m,
                     channel_port,
                     local_port,
+                    channel_factory=open_redirect_channel,
                     event_callback=dashboard.apply_event,
                 )
             )
@@ -2912,18 +2959,27 @@ def devices_ssh(
 
         try:
             identity = await m2m.wait_for_identity(timeout=float(connect_timeout))
-            response = _open_remote_access_port(
-                state,
-                resolved_hash,
-                {
-                    "m2m_identity": identity,
-                    "service": "redirect-port",
-                    "port": remote_port,
-                },
-            )
-            if not response.ok:
-                raise RuntimeError(_friendly_response_message("Unable to open SSH tunnel.", response.data, response.text))
-            channel_port = await m2m.wait_for_channel_open(timeout=float(connect_timeout))
+            open_channel_lock = asyncio.Lock()
+
+            async def open_redirect_channel() -> int:
+                async with open_channel_lock:
+                    response = await asyncio.to_thread(
+                        _open_remote_access_port,
+                        state,
+                        resolved_hash,
+                        {
+                            "m2m_identity": identity,
+                            "service": "redirect-port",
+                            "port": remote_port,
+                        },
+                    )
+                    if not response.ok:
+                        raise RuntimeError(
+                            _friendly_response_message("Unable to open SSH tunnel.", response.data, response.text)
+                        )
+                    return await m2m.wait_for_channel_open(timeout=float(connect_timeout))
+
+            channel_port = await open_redirect_channel()
             from .remote_access import run_port_forward
 
             forward_task = asyncio.create_task(
@@ -2931,6 +2987,7 @@ def devices_ssh(
                     m2m,
                     channel_port,
                     resolved_local_port,
+                    channel_factory=open_redirect_channel,
                     event_callback=on_forward_event,
                 )
             )
