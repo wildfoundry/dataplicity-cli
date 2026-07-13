@@ -136,7 +136,7 @@ class CliUxSnapshotsTest(unittest.TestCase):
     def test_version_flag_snapshot(self) -> None:
         result = self._invoke(["--version"])
         self.assertEqual(result.exit_code, 0, msg=result.output)
-        self.assertEqual(result.output.strip(), "dataplicity-cli 0.1.6")
+        self.assertEqual(result.output.strip(), "dataplicity-cli 0.1.7")
 
     def test_auth_required_message_snapshot_json(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
