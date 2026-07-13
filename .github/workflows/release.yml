@@ -50,6 +50,7 @@ jobs:
         run: |
           pyinstaller --noconfirm --clean --onefile --name dataplicity \
             --target-architecture "${{ matrix.macos_arch }}" \
+            --exclude-module websockets.speedups \
             --workpath pyinstaller-build --distpath pyinstaller-dist \
             dataplicity_cli/__main__.py
 
