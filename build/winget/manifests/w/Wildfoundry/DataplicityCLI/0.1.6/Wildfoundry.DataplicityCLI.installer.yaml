@@ -1,0 +1,27 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.1.9.0.schema.json
+
+PackageIdentifier: Wildfoundry.DataplicityCLI
+PackageVersion: 0.1.6
+Platform:
+- Windows.Desktop
+InstallerType: wix
+Scope: machine
+InstallModes:
+- interactive
+- silent
+- silentWithProgress
+UpgradeBehavior: install
+Commands:
+- dataplicity
+ElevationRequirement: elevatesSelf
+Installers:
+- Architecture: x64
+  InstallerUrl: https://github.com/wildfoundry/dataplicity-cli/releases/download/v0.1.6/dataplicity-cli-0.1.6-windows-x64.msi
+  InstallerSha256: 399CB0A4415F01AC22252F3F533199ACFF2287EFBC8E7C197C65F0A54EF0365B
+  AppsAndFeaturesEntries:
+  - DisplayName: Dataplicity CLI
+    Publisher: Dataplicity
+    UpgradeCode: '{B3C5A6C2-3D42-4E6B-9E2E-4F7B3D3C2A10}'
+ManifestType: installer
+ManifestVersion: 1.9.0
+ReleaseDate: 2026-07-13
