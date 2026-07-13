@@ -210,4 +210,4 @@ dataplicity --install-completion zsh
 - You can also override tap settings per manual run using workflow inputs `tap_repository` and `formula_name`.
 - The `Update WinGet package` workflow publishes new `.msi` releases to WinGet using `Wildfoundry.DataplicityCLI`.
 - Configure a repository secret named `WINGET_TOKEN` (classic PAT with `public_repo`) and ensure your account has a fork of `microsoft/winget-pkgs`.
-- WinGet automation updates existing manifests; if this package is not yet in WinGet, submit the first manifest manually, then subsequent releases are automated.
+- WinGet automation updates existing manifests; if this package is not yet in WinGet, submit the first manifest for the current release, then subsequent releases are automated.
