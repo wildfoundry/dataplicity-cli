@@ -8,11 +8,13 @@ on:
 
 permissions:
   contents: write
+  id-token: write
 
 jobs:
   build:
     name: Build ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
+    environment: release-signing
     strategy:
       fail-fast: false
       matrix:
@@ -58,6 +60,33 @@ jobs:
         if: runner.os == 'Windows'
         run: pyinstaller --noconfirm --clean --onefile --name dataplicity --workpath pyinstaller-build --distpath pyinstaller-dist dataplicity_cli/__main__.py
 
+      - name: Setup .NET for Artifact Signing
+        if: runner.os == 'Windows'
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Azure login for Artifact Signing
+        if: runner.os == 'Windows'
+        uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Sign Windows executable
+        if: runner.os == 'Windows'
+        uses: azure/artifact-signing-action@v2
+        with:
+          endpoint: ${{ vars.AZURE_ARTIFACT_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ vars.AZURE_ARTIFACT_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ vars.AZURE_ARTIFACT_SIGNING_PROFILE }}
+          files-folder: ${{ github.workspace }}\pyinstaller-dist
+          files-folder-filter: exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
       - name: Build macOS tarball (for Homebrew)
         if: runner.os == 'macOS'
         shell: bash
@@ -93,6 +122,19 @@ jobs:
         shell: pwsh
         run: |
           ./build/windows/build_msi.ps1 -Version "${env:VERSION}"
+
+      - name: Sign Windows MSI
+        if: runner.os == 'Windows'
+        uses: azure/artifact-signing-action@v2
+        with:
+          endpoint: ${{ vars.AZURE_ARTIFACT_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ vars.AZURE_ARTIFACT_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ vars.AZURE_ARTIFACT_SIGNING_PROFILE }}
+          files-folder: ${{ github.workspace }}\dist
+          files-folder-filter: msi
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
 
       - name: Stage Windows release artifacts
         if: runner.os == 'Windows'
