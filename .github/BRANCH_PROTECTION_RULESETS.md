@@ -7,7 +7,7 @@ This repository uses two GitHub branch protection rulesets.
 1. **Default branch (main)**  
    - Target: branch name `main`.  
    - Require a pull request, stale review dismissal, and resolved review threads (self-approval allowed; no mandatory external approval).  
-   - Require status checks: **Analyze (python)**, **Unit tests (3.11)**, **Unit tests (3.12)**, **Compile + help smoke (macos-latest, 3.11)**, **Compile + help smoke (windows-latest, 3.11)**, **No build artifacts tracked**.  
+   - Require status checks: **Analyze (python)**, **Unit tests (3.11)**, **Unit tests (3.12)**, **Compile + help smoke (macos-latest, 3.11)**, **Compile + help smoke (windows-latest, 3.11)**, **Windows unit tests**, **Windows MSI smoke**, **No build artifacts tracked**.
    - Require linear history.  
    - Block force pushes and branch deletion.  
    - Bypass: none configured in rulesets.
@@ -34,6 +34,8 @@ This repository uses two GitHub branch protection rulesets.
   - **Unit tests (3.12)**
   - **Compile + help smoke (macos-latest, 3.11)**
   - **Compile + help smoke (windows-latest, 3.11)**
+  - **Windows unit tests**
+  - **Windows MSI smoke**
   - **No build artifacts tracked**
 
 ## Optional: apply via API
@@ -48,6 +50,8 @@ CONTEXTS='[
   {"context":"Unit tests (3.12)"},
   {"context":"Compile + help smoke (macos-latest, 3.11)"},
   {"context":"Compile + help smoke (windows-latest, 3.11)"},
+  {"context":"Windows unit tests"},
+  {"context":"Windows MSI smoke"},
   {"context":"No build artifacts tracked"}
 ]'
 

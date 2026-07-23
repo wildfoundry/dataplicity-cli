@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Dict, Optional
 from unittest.mock import patch
 
+from dataplicity_cli import remote_access
 from dataplicity_cli.remote_access import _detect_protocol, run_port_forward, run_remote_file, run_single_command
 
 
@@ -37,6 +38,17 @@ class _StdoutWithBuffer:
         self.buffer = io.BytesIO()
 
 
+class _FakeMsvcrt:
+    def __init__(self, characters: list[str]) -> None:
+        self.characters = characters
+
+    def kbhit(self) -> bool:
+        return bool(self.characters)
+
+    def getwch(self) -> str:
+        return self.characters.pop(0)
+
+
 def _unused_local_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
         probe.bind(("127.0.0.1", 0))
@@ -44,6 +56,23 @@ def _unused_local_port() -> int:
 
 
 class RemoteAccessHelpersTest(unittest.IsolatedAsyncioTestCase):
+    async def test_windows_console_input_maps_text_and_navigation_keys(self) -> None:
+        fake_msvcrt = _FakeMsvcrt(["a", "\xe0", "H", "\xe0", "M", "\r"])
+
+        with patch.object(remote_access, "msvcrt", fake_msvcrt):
+            data = remote_access._read_windows_console_input()
+
+        self.assertEqual(data, b"a\x1b[A\x1b[C\r")
+
+    async def test_raw_terminal_is_noop_without_posix_terminal_modules(self) -> None:
+        with (
+            patch.object(remote_access, "termios", None),
+            patch.object(remote_access, "tty", None),
+            patch.object(remote_access.sys.stdin, "fileno", side_effect=AssertionError("fileno should not be called")),
+        ):
+            with remote_access.RawTerminal():
+                pass
+
     async def test_run_single_command_rejects_empty_command(self) -> None:
         fake = _FakeM2M()
         with self.assertRaises(RuntimeError):

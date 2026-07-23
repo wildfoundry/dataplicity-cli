@@ -545,38 +545,19 @@ def _apply_tokens_or_none(state: AppContext, payload: Any) -> bool:
     return True
 
 
-def _try_complete_sso_from_code(state: AppContext, code_payload: Dict[str, Any]) -> bool:
-    code = code_payload.get("code")
-    if not code:
-        return False
-    body: Dict[str, Any] = {"code": code}
-    if code_payload.get("state"):
-        body["state"] = code_payload["state"]
-    response = state.api.post("/api/auth/sso/complete/", json_data=body)
-    if not response.ok:
-        return False
-    return _apply_tokens_or_none(state, response.data)
-
-
 def _attempt_sso_auto_complete(
     state: AppContext,
     listener: Optional[_SsoCallbackListener],
     *,
     timeout_seconds: int,
 ) -> bool:
+    if listener is None:
+        return False
     deadline = time.monotonic() + max(timeout_seconds, 1)
     while time.monotonic() < deadline:
-        if listener:
-            payload = listener.wait_for_payload(timeout_seconds=1.0)
-            if payload:
-                if _apply_tokens_or_none(state, payload):
-                    return True
-                if _try_complete_sso_from_code(state, payload):
-                    return True
-        response = state.api.get("/api/auth/sso/complete/")
-        if response.ok and _apply_tokens_or_none(state, response.data):
+        payload = listener.wait_for_payload(timeout_seconds=1.0)
+        if payload and _apply_tokens_or_none(state, payload):
             return True
-        time.sleep(1.0)
     return False
 
 
@@ -1805,7 +1786,7 @@ def auth_sso(
     if payload is None:
         _show_error(state.console, "Could not parse SSO response.")
         raise typer.Exit(code=1)
-    if not _apply_tokens_or_none(state, payload) and not _try_complete_sso_from_code(state, payload):
+    if not _apply_tokens_or_none(state, payload):
         _show_error(state.console, "No access token found in payload.")
         raise typer.Exit(code=1)
     state.config.last_email = email
@@ -2998,7 +2979,7 @@ def devices_ssh(
             if identity_file:
                 ssh_cmd.extend(["-i", str(identity_file.expanduser())])
             if not strict_host_key_checking:
-                ssh_cmd.extend(["-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null"])
+                ssh_cmd.extend(["-o", "StrictHostKeyChecking=no", "-o", f"UserKnownHostsFile={os.devnull}"])
             ssh_cmd.extend(ssh_arg or [])
             ssh_cmd.append(target)
             if remote_command:

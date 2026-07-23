@@ -5,13 +5,23 @@ import os
 import secrets
 import select
 import sys
-import termios
 import time
-import tty
 from dataclasses import dataclass
 from typing import Awaitable, Callable, Optional
 
 from .m2m import M2MClient
+
+try:
+    import msvcrt
+except ImportError:  # pragma: no cover - Windows only
+    msvcrt = None
+
+try:
+    import termios
+    import tty
+except ImportError:  # pragma: no cover - Windows only
+    termios = None
+    tty = None
 
 
 class RawTerminal:
@@ -20,13 +30,15 @@ class RawTerminal:
         self._old: Optional[list] = None
 
     def __enter__(self) -> "RawTerminal":
+        if termios is None or tty is None:
+            return self
         self._fd = sys.stdin.fileno()
         self._old = termios.tcgetattr(self._fd)
         tty.setraw(self._fd)
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
-        if self._fd is not None and self._old is not None:
+        if termios is not None and self._fd is not None and self._old is not None:
             termios.tcsetattr(self._fd, termios.TCSADRAIN, self._old)
 
 
@@ -44,6 +56,34 @@ class PortForwardEvent:
 
 PortForwardEventCallback = Callable[[PortForwardEvent], None]
 PortForwardChannelFactory = Callable[[], Awaitable[int]]
+
+_WINDOWS_KEY_SEQUENCES = {
+    "G": b"\x1b[H",
+    "H": b"\x1b[A",
+    "I": b"\x1b[5~",
+    "K": b"\x1b[D",
+    "M": b"\x1b[C",
+    "O": b"\x1b[F",
+    "P": b"\x1b[B",
+    "Q": b"\x1b[6~",
+    "S": b"\x1b[3~",
+}
+
+
+def _read_windows_console_input() -> bytes:
+    if msvcrt is None:
+        return b""
+    chunks = []
+    while msvcrt.kbhit():
+        character = msvcrt.getwch()
+        if character in {"\x00", "\xe0"}:
+            scan_code = msvcrt.getwch()
+            sequence = _WINDOWS_KEY_SEQUENCES.get(scan_code)
+            if sequence:
+                chunks.append(sequence)
+            continue
+        chunks.append(character.encode("utf-8", errors="replace"))
+    return b"".join(chunks)
 
 
 def _detect_protocol(sample: bytes) -> Optional[str]:
@@ -70,6 +110,14 @@ async def run_terminal_session(m2m: M2MClient, port: int) -> None:
     stop_event = asyncio.Event()
 
     async def stdin_loop() -> None:
+        if msvcrt is not None:
+            while not stop_event.is_set():
+                data = _read_windows_console_input()
+                if data:
+                    await m2m.send_route(port, data)
+                else:
+                    await asyncio.sleep(0.02)
+            return
         while not stop_event.is_set():
             ready, _, _ = await asyncio.to_thread(select.select, [stdin_fd], [], [], 0.1)
             if not ready:
