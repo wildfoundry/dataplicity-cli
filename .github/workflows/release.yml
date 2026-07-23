@@ -87,6 +87,16 @@ jobs:
           timestamp-rfc3161: http://timestamp.acs.microsoft.com
           timestamp-digest: SHA256
 
+      - name: Verify Windows executable signature
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $signature = Get-AuthenticodeSignature "pyinstaller-dist/dataplicity.exe"
+          if ($signature.Status -ne "Valid") {
+            throw "Executable signature is $($signature.Status): $($signature.StatusMessage)"
+          }
+          Write-Host "Executable signed by $($signature.SignerCertificate.Subject)"
+
       - name: Build macOS tarball (for Homebrew)
         if: runner.os == 'macOS'
         shell: bash
@@ -135,6 +145,20 @@ jobs:
           file-digest: SHA256
           timestamp-rfc3161: http://timestamp.acs.microsoft.com
           timestamp-digest: SHA256
+
+      - name: Verify Windows MSI signature
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $msi = Get-ChildItem "dist/*.msi" | Select-Object -First 1
+          if (-not $msi) {
+            throw "No MSI found to verify."
+          }
+          $signature = Get-AuthenticodeSignature $msi.FullName
+          if ($signature.Status -ne "Valid") {
+            throw "MSI signature is $($signature.Status): $($signature.StatusMessage)"
+          }
+          Write-Host "MSI signed by $($signature.SignerCertificate.Subject)"
 
       - name: Stage Windows release artifacts
         if: runner.os == 'Windows'

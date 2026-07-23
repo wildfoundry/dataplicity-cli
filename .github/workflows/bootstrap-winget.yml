@@ -2,6 +2,12 @@ name: Bootstrap WinGet package
 
 "on":
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Published release tag to submit (for example v0.1.7)"
+        required: true
+        default: "v0.1.7"
+        type: string
 
 permissions:
   contents: read
@@ -80,17 +86,59 @@ jobs:
           $ErrorActionPreference = "Stop"
           Invoke-WebRequest https://aka.ms/wingetcreate/latest -OutFile wingetcreate.exe -UseBasicParsing
 
+      - name: Prepare manifest from published release
+        id: prepare
+        shell: pwsh
+        env:
+          WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          if ($env:RELEASE_TAG -notmatch '^v(\d+\.\d+\.\d+(?:\.\d+)?)$') {
+            throw "Release tag must use vX.Y.Z or vX.Y.Z.W."
+          }
+          $version = $Matches[1]
+          $headers = @{
+            Authorization = "Bearer $env:WINGET_TOKEN"
+            Accept = "application/vnd.github+json"
+            "X-GitHub-Api-Version" = "2022-11-28"
+          }
+          $release = Invoke-RestMethod `
+            -Headers $headers `
+            -Uri "https://api.github.com/repos/wildfoundry/dataplicity-cli/releases/tags/$env:RELEASE_TAG"
+          $assetName = "dataplicity-cli-$version-windows-x64.msi"
+          $asset = $release.assets | Where-Object { $_.name -eq $assetName } | Select-Object -First 1
+          if (-not $asset) {
+            throw "Release $env:RELEASE_TAG does not contain $assetName."
+          }
+          $downloadPath = Join-Path $env:RUNNER_TEMP $assetName
+          Invoke-WebRequest $asset.browser_download_url -OutFile $downloadPath -UseBasicParsing
+          $sha256 = (Get-FileHash $downloadPath -Algorithm SHA256).Hash
+          $releaseDate = ([DateTime]$release.published_at).ToString("yyyy-MM-dd")
+          $outputRoot = Join-Path $env:RUNNER_TEMP "winget-manifests"
+          $manifestOutput = python build/winget/prepare_manifest.py `
+            --source-dir "build/winget/manifests/w/Wildfoundry/DataplicityCLI/0.1.6" `
+            --output-root $outputRoot `
+            --version $version `
+            --installer-url $asset.browser_download_url `
+            --installer-sha256 $sha256 `
+            --release-date $releaseDate
+          $manifestPath = ($manifestOutput | Select-Object -Last 1).Trim()
+          "manifest_path=$manifestPath" >> $env:GITHUB_OUTPUT
+          "package_version=$version" >> $env:GITHUB_OUTPUT
+
       - name: Submit initial manifest
         shell: pwsh
         env:
           WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
+          MANIFEST_PATH: ${{ steps.prepare.outputs.manifest_path }}
+          PACKAGE_VERSION: ${{ steps.prepare.outputs.package_version }}
         run: |
           $ErrorActionPreference = "Stop"
-          $manifestPath = "build/winget/manifests/w/Wildfoundry/DataplicityCLI/0.1.6"
-          $prTitle = "New package: Wildfoundry.DataplicityCLI version 0.1.6"
+          $prTitle = "New package: Wildfoundry.DataplicityCLI version $env:PACKAGE_VERSION"
 
           ./wingetcreate.exe submit `
             --token $env:WINGET_TOKEN `
             --prtitle $prTitle `
             --no-open `
-            $manifestPath
+            $env:MANIFEST_PATH

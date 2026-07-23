@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import unittest
+from types import SimpleNamespace
 from urllib.request import urlopen
+from unittest.mock import Mock, patch
 
 from dataplicity_cli.cli import (
     _SsoCallbackListener,
+    _attempt_sso_auto_complete,
     _coerce_timeout_seconds,
     _extract_sso_payload_from_url,
     _extract_sso_payload_from_query,
@@ -12,6 +15,16 @@ from dataplicity_cli.cli import (
     _parse_sso_user_artifact,
     _with_callback_hint,
 )
+
+
+class _FakeSsoListener:
+    def __init__(self, payload: dict | None) -> None:
+        self.payload = payload
+
+    def wait_for_payload(self, timeout_seconds: float) -> dict | None:
+        _ = timeout_seconds
+        payload, self.payload = self.payload, None
+        return payload
 
 
 class SsoAuthFlowTest(unittest.TestCase):
@@ -52,6 +65,27 @@ class SsoAuthFlowTest(unittest.TestCase):
             self.assertEqual(payload, {"access": "abc", "refresh": "def"})
         finally:
             listener.stop()
+
+    def test_auto_complete_uses_loopback_payload_without_backend_polling(self) -> None:
+        state = SimpleNamespace(api=Mock())
+        listener = _FakeSsoListener({"access": "abc", "refresh": "def"})
+
+        with patch("dataplicity_cli.cli._apply_tokens_or_none", return_value=True) as apply_tokens:
+            completed = _attempt_sso_auto_complete(state, listener, timeout_seconds=1)
+
+        self.assertTrue(completed)
+        apply_tokens.assert_called_once_with(state, {"access": "abc", "refresh": "def"})
+        state.api.get.assert_not_called()
+        state.api.post.assert_not_called()
+
+    def test_auto_complete_without_listener_returns_immediately(self) -> None:
+        state = SimpleNamespace(api=Mock())
+
+        completed = _attempt_sso_auto_complete(state, None, timeout_seconds=180)
+
+        self.assertFalse(completed)
+        state.api.get.assert_not_called()
+        state.api.post.assert_not_called()
 
     def test_coerce_timeout_seconds_handles_invalid_values(self) -> None:
         self.assertEqual(_coerce_timeout_seconds(30), 30)

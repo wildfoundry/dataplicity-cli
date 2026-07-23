@@ -48,6 +48,89 @@ jobs:
       - name: Help smoke
         run: python -m dataplicity_cli --help
 
+  windows-unit-tests:
+    name: Windows unit tests
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[test]"
+      - name: Run unit tests
+        run: pytest -q --maxfail=1
+
+  windows-package-smoke:
+    name: Windows MSI smoke
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install . pyinstaller
+          choco install wixtoolset -y
+      - name: Build executable and MSI
+        shell: pwsh
+        run: |
+          $env:VERSION = python build/get_version.py
+          pyinstaller --noconfirm --clean --onefile --name dataplicity `
+            --workpath pyinstaller-build --distpath pyinstaller-dist `
+            dataplicity_cli/__main__.py
+          ./pyinstaller-dist/dataplicity.exe --version
+          ./pyinstaller-dist/dataplicity.exe --help
+          ./build/windows/build_msi.ps1 -Version $env:VERSION
+          "MSI_PATH=$((Resolve-Path "dist/dataplicity-cli-$env:VERSION-windows-x64.msi").Path)" >> $env:GITHUB_ENV
+      - name: Install, verify, and uninstall MSI
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $installDir = Join-Path $env:ProgramFiles "Dataplicity\Dataplicity CLI"
+          $installedExe = Join-Path $installDir "dataplicity.exe"
+          $installed = $false
+          try {
+            $install = Start-Process msiexec.exe `
+              -ArgumentList @("/i", "`"$env:MSI_PATH`"", "/qn", "/norestart") `
+              -Wait -PassThru
+            if ($install.ExitCode -ne 0) {
+              throw "MSI install failed with exit code $($install.ExitCode)."
+            }
+            $installed = $true
+            if (!(Test-Path $installedExe)) {
+              throw "Installed executable not found at $installedExe."
+            }
+            & $installedExe --version
+            if ($LASTEXITCODE -ne 0) {
+              throw "Installed executable --version failed."
+            }
+            & $installedExe --help
+            if ($LASTEXITCODE -ne 0) {
+              throw "Installed executable --help failed."
+            }
+            $machinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
+            if ($installDir -notin ($machinePath -split ";")) {
+              throw "Installer did not add $installDir to the machine PATH."
+            }
+          } finally {
+            if ($installed) {
+              $uninstall = Start-Process msiexec.exe `
+                -ArgumentList @("/x", "`"$env:MSI_PATH`"", "/qn", "/norestart") `
+                -Wait -PassThru
+              if ($uninstall.ExitCode -ne 0) {
+                throw "MSI uninstall failed with exit code $($uninstall.ExitCode)."
+              }
+            }
+          }
+          if (Test-Path $installedExe) {
+            throw "Installed executable remains after uninstall."
+          }
+
   no-artifacts-tracked:
     name: No build artifacts tracked
     runs-on: ubuntu-latest

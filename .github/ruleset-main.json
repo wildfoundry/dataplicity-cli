@@ -29,6 +29,8 @@
           { "context": "Unit tests (3.12)" },
           { "context": "Compile + help smoke (macos-latest, 3.11)" },
           { "context": "Compile + help smoke (windows-latest, 3.11)" },
+          { "context": "Windows unit tests" },
+          { "context": "Windows MSI smoke" },
           { "context": "No build artifacts tracked" }
         ]
       }
