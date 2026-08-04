@@ -114,8 +114,12 @@ jobs:
               throw "Installed executable --help failed."
             }
             $machinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
-            if ($installDir -notin ($machinePath -split ";")) {
-              throw "Installer did not add $installDir to the machine PATH."
+            $expectedPathEntry = $installDir -replace '[\\/]+$', ''
+            $machinePathEntries = $machinePath -split ";" | ForEach-Object {
+              $_.Trim().Trim('"') -replace '[\\/]+$', ''
+            }
+            if ($machinePathEntries -notcontains $expectedPathEntry) {
+              throw "Installer did not add $installDir to the machine PATH. Machine PATH: $machinePath"
             }
           } finally {
             if ($installed) {
@@ -129,6 +133,13 @@ jobs:
           }
           if (Test-Path $installedExe) {
             throw "Installed executable remains after uninstall."
+          }
+          $machinePathAfterUninstall = [Environment]::GetEnvironmentVariable("Path", "Machine")
+          $pathEntriesAfterUninstall = $machinePathAfterUninstall -split ";" | ForEach-Object {
+            $_.Trim().Trim('"') -replace '[\\/]+$', ''
+          }
+          if ($pathEntriesAfterUninstall -contains $expectedPathEntry) {
+            throw "Installer PATH entry remains after uninstall: $installDir"
           }
 
   no-artifacts-tracked:
