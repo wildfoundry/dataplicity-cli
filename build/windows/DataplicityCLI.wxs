@@ -11,7 +11,8 @@
     <Package
       InstallerVersion="500"
       Compressed="yes"
-      InstallScope="perMachine" />
+      InstallScope="perMachine"
+      Platform="x64" />
 
     <MajorUpgrade DowngradeErrorMessage="A newer version of Dataplicity CLI is already installed." />
     <MediaTemplate EmbedCab="yes" />
@@ -19,7 +20,7 @@
     <Property Id="WIXUI_INSTALLDIR" Value="INSTALLFOLDER" />
 
     <Directory Id="TARGETDIR" Name="SourceDir">
-      <Directory Id="ProgramFilesFolder">
+      <Directory Id="ProgramFiles64Folder">
         <Directory Id="ManufacturerFolder" Name="Dataplicity">
           <Directory Id="INSTALLFOLDER" Name="Dataplicity CLI" />
         </Directory>
@@ -27,7 +28,7 @@
     </Directory>
 
     <DirectoryRef Id="INSTALLFOLDER">
-      <Component Id="MainExecutable" Guid="B2C7E7C3-9A4C-4C7E-A2E6-8DDB0F3A1E1B">
+      <Component Id="MainExecutable" Guid="B2C7E7C3-9A4C-4C7E-A2E6-8DDB0F3A1E1B" Win64="yes">
         <File Id="DataplicityExe" Source="dist\dataplicity.exe" KeyPath="yes" />
         <Environment
           Id="PathEntry"
