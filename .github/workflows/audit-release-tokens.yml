@@ -1,0 +1,26 @@
+name: Audit release tokens
+
+"on":
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    name: Verify release-bot token owners
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Audit HOMEBREW_TAP_TOKEN
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          EXPECTED_BOT: dataplicity-release-bot
+        run: scripts/verify-release-bot-token.sh TAP_TOKEN "$EXPECTED_BOT"
+      - name: Audit WINGET_TOKEN
+        env:
+          WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
+          EXPECTED_BOT: dataplicity-release-bot
+        run: scripts/verify-release-bot-token.sh WINGET_TOKEN "$EXPECTED_BOT"

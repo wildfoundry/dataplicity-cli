@@ -48,6 +48,7 @@ jobs:
         shell: pwsh
         env:
           WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
+          EXPECTED_BOT: dataplicity-release-bot
         run: |
           $ErrorActionPreference = "Stop"
           $headers = @{
@@ -58,6 +59,9 @@ jobs:
 
           $user = Invoke-RestMethod -Headers $headers -Uri "https://api.github.com/user"
           Write-Host "WINGET_TOKEN owner: $($user.login)"
+          if ($user.login -ne $env:EXPECTED_BOT) {
+            throw "WINGET_TOKEN must be owned by '$($env:EXPECTED_BOT)', not '$($user.login)'."
+          }
 
           $fork = Invoke-RestMethod -Headers $headers -Uri "https://api.github.com/repos/wildfoundry/winget-pkgs"
           if (-not $fork.fork -or $fork.parent.full_name -ne "microsoft/winget-pkgs") {
