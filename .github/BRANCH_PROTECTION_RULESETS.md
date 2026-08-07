@@ -34,3 +34,7 @@ gh api --method PUT "repos/${REPO}/rulesets/<id>" --input .github/ruleset-main.j
 gh api --method PUT "repos/${REPO}/rulesets/<id>" --input .github/ruleset-release.json
 gh api --method POST "repos/${REPO}/rulesets" --input .github/ruleset-tags.json
 ```
+
+## Release automation tokens
+
+See `.github/RELEASE_TOKENS.md`. Cross-repo CI secrets must be owned by `dataplicity-release-bot`.
