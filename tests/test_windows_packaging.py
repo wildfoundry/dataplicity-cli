@@ -10,6 +10,13 @@ WIX_NAMESPACE = {"wix": "http://schemas.microsoft.com/wix/2006/wi"}
 
 
 class WindowsPackagingTest(unittest.TestCase):
+    def test_msi_uses_legal_publisher(self) -> None:
+        root = ET.parse(WIX_SOURCE).getroot()
+        product = root.find(".//wix:Product", WIX_NAMESPACE)
+
+        self.assertIsNotNone(product)
+        self.assertEqual(product.get("Manufacturer"), "Wildfoundry Ltd")
+
     def test_msi_targets_64_bit_program_files(self) -> None:
         root = ET.parse(WIX_SOURCE).getroot()
         package = root.find(".//wix:Package", WIX_NAMESPACE)

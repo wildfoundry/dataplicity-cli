@@ -3,7 +3,7 @@
   <Product
     Id="*"
     Name="Dataplicity CLI"
-    Manufacturer="Dataplicity"
+    Manufacturer="Wildfoundry Ltd"
     Version="$(var.ProductVersion)"
     Language="1033"
     UpgradeCode="B3C5A6C2-3D42-4E6B-9E2E-4F7B3D3C2A10">

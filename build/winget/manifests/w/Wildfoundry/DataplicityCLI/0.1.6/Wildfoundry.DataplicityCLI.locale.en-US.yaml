@@ -3,7 +3,7 @@
 PackageIdentifier: Wildfoundry.DataplicityCLI
 PackageVersion: 0.1.6
 PackageLocale: en-US
-Publisher: Dataplicity
+Publisher: Wildfoundry Ltd
 PublisherUrl: https://github.com/wildfoundry
 PublisherSupportUrl: https://github.com/wildfoundry/dataplicity-cli/issues
 PackageName: Dataplicity CLI

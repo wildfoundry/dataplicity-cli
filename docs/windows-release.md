@@ -16,12 +16,11 @@ smoke that verifies the embedded payload.
 - Installer: WiX MSI, x64, per-machine
 - License: `BSD-3-Clause`
 - Copyright holder: `Wildfoundry Ltd`
-- Current MSI and WinGet publisher: `Dataplicity`
+- MSI and WinGet publisher: `Wildfoundry Ltd`
 
-Before the first public WinGet submission, Legal or Product must confirm that
-`Dataplicity` is the intended public publisher name. Ops must also confirm that
-it is consistent with the Azure Artifact Signing certificate subject. Record
-the approval in the release issue.
+Before the first public WinGet submission, Ops must confirm that the Azure
+Artifact Signing certificate subject identifies `Wildfoundry Ltd`. Record the
+confirmation in the release issue.
 
 ## Signing configuration
 
