@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -52,6 +53,8 @@ class ConfigTest(unittest.TestCase):
             )
             cfg.save(path)
             loaded = Config.load(path)
+            if os.name != "nt":
+                self.assertEqual(path.stat().st_mode & 0o777, 0o600)
         self.assertEqual(loaded.to_dict(), cfg.to_dict())
 
     def test_clear_tokens_resets_jwt_mode_only(self) -> None:

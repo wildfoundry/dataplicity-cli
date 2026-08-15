@@ -80,7 +80,12 @@ class Config:
 
     def save(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(self.to_dict(), indent=2, sort_keys=True), encoding="utf-8")
+        payload = json.dumps(self.to_dict(), indent=2, sort_keys=True).encode("utf-8")
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.write(fd, payload)
+        finally:
+            os.close(fd)
 
     def clear_tokens(self) -> None:
         self.access_token = None
