@@ -51,6 +51,34 @@ jobs:
       - name: Help smoke
         run: python -m dataplicity_cli --help
 
+  windows-unit-tests:
+    name: Windows unit tests
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[test]"
+      - name: Run unit tests
+        run: pytest -q --maxfail=1
+
+  windows-msi-smoke:
+    name: Windows MSI smoke
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate WiX source and MSI build script
+        shell: pwsh
+        run: |
+          if (!(Test-Path "build/windows/DataplicityCLI.wxs")) { throw "missing wxs" }
+          if (!(Test-Path "build/windows/build_msi.ps1")) { throw "missing build_msi.ps1" }
+          $null = [xml](Get-Content "build/windows/DataplicityCLI.wxs")
+          Write-Host "OK: WiX source parses"
+
   no-artifacts-tracked:
     name: No build artifacts tracked
     runs-on: ubuntu-latest
