@@ -181,6 +181,9 @@ jobs:
     name: Publish GitHub Release
     runs-on: ubuntu-latest
     needs: build
+    permissions:
+      contents: write
+      actions: write
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -194,4 +197,16 @@ jobs:
         with:
           files: |
             artifacts/**/*
+
+      # Releases created with GITHUB_TOKEN do not emit release events to other workflows.
+      # Dispatch the tap updater explicitly so Homebrew stays current.
+      - name: Dispatch Homebrew tap update
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          gh workflow run update-homebrew-tap.yml \
+            --repo "${GITHUB_REPOSITORY}" \
+            -f "version=${version}"
 
