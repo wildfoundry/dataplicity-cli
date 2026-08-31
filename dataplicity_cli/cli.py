@@ -4,6 +4,7 @@ import asyncio
 import datetime as dt
 import html
 import json
+import os
 import queue
 import re
 import shutil
@@ -18,7 +19,7 @@ from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
-from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
+from urllib.parse import parse_qs, urlparse
 
 import typer
 from rich.console import Console
@@ -297,21 +298,6 @@ def _parse_sso_user_artifact(raw: str) -> Optional[Dict[str, Any]]:
     if text.startswith("http://") or text.startswith("https://"):
         return _extract_sso_payload_from_url(text)
     return _extract_sso_payload_from_query(parse_qs(text, keep_blank_values=True))
-
-
-def _with_callback_hint(url: str, callback_url: str) -> str:
-    parsed = urlparse(url)
-    query = parse_qs(parsed.query, keep_blank_values=True)
-    # Prefer standards/common redirect targets when present so the IdP/browser
-    # flow can return directly to the loopback listener.
-    for redirect_key in ("redirect_uri", "redirect_url", "return_to", "return", "next"):
-        if redirect_key in query:
-            query[redirect_key] = [callback_url]
-            break
-    if "cli_callback_url" in query:
-        return urlunparse(parsed._replace(query=urlencode(query, doseq=True)))
-    query["cli_callback_url"] = [callback_url]
-    return urlunparse(parsed._replace(query=urlencode(query, doseq=True)))
 
 
 class _SsoCallbackListener:
@@ -1711,8 +1697,21 @@ def auth_sso(
     state = _ctx(ctx)
     email = _resolve_email_for_auth(state, provided_email=email)
     timeout_seconds = _coerce_timeout_seconds(timeout)
-    response = state.api.post("/api/auth/bootstrap/", json_data={"email": email})
+    listener: Optional[_SsoCallbackListener] = None
+    bootstrap_payload = {"email": email}
+    if open_browser:
+        listener = _SsoCallbackListener()
+        if listener.start() and listener.callback_url:
+            bootstrap_payload["callback_url"] = listener.callback_url
+            if not state.json_output:
+                state.console.print(f"Listening for SSO callback on [blue]{listener.callback_url}[/blue]")
+        else:
+            listener = None
+
+    response = state.api.post("/api/auth/bootstrap/", json_data=bootstrap_payload)
     if not response.ok:
+        if listener:
+            listener.stop()
         message = _friendly_response_message("Unable to start SSO.", response.data, response.text)
         if state.json_output:
             _print_json({"ok": False, "detail": message})
@@ -1721,6 +1720,8 @@ def auth_sso(
         raise typer.Exit(code=1)
 
     if not isinstance(response.data, dict) or response.data.get("status") != "sso_redirect":
+        if listener:
+            listener.stop()
         message = "SSO is not enabled for this account."
         if state.json_output:
             _print_json({"ok": False, "detail": message})
@@ -1730,6 +1731,8 @@ def auth_sso(
 
     redirect_url = response.data.get("redirect_url")
     if not redirect_url:
+        if listener:
+            listener.stop()
         message = "SSO redirect URL missing."
         if state.json_output:
             _print_json({"ok": False, "detail": message})
@@ -1737,21 +1740,11 @@ def auth_sso(
             _show_error(state.console, message)
         raise typer.Exit(code=1)
 
-    listener: Optional[_SsoCallbackListener] = None
-    browser_url = redirect_url
-    if open_browser:
-        listener = _SsoCallbackListener()
-        if listener.start() and listener.callback_url:
-            browser_url = _with_callback_hint(redirect_url, listener.callback_url)
-            if not state.json_output:
-                state.console.print(f"Listening for SSO callback on [blue]{listener.callback_url}[/blue]")
-        else:
-            listener = None
-        webbrowser.open(browser_url)
-
-    if not state.json_output:
-        state.console.print("Waiting for browser sign-in to complete...")
     try:
+        if open_browser:
+            webbrowser.open(redirect_url)
+        if not state.json_output:
+            state.console.print("Waiting for browser sign-in to complete...")
         if _attempt_sso_auto_complete(state, listener, timeout_seconds=timeout_seconds):
             state.config.last_email = email
             state.config.preferred_login_method = "sso"
@@ -2707,6 +2700,12 @@ def _resolve_local_port(preferred: Optional[int]) -> int:
         return int(probe.getsockname()[1])
 
 
+def _ssh_host_key_options(strict_host_key_checking: bool) -> List[str]:
+    if strict_host_key_checking:
+        return []
+    return ["-o", "StrictHostKeyChecking=no", "-o", f"UserKnownHostsFile={os.devnull}"]
+
+
 @devices_app.command("terminal")
 def devices_terminal(ctx: typer.Context, device_hash: Optional[str] = typer.Argument(None)) -> None:
     """Open an interactive terminal session to a device.
@@ -2978,8 +2977,7 @@ def devices_ssh(
             ssh_cmd: List[str] = ["ssh", "-p", str(resolved_local_port)]
             if identity_file:
                 ssh_cmd.extend(["-i", str(identity_file.expanduser())])
-            if not strict_host_key_checking:
-                ssh_cmd.extend(["-o", "StrictHostKeyChecking=no", "-o", f"UserKnownHostsFile={os.devnull}"])
+            ssh_cmd.extend(_ssh_host_key_options(strict_host_key_checking))
             ssh_cmd.extend(ssh_arg or [])
             ssh_cmd.append(target)
             if remote_command:

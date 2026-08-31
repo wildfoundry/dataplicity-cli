@@ -4,10 +4,12 @@ import asyncio
 import os
 import secrets
 import select
+import signal
 import sys
 import time
+from collections import deque
 from dataclasses import dataclass
-from typing import Awaitable, Callable, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 from .m2m import M2MClient
 
@@ -24,12 +26,25 @@ except ImportError:  # pragma: no cover - Windows only
     tty = None
 
 
+_WINDOWS_SIGNAL_INPUT: deque[bytes] = deque()
+
+
+def _capture_windows_sigint(_signum: int, _frame: Any) -> None:
+    _WINDOWS_SIGNAL_INPUT.append(b"\x03")
+
+
 class RawTerminal:
     def __init__(self) -> None:
         self._fd: Optional[int] = None
         self._old: Optional[list] = None
+        self._old_sigint_handler: Any = None
 
     def __enter__(self) -> "RawTerminal":
+        if msvcrt is not None:
+            _WINDOWS_SIGNAL_INPUT.clear()
+            self._old_sigint_handler = signal.getsignal(signal.SIGINT)
+            signal.signal(signal.SIGINT, _capture_windows_sigint)
+            return self
         if termios is None or tty is None:
             return self
         self._fd = sys.stdin.fileno()
@@ -38,6 +53,10 @@ class RawTerminal:
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
+        if self._old_sigint_handler is not None:
+            signal.signal(signal.SIGINT, self._old_sigint_handler)
+            self._old_sigint_handler = None
+        _WINDOWS_SIGNAL_INPUT.clear()
         if termios is not None and self._fd is not None and self._old is not None:
             termios.tcsetattr(self._fd, termios.TCSADRAIN, self._old)
 
@@ -71,9 +90,11 @@ _WINDOWS_KEY_SEQUENCES = {
 
 
 def _read_windows_console_input() -> bytes:
-    if msvcrt is None:
-        return b""
     chunks = []
+    while _WINDOWS_SIGNAL_INPUT:
+        chunks.append(_WINDOWS_SIGNAL_INPUT.popleft())
+    if msvcrt is None:
+        return b"".join(chunks)
     while msvcrt.kbhit():
         character = msvcrt.getwch()
         if character in {"\x00", "\xe0"}:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import unittest
 
 from dataplicity_cli.cli import (
@@ -9,11 +10,19 @@ from dataplicity_cli.cli import (
     _extract_devices,
     _render_latency_sparkline,
     _render_quality_status_bar,
+    _ssh_host_key_options,
     _sort_devices_for_display,
 )
 
 
 class DeviceCliHelpersTest(unittest.TestCase):
+    def test_ssh_host_key_options_use_platform_null_device(self) -> None:
+        self.assertEqual(_ssh_host_key_options(True), [])
+        self.assertEqual(
+            _ssh_host_key_options(False),
+            ["-o", "StrictHostKeyChecking=no", "-o", f"UserKnownHostsFile={os.devnull}"],
+        )
+
     def test_extract_devices_includes_limited_devices_bucket(self) -> None:
         payload = {
             "devices": [{"hash_id": "active-1"}],

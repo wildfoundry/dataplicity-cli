@@ -64,6 +64,25 @@ class RemoteAccessHelpersTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(data, b"a\x1b[A\x1b[C\r")
 
+    async def test_windows_raw_terminal_forwards_ctrl_c_as_input(self) -> None:
+        fake_msvcrt = _FakeMsvcrt([])
+        previous_handler = object()
+
+        with (
+            patch.object(remote_access, "msvcrt", fake_msvcrt),
+            patch.object(remote_access.signal, "getsignal", return_value=previous_handler),
+            patch.object(remote_access.signal, "signal") as set_signal,
+        ):
+            with remote_access.RawTerminal():
+                sigint_handler = set_signal.call_args_list[0].args[1]
+                sigint_handler(remote_access.signal.SIGINT, None)
+                self.assertEqual(remote_access._read_windows_console_input(), b"\x03")
+
+        self.assertEqual(
+            set_signal.call_args_list[-1].args,
+            (remote_access.signal.SIGINT, previous_handler),
+        )
+
     async def test_raw_terminal_is_noop_without_posix_terminal_modules(self) -> None:
         with (
             patch.object(remote_access, "termios", None),
