@@ -8,6 +8,7 @@ import signal
 import sys
 import time
 from collections import deque
+from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Optional
 
@@ -122,6 +123,12 @@ def _detect_protocol(sample: bytes) -> Optional[str]:
     if len(sample) >= 3 and sample[0] == 0x16 and sample[1] == 0x03 and sample[2] in {0x00, 0x01, 0x02, 0x03, 0x04}:
         return "TLS"
     return None
+
+
+async def _close_stream_writer(writer: asyncio.StreamWriter) -> None:
+    writer.close()
+    with suppress(ConnectionError, OSError):
+        await writer.wait_closed()
 
 
 async def run_terminal_session(m2m: M2MClient, port: int) -> None:
@@ -392,8 +399,7 @@ async def run_port_forward(
                     await m2m.close_channel(channel_for_client)
                 except Exception as exc:
                     emit("channel_close_failed", detail=f"{connection_label}: {exc}")
-            writer.close()
-            await writer.wait_closed()
+            await _close_stream_writer(writer)
             emit("connection_closed", detail=connection_label)
 
     server = await asyncio.start_server(handle_client, host="127.0.0.1", port=local_port)

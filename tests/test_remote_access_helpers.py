@@ -7,10 +7,16 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import Dict, Optional
-from unittest.mock import patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from dataplicity_cli import remote_access
-from dataplicity_cli.remote_access import _detect_protocol, run_port_forward, run_remote_file, run_single_command
+from dataplicity_cli.remote_access import (
+    _close_stream_writer,
+    _detect_protocol,
+    run_port_forward,
+    run_remote_file,
+    run_single_command,
+)
 
 
 class _FakeM2M:
@@ -136,6 +142,15 @@ class RemoteAccessHelpersTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(_detect_protocol(b"SSH-2.0-OpenSSH_9.0"), "SSH")
         self.assertEqual(_detect_protocol(bytes([0x16, 0x03, 0x03, 0x00])), "TLS")
         self.assertIsNone(_detect_protocol(b"\x01\x02\x03"))
+
+    async def test_close_stream_writer_ignores_connection_reset(self) -> None:
+        writer = Mock()
+        writer.wait_closed = AsyncMock(side_effect=ConnectionResetError)
+
+        await _close_stream_writer(writer)
+
+        writer.close.assert_called_once_with()
+        writer.wait_closed.assert_awaited_once_with()
 
     async def test_run_port_forward_allocates_channel_per_local_client(self) -> None:
         fake = _FakeM2M()
