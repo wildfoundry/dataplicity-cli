@@ -7,9 +7,16 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import Dict, Optional
-from unittest.mock import patch
+from unittest.mock import AsyncMock, Mock, patch
 
-from dataplicity_cli.remote_access import _detect_protocol, run_port_forward, run_remote_file, run_single_command
+from dataplicity_cli import remote_access
+from dataplicity_cli.remote_access import (
+    _close_stream_writer,
+    _detect_protocol,
+    run_port_forward,
+    run_remote_file,
+    run_single_command,
+)
 
 
 class _FakeM2M:
@@ -37,6 +44,17 @@ class _StdoutWithBuffer:
         self.buffer = io.BytesIO()
 
 
+class _FakeMsvcrt:
+    def __init__(self, characters: list[str]) -> None:
+        self.characters = characters
+
+    def kbhit(self) -> bool:
+        return bool(self.characters)
+
+    def getwch(self) -> str:
+        return self.characters.pop(0)
+
+
 def _unused_local_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
         probe.bind(("127.0.0.1", 0))
@@ -44,6 +62,42 @@ def _unused_local_port() -> int:
 
 
 class RemoteAccessHelpersTest(unittest.IsolatedAsyncioTestCase):
+    async def test_windows_console_input_maps_text_and_navigation_keys(self) -> None:
+        fake_msvcrt = _FakeMsvcrt(["a", "\xe0", "H", "\xe0", "M", "\r"])
+
+        with patch.object(remote_access, "msvcrt", fake_msvcrt):
+            data = remote_access._read_windows_console_input()
+
+        self.assertEqual(data, b"a\x1b[A\x1b[C\r")
+
+    async def test_windows_raw_terminal_forwards_ctrl_c_as_input(self) -> None:
+        fake_msvcrt = _FakeMsvcrt([])
+        previous_handler = object()
+
+        with (
+            patch.object(remote_access, "msvcrt", fake_msvcrt),
+            patch.object(remote_access.signal, "getsignal", return_value=previous_handler),
+            patch.object(remote_access.signal, "signal") as set_signal,
+        ):
+            with remote_access.RawTerminal():
+                sigint_handler = set_signal.call_args_list[0].args[1]
+                sigint_handler(remote_access.signal.SIGINT, None)
+                self.assertEqual(remote_access._read_windows_console_input(), b"\x03")
+
+        self.assertEqual(
+            set_signal.call_args_list[-1].args,
+            (remote_access.signal.SIGINT, previous_handler),
+        )
+
+    async def test_raw_terminal_is_noop_without_posix_terminal_modules(self) -> None:
+        with (
+            patch.object(remote_access, "termios", None),
+            patch.object(remote_access, "tty", None),
+            patch.object(remote_access.sys.stdin, "fileno", side_effect=AssertionError("fileno should not be called")),
+        ):
+            with remote_access.RawTerminal():
+                pass
+
     async def test_run_single_command_rejects_empty_command(self) -> None:
         fake = _FakeM2M()
         with self.assertRaises(RuntimeError):
@@ -88,6 +142,15 @@ class RemoteAccessHelpersTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(_detect_protocol(b"SSH-2.0-OpenSSH_9.0"), "SSH")
         self.assertEqual(_detect_protocol(bytes([0x16, 0x03, 0x03, 0x00])), "TLS")
         self.assertIsNone(_detect_protocol(b"\x01\x02\x03"))
+
+    async def test_close_stream_writer_ignores_connection_reset(self) -> None:
+        writer = Mock()
+        writer.wait_closed = AsyncMock(side_effect=ConnectionResetError)
+
+        await _close_stream_writer(writer)
+
+        writer.close.assert_called_once_with()
+        writer.wait_closed.assert_awaited_once_with()
 
     async def test_run_port_forward_allocates_channel_per_local_client(self) -> None:
         fake = _FakeM2M()

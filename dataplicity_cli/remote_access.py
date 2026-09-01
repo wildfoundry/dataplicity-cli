@@ -4,29 +4,61 @@ import asyncio
 import os
 import secrets
 import select
+import signal
 import sys
-import termios
 import time
-import tty
+from collections import deque
+from contextlib import suppress
 from dataclasses import dataclass
-from typing import Awaitable, Callable, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 from .m2m import M2MClient
+
+try:
+    import msvcrt
+except ImportError:  # pragma: no cover - Windows only
+    msvcrt = None
+
+try:
+    import termios
+    import tty
+except ImportError:  # pragma: no cover - Windows only
+    termios = None
+    tty = None
+
+
+_WINDOWS_SIGNAL_INPUT: deque[bytes] = deque()
+
+
+def _capture_windows_sigint(_signum: int, _frame: Any) -> None:
+    _WINDOWS_SIGNAL_INPUT.append(b"\x03")
 
 
 class RawTerminal:
     def __init__(self) -> None:
         self._fd: Optional[int] = None
         self._old: Optional[list] = None
+        self._old_sigint_handler: Any = None
 
     def __enter__(self) -> "RawTerminal":
+        if msvcrt is not None:
+            _WINDOWS_SIGNAL_INPUT.clear()
+            self._old_sigint_handler = signal.getsignal(signal.SIGINT)
+            signal.signal(signal.SIGINT, _capture_windows_sigint)
+            return self
+        if termios is None or tty is None:
+            return self
         self._fd = sys.stdin.fileno()
         self._old = termios.tcgetattr(self._fd)
         tty.setraw(self._fd)
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
-        if self._fd is not None and self._old is not None:
+        if self._old_sigint_handler is not None:
+            signal.signal(signal.SIGINT, self._old_sigint_handler)
+            self._old_sigint_handler = None
+        _WINDOWS_SIGNAL_INPUT.clear()
+        if termios is not None and self._fd is not None and self._old is not None:
             termios.tcsetattr(self._fd, termios.TCSADRAIN, self._old)
 
 
@@ -44,6 +76,36 @@ class PortForwardEvent:
 
 PortForwardEventCallback = Callable[[PortForwardEvent], None]
 PortForwardChannelFactory = Callable[[], Awaitable[int]]
+
+_WINDOWS_KEY_SEQUENCES = {
+    "G": b"\x1b[H",
+    "H": b"\x1b[A",
+    "I": b"\x1b[5~",
+    "K": b"\x1b[D",
+    "M": b"\x1b[C",
+    "O": b"\x1b[F",
+    "P": b"\x1b[B",
+    "Q": b"\x1b[6~",
+    "S": b"\x1b[3~",
+}
+
+
+def _read_windows_console_input() -> bytes:
+    chunks = []
+    while _WINDOWS_SIGNAL_INPUT:
+        chunks.append(_WINDOWS_SIGNAL_INPUT.popleft())
+    if msvcrt is None:
+        return b"".join(chunks)
+    while msvcrt.kbhit():
+        character = msvcrt.getwch()
+        if character in {"\x00", "\xe0"}:
+            scan_code = msvcrt.getwch()
+            sequence = _WINDOWS_KEY_SEQUENCES.get(scan_code)
+            if sequence:
+                chunks.append(sequence)
+            continue
+        chunks.append(character.encode("utf-8", errors="replace"))
+    return b"".join(chunks)
 
 
 def _detect_protocol(sample: bytes) -> Optional[str]:
@@ -63,6 +125,12 @@ def _detect_protocol(sample: bytes) -> Optional[str]:
     return None
 
 
+async def _close_stream_writer(writer: asyncio.StreamWriter) -> None:
+    writer.close()
+    with suppress(ConnectionError, OSError):
+        await writer.wait_closed()
+
+
 async def run_terminal_session(m2m: M2MClient, port: int) -> None:
     queue = m2m.channel_queue(port)
     stdin_fd = sys.stdin.fileno()
@@ -70,6 +138,14 @@ async def run_terminal_session(m2m: M2MClient, port: int) -> None:
     stop_event = asyncio.Event()
 
     async def stdin_loop() -> None:
+        if msvcrt is not None:
+            while not stop_event.is_set():
+                data = _read_windows_console_input()
+                if data:
+                    await m2m.send_route(port, data)
+                else:
+                    await asyncio.sleep(0.02)
+            return
         while not stop_event.is_set():
             ready, _, _ = await asyncio.to_thread(select.select, [stdin_fd], [], [], 0.1)
             if not ready:
@@ -323,8 +399,7 @@ async def run_port_forward(
                     await m2m.close_channel(channel_for_client)
                 except Exception as exc:
                     emit("channel_close_failed", detail=f"{connection_label}: {exc}")
-            writer.close()
-            await writer.wait_closed()
+            await _close_stream_writer(writer)
             emit("connection_closed", detail=connection_label)
 
     server = await asyncio.start_server(handle_client, host="127.0.0.1", port=local_port)

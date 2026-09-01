@@ -53,6 +53,12 @@
             "context": "Compile + help smoke (windows-latest, 3.11)"
           },
           {
+            "context": "Windows unit tests"
+          },
+          {
+            "context": "Windows MSI smoke"
+          },
+          {
             "context": "No build artifacts tracked"
           }
         ]

@@ -20,7 +20,7 @@ Installers:
   InstallerSha256: 399CB0A4415F01AC22252F3F533199ACFF2287EFBC8E7C197C65F0A54EF0365B
   AppsAndFeaturesEntries:
   - DisplayName: Dataplicity CLI
-    Publisher: Dataplicity
+    Publisher: Wildfoundry Ltd
     UpgradeCode: '{B3C5A6C2-3D42-4E6B-9E2E-4F7B3D3C2A10}'
 ManifestType: installer
 ManifestVersion: 1.9.0

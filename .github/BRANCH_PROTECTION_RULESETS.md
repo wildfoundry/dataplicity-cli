@@ -25,6 +25,18 @@ This repository uses GitHub repository rulesets. Public contributors may open pu
 
 `.github/ruleset-tags.json` protects `v*` tags from deletion and force-updates.
 
+## Required status check names
+
+- Use check names exactly as they appear on pull requests. In this repo, required checks are:
+  - **Analyze (python)**
+  - **Unit tests (3.11)**
+  - **Unit tests (3.12)**
+  - **Compile + help smoke (macos-latest, 3.11)**
+  - **Compile + help smoke (windows-latest, 3.11)**
+  - **Windows unit tests**
+  - **Windows MSI smoke**
+  - **No build artifacts tracked**
+
 ## Apply or refresh via API
 
 ```bash

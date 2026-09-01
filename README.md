@@ -23,11 +23,25 @@ dataplicity --help
 
 ### Windows (no Python required)
 
-Download the latest `.msi` from [GitHub Releases](https://github.com/wildfoundry/dataplicity-cli/releases) and install it. It installs `dataplicity.exe` and adds it to `PATH`.
+Install the signed x64 MSI from WinGet in PowerShell or Windows Terminal:
 
-```
+```powershell
+winget install --id Wildfoundry.DataplicityCLI --exact
 dataplicity --help
 ```
+
+WinGet handles future upgrades and uninstall:
+
+```powershell
+winget upgrade --id Wildfoundry.DataplicityCLI --exact
+winget uninstall --id Wildfoundry.DataplicityCLI --exact
+```
+
+The installer is machine-wide and may request administrator approval. If
+WinGet is unavailable, download the latest signed `.msi` from
+[GitHub Releases](https://github.com/wildfoundry/dataplicity-cli/releases).
+Both install paths add `dataplicity.exe` to `PATH`; open a new terminal after
+installation.
 
 ### Python (developer install)
 
@@ -211,3 +225,4 @@ dataplicity --install-completion zsh
 - The `Update WinGet package` workflow publishes new `.msi` releases to WinGet using `Wildfoundry.DataplicityCLI`.
 - Configure a repository secret named `WINGET_TOKEN` (classic PAT with `public_repo`) and ensure your account has a fork of `microsoft/winget-pkgs`.
 - WinGet automation updates existing manifests; if this package is not yet in WinGet, submit the first manifest for the current release, then subsequent releases are automated.
+- Follow [`docs/windows-release.md`](docs/windows-release.md) before tagging a Windows release or submitting its first WinGet manifest.

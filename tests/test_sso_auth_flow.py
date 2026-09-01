@@ -1,17 +1,30 @@
 from __future__ import annotations
 
 import unittest
+from types import SimpleNamespace
 from urllib.request import urlopen
+from unittest.mock import Mock, patch
 
 from dataplicity_cli.cli import (
     _SsoCallbackListener,
+    _attempt_sso_auto_complete,
     _coerce_timeout_seconds,
     _extract_sso_payload_from_url,
     _extract_sso_payload_from_query,
     _extract_sso_tokens,
     _parse_sso_user_artifact,
-    _with_callback_hint,
+    auth_sso,
 )
+
+
+class _FakeSsoListener:
+    def __init__(self, payload: dict | None) -> None:
+        self.payload = payload
+
+    def wait_for_payload(self, timeout_seconds: float) -> dict | None:
+        _ = timeout_seconds
+        payload, self.payload = self.payload, None
+        return payload
 
 
 class SsoAuthFlowTest(unittest.TestCase):
@@ -26,16 +39,6 @@ class SsoAuthFlowTest(unittest.TestCase):
         self.assertEqual(payload.get("access"), "a2")
         self.assertEqual(payload.get("refresh"), "r2")
 
-    def test_with_callback_hint_adds_cli_callback(self) -> None:
-        url = _with_callback_hint("https://example.com/sso?foo=bar", "http://127.0.0.1:1234/callback")
-        self.assertIn("foo=bar", url)
-        self.assertIn("cli_callback_url=", url)
-
-    def test_with_callback_hint_rewrites_next_target(self) -> None:
-        callback = "http://127.0.0.1:1234/callback"
-        url = _with_callback_hint("https://example.com/sso?next=%2Fafter-login%2F", callback)
-        self.assertIn("next=http%3A%2F%2F127.0.0.1%3A1234%2Fcallback", url)
-        self.assertIn("cli_callback_url=", url)
     def test_extract_sso_payload_from_url_reads_query_and_fragment(self) -> None:
         payload = _extract_sso_payload_from_url("https://dataplicity.com/cb?code=abc#state=xyz")
         self.assertEqual(payload, {"code": "abc", "state": "xyz"})
@@ -52,6 +55,61 @@ class SsoAuthFlowTest(unittest.TestCase):
             self.assertEqual(payload, {"access": "abc", "refresh": "def"})
         finally:
             listener.stop()
+
+    def test_auto_complete_uses_loopback_payload_without_backend_polling(self) -> None:
+        state = SimpleNamespace(api=Mock())
+        listener = _FakeSsoListener({"access": "abc", "refresh": "def"})
+
+        with patch("dataplicity_cli.cli._apply_tokens_or_none", return_value=True) as apply_tokens:
+            completed = _attempt_sso_auto_complete(state, listener, timeout_seconds=1)
+
+        self.assertTrue(completed)
+        apply_tokens.assert_called_once_with(state, {"access": "abc", "refresh": "def"})
+        state.api.get.assert_not_called()
+        state.api.post.assert_not_called()
+
+    def test_auto_complete_without_listener_returns_immediately(self) -> None:
+        state = SimpleNamespace(api=Mock())
+
+        completed = _attempt_sso_auto_complete(state, None, timeout_seconds=180)
+
+        self.assertFalse(completed)
+        state.api.get.assert_not_called()
+        state.api.post.assert_not_called()
+
+    def test_sso_bootstrap_registers_loopback_callback_without_rewriting_redirect(self) -> None:
+        listener = Mock()
+        listener.start.return_value = True
+        listener.callback_url = "http://127.0.0.1:1234/callback"
+        redirect_url = "https://example.com/sso?redirect_uri=https%3A%2F%2Fexample.com%2Fcomplete"
+        state = SimpleNamespace(
+            api=Mock(),
+            config=SimpleNamespace(last_email=None, preferred_login_method=None, save=Mock()),
+            config_path="config.json",
+            json_output=True,
+        )
+        state.api.post.return_value = SimpleNamespace(
+            ok=True,
+            data={"status": "sso_redirect", "redirect_url": redirect_url},
+            text="",
+        )
+
+        with (
+            patch("dataplicity_cli.cli._ctx", return_value=state),
+            patch("dataplicity_cli.cli._resolve_email_for_auth", return_value="user@example.com"),
+            patch("dataplicity_cli.cli._SsoCallbackListener", return_value=listener),
+            patch("dataplicity_cli.cli._attempt_sso_auto_complete", return_value=True),
+            patch("dataplicity_cli.cli.webbrowser.open") as open_browser,
+            patch("dataplicity_cli.cli._print_json"),
+        ):
+            auth_sso(Mock(), email="user@example.com", open_browser=True, timeout=1)
+
+        state.api.post.assert_called_once_with(
+            "/api/auth/bootstrap/",
+            json_data={"email": "user@example.com", "callback_url": listener.callback_url},
+        )
+        open_browser.assert_called_once_with(redirect_url)
+        listener.stop.assert_called_once_with()
 
     def test_coerce_timeout_seconds_handles_invalid_values(self) -> None:
         self.assertEqual(_coerce_timeout_seconds(30), 30)

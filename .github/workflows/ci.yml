@@ -64,21 +64,86 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[test]"
       - name: Run unit tests
-        # remote_access imports termios, which is not available on Windows.
-        run: pytest -q --maxfail=1 --ignore=tests/test_remote_access_helpers.py --ignore=tests/test_remote_access_single_command.py
+        run: pytest -q --maxfail=1
 
   windows-msi-smoke:
     name: Windows MSI smoke
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Validate WiX source and MSI build script
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install . pyinstaller
+          choco install wixtoolset -y
+      - name: Build executable and MSI
         shell: pwsh
         run: |
-          if (!(Test-Path "build/windows/DataplicityCLI.wxs")) { throw "missing wxs" }
-          if (!(Test-Path "build/windows/build_msi.ps1")) { throw "missing build_msi.ps1" }
-          $null = [xml](Get-Content "build/windows/DataplicityCLI.wxs")
-          Write-Host "OK: WiX source parses"
+          $env:VERSION = python build/get_version.py
+          pyinstaller --noconfirm --clean --onefile --name dataplicity `
+            --workpath pyinstaller-build --distpath pyinstaller-dist `
+            dataplicity_cli/__main__.py
+          ./pyinstaller-dist/dataplicity.exe --version
+          ./pyinstaller-dist/dataplicity.exe --help
+          ./build/windows/build_msi.ps1 -Version $env:VERSION
+          "MSI_PATH=$((Resolve-Path "dist/dataplicity-cli-$env:VERSION-windows-x64.msi").Path)" >> $env:GITHUB_ENV
+      - name: Install, verify, and uninstall MSI
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $installDir = Join-Path $env:ProgramFiles "Dataplicity\Dataplicity CLI"
+          $installedExe = Join-Path $installDir "dataplicity.exe"
+          $installed = $false
+          try {
+            $install = Start-Process msiexec.exe `
+              -ArgumentList @("/i", "`"$env:MSI_PATH`"", "/qn", "/norestart") `
+              -Wait -PassThru
+            if ($install.ExitCode -ne 0) {
+              throw "MSI install failed with exit code $($install.ExitCode)."
+            }
+            $installed = $true
+            if (!(Test-Path $installedExe)) {
+              throw "Installed executable not found at $installedExe."
+            }
+            & $installedExe --version
+            if ($LASTEXITCODE -ne 0) {
+              throw "Installed executable --version failed."
+            }
+            & $installedExe --help
+            if ($LASTEXITCODE -ne 0) {
+              throw "Installed executable --help failed."
+            }
+            $machinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
+            $expectedPathEntry = $installDir -replace '[\\/]+$', ''
+            $machinePathEntries = $machinePath -split ";" | ForEach-Object {
+              $_.Trim().Trim('"') -replace '[\\/]+$', ''
+            }
+            if ($machinePathEntries -notcontains $expectedPathEntry) {
+              throw "Installer did not add $installDir to the machine PATH. Machine PATH: $machinePath"
+            }
+          } finally {
+            if ($installed) {
+              $uninstall = Start-Process msiexec.exe `
+                -ArgumentList @("/x", "`"$env:MSI_PATH`"", "/qn", "/norestart") `
+                -Wait -PassThru
+              if ($uninstall.ExitCode -ne 0) {
+                throw "MSI uninstall failed with exit code $($uninstall.ExitCode)."
+              }
+            }
+          }
+          if (Test-Path $installedExe) {
+            throw "Installed executable remains after uninstall."
+          }
+          $machinePathAfterUninstall = [Environment]::GetEnvironmentVariable("Path", "Machine")
+          $pathEntriesAfterUninstall = $machinePathAfterUninstall -split ";" | ForEach-Object {
+            $_.Trim().Trim('"') -replace '[\\/]+$', ''
+          }
+          if ($pathEntriesAfterUninstall -contains $expectedPathEntry) {
+            throw "Installer PATH entry remains after uninstall: $installDir"
+          }
 
   no-artifacts-tracked:
     name: No build artifacts tracked

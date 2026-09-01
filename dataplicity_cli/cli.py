@@ -4,6 +4,7 @@ import asyncio
 import datetime as dt
 import html
 import json
+import os
 import queue
 import re
 import shutil
@@ -18,7 +19,7 @@ from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
-from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
+from urllib.parse import parse_qs, urlparse
 
 import typer
 from rich.console import Console
@@ -299,21 +300,6 @@ def _parse_sso_user_artifact(raw: str) -> Optional[Dict[str, Any]]:
     return _extract_sso_payload_from_query(parse_qs(text, keep_blank_values=True))
 
 
-def _with_callback_hint(url: str, callback_url: str) -> str:
-    parsed = urlparse(url)
-    query = parse_qs(parsed.query, keep_blank_values=True)
-    # Prefer standards/common redirect targets when present so the IdP/browser
-    # flow can return directly to the loopback listener.
-    for redirect_key in ("redirect_uri", "redirect_url", "return_to", "return", "next"):
-        if redirect_key in query:
-            query[redirect_key] = [callback_url]
-            break
-    if "cli_callback_url" in query:
-        return urlunparse(parsed._replace(query=urlencode(query, doseq=True)))
-    query["cli_callback_url"] = [callback_url]
-    return urlunparse(parsed._replace(query=urlencode(query, doseq=True)))
-
-
 class _SsoCallbackListener:
     def __init__(self) -> None:
         self._queue: "queue.Queue[Dict[str, Any]]" = queue.Queue()
@@ -545,38 +531,19 @@ def _apply_tokens_or_none(state: AppContext, payload: Any) -> bool:
     return True
 
 
-def _try_complete_sso_from_code(state: AppContext, code_payload: Dict[str, Any]) -> bool:
-    code = code_payload.get("code")
-    if not code:
-        return False
-    body: Dict[str, Any] = {"code": code}
-    if code_payload.get("state"):
-        body["state"] = code_payload["state"]
-    response = state.api.post("/api/auth/sso/complete/", json_data=body)
-    if not response.ok:
-        return False
-    return _apply_tokens_or_none(state, response.data)
-
-
 def _attempt_sso_auto_complete(
     state: AppContext,
     listener: Optional[_SsoCallbackListener],
     *,
     timeout_seconds: int,
 ) -> bool:
+    if listener is None:
+        return False
     deadline = time.monotonic() + max(timeout_seconds, 1)
     while time.monotonic() < deadline:
-        if listener:
-            payload = listener.wait_for_payload(timeout_seconds=1.0)
-            if payload:
-                if _apply_tokens_or_none(state, payload):
-                    return True
-                if _try_complete_sso_from_code(state, payload):
-                    return True
-        response = state.api.get("/api/auth/sso/complete/")
-        if response.ok and _apply_tokens_or_none(state, response.data):
+        payload = listener.wait_for_payload(timeout_seconds=1.0)
+        if payload and _apply_tokens_or_none(state, payload):
             return True
-        time.sleep(1.0)
     return False
 
 
@@ -1730,8 +1697,21 @@ def auth_sso(
     state = _ctx(ctx)
     email = _resolve_email_for_auth(state, provided_email=email)
     timeout_seconds = _coerce_timeout_seconds(timeout)
-    response = state.api.post("/api/auth/bootstrap/", json_data={"email": email})
+    listener: Optional[_SsoCallbackListener] = None
+    bootstrap_payload = {"email": email}
+    if open_browser:
+        listener = _SsoCallbackListener()
+        if listener.start() and listener.callback_url:
+            bootstrap_payload["callback_url"] = listener.callback_url
+            if not state.json_output:
+                state.console.print(f"Listening for SSO callback on [blue]{listener.callback_url}[/blue]")
+        else:
+            listener = None
+
+    response = state.api.post("/api/auth/bootstrap/", json_data=bootstrap_payload)
     if not response.ok:
+        if listener:
+            listener.stop()
         message = _friendly_response_message("Unable to start SSO.", response.data, response.text)
         if state.json_output:
             _print_json({"ok": False, "detail": message})
@@ -1740,6 +1720,8 @@ def auth_sso(
         raise typer.Exit(code=1)
 
     if not isinstance(response.data, dict) or response.data.get("status") != "sso_redirect":
+        if listener:
+            listener.stop()
         message = "SSO is not enabled for this account."
         if state.json_output:
             _print_json({"ok": False, "detail": message})
@@ -1749,6 +1731,8 @@ def auth_sso(
 
     redirect_url = response.data.get("redirect_url")
     if not redirect_url:
+        if listener:
+            listener.stop()
         message = "SSO redirect URL missing."
         if state.json_output:
             _print_json({"ok": False, "detail": message})
@@ -1756,21 +1740,11 @@ def auth_sso(
             _show_error(state.console, message)
         raise typer.Exit(code=1)
 
-    listener: Optional[_SsoCallbackListener] = None
-    browser_url = redirect_url
-    if open_browser:
-        listener = _SsoCallbackListener()
-        if listener.start() and listener.callback_url:
-            browser_url = _with_callback_hint(redirect_url, listener.callback_url)
-            if not state.json_output:
-                state.console.print(f"Listening for SSO callback on [blue]{listener.callback_url}[/blue]")
-        else:
-            listener = None
-        webbrowser.open(browser_url)
-
-    if not state.json_output:
-        state.console.print("Waiting for browser sign-in to complete...")
     try:
+        if open_browser:
+            webbrowser.open(redirect_url)
+        if not state.json_output:
+            state.console.print("Waiting for browser sign-in to complete...")
         if _attempt_sso_auto_complete(state, listener, timeout_seconds=timeout_seconds):
             state.config.last_email = email
             state.config.preferred_login_method = "sso"
@@ -1805,7 +1779,7 @@ def auth_sso(
     if payload is None:
         _show_error(state.console, "Could not parse SSO response.")
         raise typer.Exit(code=1)
-    if not _apply_tokens_or_none(state, payload) and not _try_complete_sso_from_code(state, payload):
+    if not _apply_tokens_or_none(state, payload):
         _show_error(state.console, "No access token found in payload.")
         raise typer.Exit(code=1)
     state.config.last_email = email
@@ -2698,10 +2672,25 @@ def devices_provisioning_key(
         state.console.print(message)
 
 
-async def _resolve_m2m_url(state: AppContext, device_hash: str) -> str:
-    response = state.api.get(f"/api/remote/devices/{device_hash}/host/")
+async def _resolve_m2m_url(
+    state: AppContext,
+    device_hash: str,
+    *,
+    request_timeout: Optional[int] = None,
+) -> str:
+    path = f"/api/remote/devices/{device_hash}/host/"
+    if request_timeout is None:
+        response = state.api.get(path)
+    else:
+        response = state.api.request("GET", path, timeout=max(1, request_timeout))
     if not response.ok or not isinstance(response.data, dict):
+        if response.status_code == 0 and request_timeout is not None:
+            raise RuntimeError(
+                f"Timed out after {request_timeout}s while resolving remote host."
+            )
         detail = _friendly_response_message("Remote Access host lookup failed.", response.data, response.text)
+        if detail.strip().lower() == "unknown device":
+            detail = "Device is offline or unavailable for Remote Access."
         raise RuntimeError(detail)
     m2m_url = response.data.get("m2m_url")
     if not m2m_url:
@@ -2724,6 +2713,12 @@ def _resolve_local_port(preferred: Optional[int]) -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
         probe.bind(("127.0.0.1", 0))
         return int(probe.getsockname()[1])
+
+
+def _ssh_host_key_options(strict_host_key_checking: bool) -> List[str]:
+    if strict_host_key_checking:
+        return []
+    return ["-o", "StrictHostKeyChecking=no", "-o", f"UserKnownHostsFile={os.devnull}"]
 
 
 @devices_app.command("terminal")
@@ -2947,7 +2942,11 @@ def devices_ssh(
     resolved_local_port = _resolve_local_port(local_port)
 
     async def runner() -> None:
-        ws_url = await asyncio.wait_for(_resolve_m2m_url(state, resolved_hash), timeout=float(connect_timeout))
+        ws_url = await _resolve_m2m_url(
+            state,
+            resolved_hash,
+            request_timeout=connect_timeout,
+        )
         m2m = M2MClient(ws_url)
         await asyncio.wait_for(m2m.connect(), timeout=float(connect_timeout))
         forward_task: Optional[asyncio.Task] = None
@@ -2997,8 +2996,7 @@ def devices_ssh(
             ssh_cmd: List[str] = ["ssh", "-p", str(resolved_local_port)]
             if identity_file:
                 ssh_cmd.extend(["-i", str(identity_file.expanduser())])
-            if not strict_host_key_checking:
-                ssh_cmd.extend(["-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null"])
+            ssh_cmd.extend(_ssh_host_key_options(strict_host_key_checking))
             ssh_cmd.extend(ssh_arg or [])
             ssh_cmd.append(target)
             if remote_command:
@@ -3156,12 +3154,11 @@ def devices_run(
         verbose = state.debug and (not state.json_output)
         if verbose:
             state.console.print(f"[blue]Connecting to {resolved_hash}...[/blue]")
-        try:
-            ws_url = await asyncio.wait_for(_resolve_m2m_url(state, resolved_hash), timeout=float(connect_timeout))
-        except asyncio.TimeoutError as exc:
-            raise RuntimeError(
-                f"Timed out after {connect_timeout}s while resolving remote host."
-            ) from exc
+        ws_url = await _resolve_m2m_url(
+            state,
+            resolved_hash,
+            request_timeout=connect_timeout,
+        )
         m2m = M2MClient(ws_url)
         try:
             await asyncio.wait_for(m2m.connect(), timeout=float(connect_timeout))
