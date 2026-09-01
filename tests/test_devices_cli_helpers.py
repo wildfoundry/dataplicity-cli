@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import os
 import unittest
+from unittest.mock import Mock
 
+from dataplicity_cli.api import ApiResponse
 from dataplicity_cli.cli import (
     _connection_quality_points,
     _device_is_active,
@@ -10,6 +12,7 @@ from dataplicity_cli.cli import (
     _extract_devices,
     _render_latency_sparkline,
     _render_quality_status_bar,
+    _resolve_m2m_url,
     _ssh_host_key_options,
     _sort_devices_for_display,
 )
@@ -88,6 +91,48 @@ class DeviceCliHelpersTest(unittest.TestCase):
         points = [{"status": "unknown"}, {"status": "unknown"}]
         rendered = _render_latency_sparkline(points, width=4)
         self.assertIn("latency unavailable", rendered)
+
+
+class ResolveM2MUrlTest(unittest.IsolatedAsyncioTestCase):
+    async def test_unknown_router_device_is_reported_as_offline(self) -> None:
+        state = Mock()
+        state.api.get.return_value = ApiResponse(
+            False,
+            404,
+            {"detail": "unknown device"},
+            '{"detail":"unknown device"}',
+        )
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "Device is offline or unavailable for Remote Access",
+        ):
+            await _resolve_m2m_url(state, "offline-device")
+
+    async def test_host_lookup_uses_requested_timeout(self) -> None:
+        state = Mock()
+        state.api.request.return_value = ApiResponse(
+            False,
+            0,
+            None,
+            "request timed out",
+        )
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "Timed out after 10s while resolving remote host",
+        ):
+            await _resolve_m2m_url(
+                state,
+                "offline-device",
+                request_timeout=10,
+            )
+
+        state.api.request.assert_called_once_with(
+            "GET",
+            "/api/remote/devices/offline-device/host/",
+            timeout=10,
+        )
 
 
 if __name__ == "__main__":

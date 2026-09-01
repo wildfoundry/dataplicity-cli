@@ -2672,10 +2672,25 @@ def devices_provisioning_key(
         state.console.print(message)
 
 
-async def _resolve_m2m_url(state: AppContext, device_hash: str) -> str:
-    response = state.api.get(f"/api/remote/devices/{device_hash}/host/")
+async def _resolve_m2m_url(
+    state: AppContext,
+    device_hash: str,
+    *,
+    request_timeout: Optional[int] = None,
+) -> str:
+    path = f"/api/remote/devices/{device_hash}/host/"
+    if request_timeout is None:
+        response = state.api.get(path)
+    else:
+        response = state.api.request("GET", path, timeout=max(1, request_timeout))
     if not response.ok or not isinstance(response.data, dict):
+        if response.status_code == 0 and request_timeout is not None:
+            raise RuntimeError(
+                f"Timed out after {request_timeout}s while resolving remote host."
+            )
         detail = _friendly_response_message("Remote Access host lookup failed.", response.data, response.text)
+        if detail.strip().lower() == "unknown device":
+            detail = "Device is offline or unavailable for Remote Access."
         raise RuntimeError(detail)
     m2m_url = response.data.get("m2m_url")
     if not m2m_url:
@@ -2927,7 +2942,11 @@ def devices_ssh(
     resolved_local_port = _resolve_local_port(local_port)
 
     async def runner() -> None:
-        ws_url = await asyncio.wait_for(_resolve_m2m_url(state, resolved_hash), timeout=float(connect_timeout))
+        ws_url = await _resolve_m2m_url(
+            state,
+            resolved_hash,
+            request_timeout=connect_timeout,
+        )
         m2m = M2MClient(ws_url)
         await asyncio.wait_for(m2m.connect(), timeout=float(connect_timeout))
         forward_task: Optional[asyncio.Task] = None
@@ -3135,12 +3154,11 @@ def devices_run(
         verbose = state.debug and (not state.json_output)
         if verbose:
             state.console.print(f"[blue]Connecting to {resolved_hash}...[/blue]")
-        try:
-            ws_url = await asyncio.wait_for(_resolve_m2m_url(state, resolved_hash), timeout=float(connect_timeout))
-        except asyncio.TimeoutError as exc:
-            raise RuntimeError(
-                f"Timed out after {connect_timeout}s while resolving remote host."
-            ) from exc
+        ws_url = await _resolve_m2m_url(
+            state,
+            resolved_hash,
+            request_timeout=connect_timeout,
+        )
         m2m = M2MClient(ws_url)
         try:
             await asyncio.wait_for(m2m.connect(), timeout=float(connect_timeout))
