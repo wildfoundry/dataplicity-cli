@@ -19,7 +19,7 @@ def _metadata() -> dict[str, str]:
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, value = line.split("=", 1)
-        values[key] = value
+        values[key] = value.strip().strip('"')
     return values
 
 
@@ -31,6 +31,7 @@ class LinuxPackagingTest(unittest.TestCase):
         self.assertEqual(metadata["MAINTAINER"], "WildFoundry Ltd")
         self.assertEqual(metadata["LICENSE"], "BSD-3-Clause")
         self.assertEqual(metadata["HOMEPAGE"], "https://github.com/wildfoundry/dataplicity-cli")
+        self.assertEqual(metadata["DESCRIPTION"], "Dataplicity command line interface")
         self.assertEqual(metadata["INSTALL_PATH"], "/usr/bin")
 
     def test_linux_package_script_emits_deb_rpm_and_tarball(self) -> None:

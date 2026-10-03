@@ -8,7 +8,14 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORKDIR="${WORKDIR:-${ROOT_DIR}/tmp-release/linux-vm}"
 IMAGE_URL="${IMAGE_URL:-https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-amd64.qcow2}"
 SSH_PORT="${SSH_PORT:-2222}"
-PYTHON="${PYTHON:-python3}"
+PYTHON="${PYTHON:-}"
+if [[ -z "${PYTHON}" ]]; then
+  if [[ -x "${ROOT_DIR}/.venv/bin/python" ]]; then
+    PYTHON="${ROOT_DIR}/.venv/bin/python"
+  else
+    PYTHON="python3"
+  fi
+fi
 VERSION="${VERSION:-$("${PYTHON}" "${ROOT_DIR}/build/get_version.py")}"
 DEB_ARCH="${DEB_ARCH:-amd64}"
 RPM_ARCH="${RPM_ARCH:-x86_64}"

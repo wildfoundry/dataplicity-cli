@@ -7,7 +7,13 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BINARY="${1:?dataplicity binary required}"
 PUBLIC_HOST="${2:-127.0.0.1}"
-PYTHON="${PYTHON:-python3}"
+if [[ -z "${PYTHON:-}" ]]; then
+  if [[ -x "${ROOT_DIR}/.venv/bin/python" ]]; then
+    PYTHON="${ROOT_DIR}/.venv/bin/python"
+  else
+    PYTHON="python3"
+  fi
+fi
 
 if [[ ! -x "${BINARY}" && ! -f "${BINARY}" ]]; then
   echo "CLI binary not found: ${BINARY}" >&2
