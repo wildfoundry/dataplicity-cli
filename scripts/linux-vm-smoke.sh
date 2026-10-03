@@ -78,13 +78,9 @@ users:
     shell: /bin/bash
     ssh_authorized_keys:
       - ${PUBKEY}
-packages:
-  - curl
-  - rpm
-  - ca-certificates
 ssh_pwauth: false
-runcmd:
-  - [ sh, -c, "systemctl enable --now ssh || systemctl enable --now sshd || true" ]
+package_update: false
+package_upgrade: false
 EOF
 cat >"${META_DATA}" <<EOF
 instance-id: dataplicity-cli-linux-smoke
@@ -114,7 +110,7 @@ qemu-system-x86_64 \
   -m 1024 \
   -smp 2 \
   -drive "file=${DISK},if=virtio,format=qcow2" \
-  -drive "file=${SEED},if=virtio,format=raw,readonly=on" \
+  -drive "file=${SEED},media=cdrom,readonly=on" \
   -netdev "user,id=net0,hostfwd=tcp:127.0.0.1:${SSH_PORT}-:22" \
   -device virtio-net-pci,netdev=net0 \
   -display none \
@@ -130,12 +126,14 @@ ssh_cmd() {
     -o LogLevel=ERROR \
     -p "${SSH_PORT}" \
     debian@127.0.0.1 \
-    "$@"
+    "export LC_ALL=C.UTF-8 LANG=C.UTF-8; $*"
 }
 
 echo "Waiting for VM SSH on localhost:${SSH_PORT}..."
+ready=0
 for _ in $(seq 1 90); do
-  if ssh_cmd 'echo up' >/dev/null 2>&1; then
+  if ssh_cmd 'cloud-init status --wait >/dev/null && echo up' >/dev/null 2>&1; then
+    ready=1
     break
   fi
   if ! kill -0 "${QEMU_PID}" 2>/dev/null; then
@@ -143,8 +141,13 @@ for _ in $(seq 1 90); do
     cat "${QEMU_LOG}" >&2 || true
     exit 1
   fi
-  sleep 2
+  sleep 3
 done
+if [[ "${ready}" -ne 1 ]]; then
+  echo "Timed out waiting for cloud-init/SSH" >&2
+  cat "${QEMU_LOG}" >&2 || true
+  exit 1
+fi
 ssh_cmd 'echo up' >/dev/null
 
 free_port() {
@@ -186,7 +189,8 @@ scp -i "${KEY}" \
   "${DEB}" "${RPM}" "${TARBALL}" "${CONFIG_HOST}" \
   debian@127.0.0.1:~/
 
-ssh_cmd "sudo apt-get update -qq && sudo apt-get install -y ./${PACKAGE_NAME}_${VERSION}_${DEB_ARCH}.deb"
+ssh_cmd "sudo apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq rpm curl ca-certificates"
+ssh_cmd "sudo apt-get install -y ./${PACKAGE_NAME}_${VERSION}_${DEB_ARCH}.deb"
 ssh_cmd "dataplicity --version"
 ssh_cmd "dataplicity --help >/dev/null"
 

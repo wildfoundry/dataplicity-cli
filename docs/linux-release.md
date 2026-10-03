@@ -18,11 +18,11 @@ x86_64 and aarch64 only.
 
 ## Compatibility
 
-Release binaries are built on Ubuntu GitHub runners and are glibc-linked.
-Support Ubuntu 22.04+, Debian 12+, RHEL/Fedora 9+, and current openSUSE
-Leap/Tumbleweed on x86_64 and aarch64. Older glibc hosts should use the
-tarball only after confirming `ldd` on the extracted binary, or run from
-source.
+Release binaries are built on Ubuntu 22.04 GitHub runners (glibc 2.35) and
+are therefore expected to run on Ubuntu 22.04+, Debian 12+, RHEL/Fedora 9+,
+and current openSUSE Leap/Tumbleweed on x86_64 and aarch64. Older glibc
+hosts should unpack the tarball and confirm `ldd` on the extracted binary,
+or run from source.
 
 The packages install `/usr/bin/dataplicity` and do not require a local Python
 runtime.

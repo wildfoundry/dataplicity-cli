@@ -45,6 +45,10 @@ DEB_ARCH="${2:-${DEFAULT_DEB_ARCH}}"
 RPM_ARCH="${3:-${DEFAULT_RPM_ARCH}}"
 
 mkdir -p "${DIST_DIR}"
+rm -f \
+  "${DIST_DIR}/${PACKAGE_NAME}_${VERSION}_${DEB_ARCH}.deb" \
+  "${DIST_DIR}/${PACKAGE_NAME}-${VERSION}-1.${RPM_ARCH}.rpm" \
+  "${DIST_DIR}/${PACKAGE_NAME}-${VERSION}-linux-${RPM_ARCH}.tar.gz"
 
 STAGE="$(mktemp -d)"
 ARCHIVE_ROOT="$(mktemp -d)"
