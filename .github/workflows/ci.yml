@@ -35,7 +35,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, windows-latest]
+        os: [macos-latest, windows-latest, ubuntu-latest]
         python-version: ["3.11"]
     steps:
       - uses: actions/checkout@v4
@@ -145,6 +145,40 @@ jobs:
             throw "Installer PATH entry remains after uninstall: $installDir"
           }
 
+  linux-packages-smoke:
+    name: Linux packages smoke
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install build and packaging dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install . pyinstaller
+          sudo apt-get update
+          sudo apt-get install --yes rpm ruby-dev curl
+          sudo gem install --no-document fpm
+      - name: Build executable and Linux packages
+        run: |
+          VERSION="$(python build/get_version.py)"
+          echo "VERSION=${VERSION}" >> "${GITHUB_ENV}"
+          pyinstaller --noconfirm --clean --onefile --name dataplicity \
+            --exclude-module websockets.speedups \
+            --workpath pyinstaller-build --distpath pyinstaller-dist \
+            dataplicity_cli/__main__.py
+          chmod +x build/linux/build_packages.sh build/linux/smoke.sh scripts/linux_port_forward_smoke.sh
+          ./build/linux/build_packages.sh "${VERSION}" amd64 x86_64
+      - name: Install packages and smoke CLI
+        run: |
+          ./build/linux/smoke.sh
+      - name: Port-forward smoke with installed package
+        run: |
+          sudo apt-get install --yes "./dist/dataplicity-cli_${VERSION}_amd64.deb"
+          scripts/linux_port_forward_smoke.sh /usr/bin/dataplicity
+          sudo apt-get remove --yes dataplicity-cli
+
   no-artifacts-tracked:
     name: No build artifacts tracked
     runs-on: ubuntu-latest
@@ -173,6 +207,8 @@ jobs:
               ".wixobj",
               ".wixpdb",
               ".exe",
+              ".deb",
+              ".rpm",
           )
 
           bad = [

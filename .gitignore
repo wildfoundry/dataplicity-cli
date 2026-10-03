@@ -7,6 +7,10 @@ __pycache__/
 .venv/
 venv/
 
+.coverage
+coverage.xml
+htmlcov/
+
 # PyInstaller / release byproducts (never commit)
 dist/
 release/
@@ -16,6 +20,8 @@ tmp-release/
 
 *.msi
 *.pkg
+*.deb
+*.rpm
 *.cab
 *.wixobj
 *.wixpdb
