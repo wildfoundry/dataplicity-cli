@@ -19,8 +19,23 @@ if [[ "${1:-}" == "--binary" ]]; then
 fi
 
 VERSION="${VERSION:?VERSION is required}"
-DEB_ARCH="${DEB_ARCH:?DEB_ARCH is required}"
-RPM_ARCH="${RPM_ARCH:?RPM_ARCH is required}"
+HOST_ARCH="$(uname -m)"
+case "${HOST_ARCH}" in
+  x86_64|amd64)
+    DEFAULT_DEB_ARCH="amd64"
+    DEFAULT_RPM_ARCH="x86_64"
+    ;;
+  aarch64|arm64)
+    DEFAULT_DEB_ARCH="arm64"
+    DEFAULT_RPM_ARCH="aarch64"
+    ;;
+  *)
+    echo "Unsupported host architecture: ${HOST_ARCH}" >&2
+    exit 1
+    ;;
+esac
+DEB_ARCH="${DEB_ARCH:-${DEFAULT_DEB_ARCH}}"
+RPM_ARCH="${RPM_ARCH:-${DEFAULT_RPM_ARCH}}"
 DIST_DIR="${DIST_DIR:-dist}"
 
 DEB="${DIST_DIR}/${PACKAGE_NAME}_${VERSION}_${DEB_ARCH}.deb"

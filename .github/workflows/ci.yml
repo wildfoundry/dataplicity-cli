@@ -171,6 +171,9 @@ jobs:
           chmod +x build/linux/build_packages.sh build/linux/smoke.sh scripts/linux_port_forward_smoke.sh
           ./build/linux/build_packages.sh "${VERSION}" amd64 x86_64
       - name: Install packages and smoke CLI
+        env:
+          DEB_ARCH: amd64
+          RPM_ARCH: x86_64
         run: |
           ./build/linux/smoke.sh
       - name: Port-forward smoke with installed package

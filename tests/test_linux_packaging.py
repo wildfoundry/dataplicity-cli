@@ -55,6 +55,8 @@ class LinuxPackagingTest(unittest.TestCase):
         self.assertIn("tar -C", script)
         self.assertIn("--version", script)
         self.assertIn("--help", script)
+        self.assertIn('DEB_ARCH="${DEB_ARCH:-${DEFAULT_DEB_ARCH}}"', script)
+        self.assertIn('RPM_ARCH="${RPM_ARCH:-${DEFAULT_RPM_ARCH}}"', script)
 
     def test_port_forward_mock_covers_remote_access_routes(self) -> None:
         source = MOCK_GATEWAY.read_text(encoding="utf-8")
