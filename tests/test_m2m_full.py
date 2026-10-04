@@ -45,15 +45,30 @@ class M2MClientFullTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_connect_and_send_packet_and_close(self) -> None:
         ws = _AsyncIterWS([])
-        with patch("dataplicity_cli.m2m.websockets.connect", new=AsyncMock(return_value=ws)):
-            client = M2MClient("wss://example.test/m2m/")
+        with patch("dataplicity_cli.m2m.websockets.connect", new=AsyncMock(return_value=ws)) as connect:
+            client = M2MClient("wss://example.test/m2m/", extra_headers={"User-Agent": "dataplicity-cli/0.1.7"})
             await client.connect()
             self.assertIs(client.ws, ws)
+            connect.assert_awaited_once_with(
+                "wss://example.test/m2m/",
+                additional_headers={"User-Agent": "dataplicity-cli/0.1.7"},
+            )
             await client.send_packet("ping", [b"nonce"])
             self.assertTrue(ws.sent)
             await client.close()
             self.assertTrue(ws.closed)
             self.assertTrue(client._closed_event.is_set())
+
+    async def test_connect_defaults_to_cli_identity_headers(self) -> None:
+        ws = _AsyncIterWS([])
+        with patch("dataplicity_cli.m2m.websockets.connect", new=AsyncMock(return_value=ws)) as connect:
+            client = M2MClient("wss://example.test/m2m/")
+            await client.connect()
+            headers = connect.await_args.kwargs["additional_headers"]
+        self.assertEqual(headers["X-Client-App"], "dataplicity-cli")
+        self.assertIn("User-Agent", headers)
+        self.assertIn("X-Client-Platform", headers)
+        self.assertIn("X-Client-Version", headers)
 
     async def test_close_swallows_request_leave_errors(self) -> None:
         ws = _AsyncIterWS([])

@@ -50,6 +50,7 @@ class ConfigTest(unittest.TestCase):
                 api_key="k",
                 last_email="test@example.com",
                 preferred_login_method="sso",
+                install_id="install-id-1234",
             )
             cfg.save(path)
             loaded = Config.load(path)
@@ -87,6 +88,22 @@ class ConfigTest(unittest.TestCase):
             with patch.dict("os.environ", {}, clear=True):
                 with patch("pathlib.Path.home", return_value=fake_home):
                     self.assertEqual(default_config_path(), fake_home / ".config" / "dataplicity" / "cli.json")
+
+    def test_ensure_install_id_creates_once_and_persists(self) -> None:
+        cfg = Config()
+        self.assertTrue(cfg.ensure_install_id())
+        first = cfg.install_id
+        self.assertIsNotNone(first)
+        self.assertFalse(cfg.ensure_install_id())
+        self.assertEqual(cfg.install_id, first)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "cli.json"
+            path.write_text(json.dumps({"install_id": "  kept-id  "}), encoding="utf-8")
+            loaded = Config.load(path)
+        self.assertEqual(loaded.install_id, "kept-id")
+        self.assertFalse(loaded.ensure_install_id())
+        self.assertEqual(loaded.install_id, "kept-id")
 
 
 if __name__ == "__main__":

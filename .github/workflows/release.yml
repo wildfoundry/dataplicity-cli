@@ -24,6 +24,14 @@ jobs:
             macos_arch: universal2
           - name: windows-x64
             os: windows-latest
+          - name: linux-x86_64
+            os: ubuntu-22.04
+            deb_arch: amd64
+            rpm_arch: x86_64
+          - name: linux-aarch64
+            os: ubuntu-22.04-arm
+            deb_arch: arm64
+            rpm_arch: aarch64
 
     steps:
       - uses: actions/checkout@v4
@@ -59,6 +67,24 @@ jobs:
       - name: Build standalone binary (Windows)
         if: runner.os == 'Windows'
         run: pyinstaller --noconfirm --clean --onefile --name dataplicity --workpath pyinstaller-build --distpath pyinstaller-dist dataplicity_cli/__main__.py
+
+      - name: Install Linux packaging tools
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes rpm ruby-dev
+          sudo gem install --no-document fpm
+
+      - name: Build standalone binary (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          pyinstaller --noconfirm --clean --onefile --name dataplicity \
+            --exclude-module websockets.speedups \
+            --workpath pyinstaller-build --distpath pyinstaller-dist \
+            dataplicity_cli/__main__.py
+          ./pyinstaller-dist/dataplicity --version
+          ./pyinstaller-dist/dataplicity --help
 
       - name: Setup .NET for Artifact Signing
         if: runner.os == 'Windows'
@@ -170,6 +196,41 @@ jobs:
             --dist-dir release `
             --output "SHA256SUMS-windows-x64.txt" `
             --file "dataplicity-cli-${env:VERSION}-windows-x64.msi"
+
+      - name: Build Linux deb, rpm, and tarball
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          chmod +x build/linux/build_packages.sh build/linux/smoke.sh scripts/linux_port_forward_smoke.sh
+          ./build/linux/build_packages.sh "${VERSION}" "${{ matrix.deb_arch }}" "${{ matrix.rpm_arch }}"
+
+      - name: Smoke Linux packages
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          VERSION: ${{ env.VERSION }}
+          DEB_ARCH: ${{ matrix.deb_arch }}
+          RPM_ARCH: ${{ matrix.rpm_arch }}
+        run: |
+          ./build/linux/smoke.sh
+          sudo apt-get install --yes "./dist/dataplicity-cli_${VERSION}_${DEB_ARCH}.deb"
+          scripts/linux_port_forward_smoke.sh /usr/bin/dataplicity
+          sudo apt-get remove --yes dataplicity-cli
+
+      - name: Stage Linux release artifacts
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          mkdir -p release
+          cp "dist/dataplicity-cli_${VERSION}_${{ matrix.deb_arch }}.deb" release/
+          cp "dist/dataplicity-cli-${VERSION}-1.${{ matrix.rpm_arch }}.rpm" release/
+          cp "dist/dataplicity-cli-${VERSION}-linux-${{ matrix.rpm_arch }}.tar.gz" release/
+          python build/generate_checksums.py \
+            --dist-dir release \
+            --output "SHA256SUMS-linux-${{ matrix.rpm_arch }}.txt" \
+            --file "dataplicity-cli_${VERSION}_${{ matrix.deb_arch }}.deb" \
+            --file "dataplicity-cli-${VERSION}-1.${{ matrix.rpm_arch }}.rpm" \
+            --file "dataplicity-cli-${VERSION}-linux-${{ matrix.rpm_arch }}.tar.gz"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4

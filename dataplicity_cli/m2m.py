@@ -5,6 +5,8 @@ from typing import Any, Dict, List, Optional
 
 import websockets
 
+from .client_identity import identity_headers
+
 
 class BencodeError(ValueError):
     pass
@@ -137,8 +139,9 @@ PACKETS: Dict[str, int] = {
 
 
 class M2MClient:
-    def __init__(self, url: str) -> None:
+    def __init__(self, url: str, extra_headers: Optional[Dict[str, str]] = None) -> None:
         self.url = url
+        self.extra_headers = extra_headers if extra_headers is not None else identity_headers()
         self.ws: Optional[websockets.WebSocketClientProtocol] = None
         self.identity: Optional[str] = None
 
@@ -149,7 +152,7 @@ class M2MClient:
         self._channel_queues: Dict[int, asyncio.Queue[Optional[bytes]]] = {}
 
     async def connect(self) -> None:
-        self.ws = await websockets.connect(self.url)
+        self.ws = await websockets.connect(self.url, additional_headers=self.extra_headers)
         self._recv_task = asyncio.create_task(self._receiver())
 
     async def close(self) -> None:

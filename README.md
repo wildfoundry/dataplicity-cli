@@ -43,6 +43,32 @@ WinGet is unavailable, download the latest signed `.msi` from
 Both install paths add `dataplicity.exe` to `PATH`; open a new terminal after
 installation.
 
+### Linux (no Python required)
+
+Download the `.deb`, `.rpm`, or `.tar.gz` matching your CPU from
+[GitHub Releases](https://github.com/wildfoundry/dataplicity-cli/releases).
+Debian/Ubuntu use the `.deb`; Fedora, RHEL, and openSUSE use the `.rpm`. Other
+distributions can unpack the tarball. Checksums are published next to each
+artifact as `SHA256SUMS-linux-x86_64.txt` or `SHA256SUMS-linux-aarch64.txt`.
+
+```sh
+# Debian / Ubuntu
+sudo apt install ./dataplicity-cli_<version>_amd64.deb
+
+# Fedora / RHEL / openSUSE
+sudo dnf install ./dataplicity-cli-<version>-1.x86_64.rpm
+
+# Other Linux
+tar -xzf dataplicity-cli-<version>-linux-x86_64.tar.gz
+sudo install -m 0755 dataplicity-cli-<version>-linux-x86_64/dataplicity /usr/local/bin/dataplicity
+
+dataplicity --help
+```
+
+Use the `arm64` / `aarch64` artifacts on ARM workstations. The packages install
+`dataplicity` into `/usr/bin`. See [`docs/linux-release.md`](docs/linux-release.md)
+for the supported distro and glibc range.
+
 ### Python (developer install)
 
 If you do have Python available and prefer `pipx`:
@@ -226,3 +252,5 @@ dataplicity --install-completion zsh
 - Configure a repository secret named `WINGET_TOKEN` (classic PAT with `public_repo`) and ensure your account has a fork of `microsoft/winget-pkgs`.
 - WinGet automation updates existing manifests; if this package is not yet in WinGet, submit the first manifest for the current release, then subsequent releases are automated.
 - Follow [`docs/windows-release.md`](docs/windows-release.md) before tagging a Windows release or submitting its first WinGet manifest.
+- Releases publish Linux `.deb`, `.rpm`, and `.tar.gz` artifacts for x86_64 and aarch64, plus `SHA256SUMS-linux-*.txt`.
+- Follow [`docs/linux-release.md`](docs/linux-release.md) before tagging a Linux release.

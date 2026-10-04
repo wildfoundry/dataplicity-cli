@@ -6,6 +6,7 @@ from typing import Any, Callable, Dict, Optional, Tuple
 import requests
 
 from .config import Config
+from .client_identity import identity_headers
 
 
 @dataclass
@@ -20,6 +21,7 @@ class ApiClient:
     def __init__(self, config: Config, on_token_update: Optional[Callable[[], None]] = None) -> None:
         self.config = config
         self.session = requests.Session()
+        self.session.headers.update(identity_headers(self.config.install_id))
         self._on_token_update = on_token_update
 
     def _build_url(self, path: str) -> str:
@@ -131,7 +133,11 @@ class ApiClient:
         allow_refresh: bool = True,
     ) -> ApiResponse:
         url = self._build_url(path)
-        req_headers = {"Accept": "application/json", **self._auth_headers()}
+        req_headers = {
+            **identity_headers(self.config.install_id),
+            "Accept": "application/json",
+            **self._auth_headers(),
+        }
         if headers:
             req_headers.update(headers)
         try:

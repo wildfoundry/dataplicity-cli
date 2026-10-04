@@ -6,6 +6,7 @@ from unittest.mock import Mock
 import requests
 
 from dataplicity_cli.api import ApiClient, ApiResponse
+from dataplicity_cli.client_identity import identity_headers
 from dataplicity_cli.config import Config
 
 
@@ -146,6 +147,22 @@ class ApiClientFullTest(unittest.TestCase):
         called_headers = client.session.request.call_args.kwargs["headers"]
         self.assertEqual(called_headers["Accept"], "application/json")
         self.assertEqual(called_headers["X-Test"], "1")
+        expected = identity_headers()
+        self.assertEqual(called_headers["User-Agent"], expected["User-Agent"])
+        self.assertEqual(called_headers["X-Client-App"], expected["X-Client-App"])
+        self.assertEqual(called_headers["X-Client-Platform"], expected["X-Client-Platform"])
+        self.assertEqual(called_headers["X-Client-Version"], expected["X-Client-Version"])
+
+    def test_session_and_requests_include_install_id(self) -> None:
+        cfg = Config(base_url="https://example.test", install_id="install-id-1234")
+        client = ApiClient(cfg)
+        self.assertEqual(client.session.headers["X-Install-Id"], "install-id-1234")
+        self.assertEqual(client.session.headers["X-Client-App"], "dataplicity-cli")
+        response = _FakeResponse(200, {"ok": True}, text='{"ok":true}')
+        client.session.request = Mock(return_value=response)
+        client.get("/x")
+        called_headers = client.session.request.call_args.kwargs["headers"]
+        self.assertEqual(called_headers["X-Install-Id"], "install-id-1234")
 
 
 if __name__ == "__main__":
