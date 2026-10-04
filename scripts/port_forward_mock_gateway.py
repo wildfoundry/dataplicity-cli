@@ -7,6 +7,7 @@ import argparse
 import asyncio
 import json
 import sys
+from contextlib import suppress
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 from urllib.parse import urlparse
@@ -81,11 +82,8 @@ class PortForwardMockGateway:
         except (ConnectionError, asyncio.IncompleteReadError, websockets.ConnectionClosed):
             return
         finally:
-            try:
+            with suppress(Exception):
                 await self._send_packet("notify_close", [channel])
-            except Exception:
-                # Best-effort close notify; the websocket may already be gone.
-                pass
 
     async def handle_m2m(self, websocket: Any) -> None:
         self.websocket = websocket
@@ -120,8 +118,7 @@ class PortForwardMockGateway:
                         streams[1].close()
                     await self._send_packet("notify_close", [channel])
         except websockets.ConnectionClosed:
-            # CLI disconnected; remaining cleanup happens in finally.
-            pass
+            pass  # CLI disconnected; remaining cleanup happens in finally.
         finally:
             self.websocket = None
             for _channel, streams in list(self.channels.items()):
@@ -275,8 +272,5 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    try:
+    with suppress(KeyboardInterrupt):
         asyncio.run(main())
-    except KeyboardInterrupt:
-        # Ctrl-C is a clean shutdown for the smoke mock.
-        pass

@@ -1348,10 +1348,8 @@ def main(
     path = config_path or default_config_path()
     config = Config.load(path)
     if config.ensure_install_id():
-        try:
+        with suppress(OSError):
             config.save(path)
-        except OSError:
-            pass
     if base_url:
         config.base_url = base_url.rstrip("/")
     console = Console()
