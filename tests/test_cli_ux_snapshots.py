@@ -142,6 +142,7 @@ class CliUxSnapshotsTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = Path(temp_dir) / "cli.json"
             result = self._invoke(["--json", "--config", str(config_path), "whoami"])
+            saved = json.loads(config_path.read_text(encoding="utf-8"))
         self.assertEqual(result.exit_code, 2, msg=result.output)
         payload = json.loads(result.output)
         self.assertEqual(payload.get("ok"), False)
@@ -149,6 +150,7 @@ class CliUxSnapshotsTest(unittest.TestCase):
             payload.get("detail"),
             "Authentication required. Use `dataplicity auth sso`, `dataplicity auth login`, or `dataplicity auth api-key`.",
         )
+        self.assertTrue(saved.get("install_id"))
 
     def test_logging_default_scope_snapshot_json(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

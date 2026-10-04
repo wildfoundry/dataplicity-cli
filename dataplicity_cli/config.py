@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -44,6 +45,7 @@ class Config:
     api_key: Optional[str] = None
     last_email: Optional[str] = None
     preferred_login_method: Optional[str] = None  # "email-password" | "sso" | "api-key"
+    install_id: Optional[str] = None
 
     @classmethod
     def load(cls, path: Path) -> "Config":
@@ -65,6 +67,7 @@ class Config:
             api_key=raw.get("api_key"),
             last_email=raw.get("last_email"),
             preferred_login_method=raw.get("preferred_login_method"),
+            install_id=(str(raw.get("install_id") or "").strip() or None),
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -76,6 +79,7 @@ class Config:
             "api_key": self.api_key,
             "last_email": self.last_email,
             "preferred_login_method": self.preferred_login_method,
+            "install_id": self.install_id,
         }
 
     def save(self, path: Path) -> None:
@@ -97,3 +101,11 @@ class Config:
         self.api_key = None
         if self.auth_method == "api_key":
             self.auth_method = None
+
+    def ensure_install_id(self) -> bool:
+        current = (self.install_id or "").strip()
+        if current:
+            self.install_id = current
+            return False
+        self.install_id = str(uuid.uuid4())
+        return True

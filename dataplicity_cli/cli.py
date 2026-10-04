@@ -29,6 +29,7 @@ from rich.table import Table
 
 from . import __version__
 from .api import ApiClient, ApiResponse
+from .client_identity import identity_headers
 from .config import Config, default_config_path
 from .m2m import M2MClient
 
@@ -90,6 +91,10 @@ def _ctx(ctx: typer.Context) -> AppContext:
     if not ctx.obj:
         raise typer.Exit(code=1)
     return ctx.obj
+
+
+def _m2m_client(state: AppContext, ws_url: str) -> M2MClient:
+    return M2MClient(ws_url, extra_headers=identity_headers(state.config.install_id))
 
 
 def _embedded_shell_command_tree() -> Dict[str, List[str]]:
@@ -1342,6 +1347,11 @@ def main(
     _ = version
     path = config_path or default_config_path()
     config = Config.load(path)
+    if config.ensure_install_id():
+        try:
+            config.save(path)
+        except OSError:
+            pass
     if base_url:
         config.base_url = base_url.rstrip("/")
     console = Console()
@@ -1509,6 +1519,18 @@ def doctor(ctx: typer.Context) -> None:
             "name": "auth_configured",
             "ok": auth_configured,
             "detail": state.config.auth_method or "none",
+        }
+    )
+
+    identity = identity_headers(state.config.install_id)
+    checks.append(
+        {
+            "name": "client_identity",
+            "ok": True,
+            "detail": (
+                f"{identity['X-Client-App']} {identity['X-Client-Version']} "
+                f"{identity['X-Client-Platform']}"
+            ),
         }
     )
 
@@ -2737,7 +2759,7 @@ def devices_terminal(ctx: typer.Context, device_hash: Optional[str] = typer.Argu
         from .remote_access import run_terminal_session
 
         ws_url = await _resolve_m2m_url(state, resolved_hash)
-        m2m = M2MClient(ws_url)
+        m2m = _m2m_client(state, ws_url)
         await m2m.connect()
         identity = await m2m.wait_for_identity()
         response = _open_remote_access_port(
@@ -2814,7 +2836,7 @@ def devices_port_forward(
             all_ports_allowed=all_ports_allowed,
         )
         ws_url = await _resolve_m2m_url(state, resolved_hash)
-        m2m = M2MClient(ws_url)
+        m2m = _m2m_client(state, ws_url)
         await m2m.connect()
         try:
             identity = await m2m.wait_for_identity()
@@ -2947,7 +2969,7 @@ def devices_ssh(
             resolved_hash,
             request_timeout=connect_timeout,
         )
-        m2m = M2MClient(ws_url)
+        m2m = _m2m_client(state, ws_url)
         await asyncio.wait_for(m2m.connect(), timeout=float(connect_timeout))
         forward_task: Optional[asyncio.Task] = None
         listener_ready = asyncio.Event()
@@ -3064,7 +3086,7 @@ def devices_remote_file(
         from .remote_access import run_remote_file
 
         ws_url = await _resolve_m2m_url(state, resolved_hash)
-        m2m = M2MClient(ws_url)
+        m2m = _m2m_client(state, ws_url)
         await m2m.connect()
         identity = await m2m.wait_for_identity()
         response = _open_remote_access_port(
@@ -3159,7 +3181,7 @@ def devices_run(
             resolved_hash,
             request_timeout=connect_timeout,
         )
-        m2m = M2MClient(ws_url)
+        m2m = _m2m_client(state, ws_url)
         try:
             await asyncio.wait_for(m2m.connect(), timeout=float(connect_timeout))
         except asyncio.TimeoutError as exc:
