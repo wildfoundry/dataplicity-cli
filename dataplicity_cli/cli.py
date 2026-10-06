@@ -805,7 +805,8 @@ def _friendly_response_message(default_message: str, response_data: Any, respons
         if detail is None:
             detail = _first_text(response_data.get("non_field_errors"))
         if detail is None:
-            detail = _first_text(response_data.get("mfa_code") or response_data.get("mfa_type"))
+            # Surface MFA field errors without copying secret-named values into logs/stdout.
+            detail = _first_text(response_data.get("mfa_type"))
     message = detail or response_text or default_message
     if _looks_like_invalid_auth_message(message):
         return "Saved login appears expired or invalid. Run `dataplicity setup` to sign in again."
