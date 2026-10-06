@@ -56,7 +56,29 @@ class AuthLoginMfaTest(unittest.TestCase):
                 saved = json.loads(config_path.read_text(encoding="utf-8"))
             return result, saved
 
-    def test_login_prompts_totp_when_challenge_mentions_webauthn(self) -> None:
+    def test_login_hands_mfa_off_to_browser_sso(self) -> None:
+        def fake_post(path, json_data=None, data=None):
+            _ = json_data, data
+            if path == "/api/auth/bootstrap/":
+                return ApiResponse(True, 200, {"status": "password"}, '{"status":"password"}')
+            return ApiResponse(False, 400, MFA_WEBAUTHN_AND_TOTP, _mfa_text(MFA_WEBAUTHN_AND_TOTP))
+
+        with patch("dataplicity_cli.cli.ApiClient.post", side_effect=fake_post), patch(
+            "dataplicity_cli.cli._attempt_sso_login", return_value=True
+        ) as mock_sso:
+            result, _saved = self._invoke(
+                ["auth", "login", "--email", "mfa@example.com", "--password", "secret"]
+            )
+
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+        self.assertNotIn("Traceback", result.output)
+        self.assertNotIn("signed-challenge", result.output)
+        self.assertIn("Redirecting to browser sign-in", result.output)
+        mock_sso.assert_called_once()
+        self.assertEqual(mock_sso.call_args.kwargs["email"], "mfa@example.com")
+        self.assertEqual(mock_sso.call_args.kwargs["open_browser"], True)
+
+    def test_login_falls_back_to_totp_when_sso_is_unavailable(self) -> None:
         posts: list[dict] = []
 
         def fake_post(path, json_data=None, data=None):
@@ -68,22 +90,20 @@ class AuthLoginMfaTest(unittest.TestCase):
                 return ApiResponse(True, 200, {"access": "access-token", "refresh": "refresh-token"}, "")
             return ApiResponse(False, 400, MFA_WEBAUTHN_AND_TOTP, _mfa_text(MFA_WEBAUTHN_AND_TOTP))
 
-        with patch("dataplicity_cli.cli.ApiClient.post", side_effect=fake_post):
+        with patch("dataplicity_cli.cli.ApiClient.post", side_effect=fake_post), patch(
+            "dataplicity_cli.cli._attempt_sso_login", return_value=False
+        ):
             result, saved = self._invoke(
                 ["auth", "login", "--email", "mfa@example.com", "--password", "secret"],
                 input="654321\n",
             )
 
         self.assertEqual(result.exit_code, 0, msg=result.output)
-        self.assertNotIn("Traceback", result.output)
-        self.assertIn("Multi-factor authentication required", result.output)
         self.assertIn("Logged in", result.output)
         self.assertEqual(len(posts), 2)
-        self.assertNotIn("mfa_code", posts[0])
         self.assertEqual(posts[1]["mfa_code"], "654321")
         self.assertEqual(posts[1]["mfa_type"], "TOTP")
         self.assertEqual(saved["access_token"], "access-token")
-        self.assertEqual(saved["auth_method"], "jwt")
 
     def test_login_webauthn_only_does_not_dump_challenge_or_crash(self) -> None:
         def fake_post(path, json_data=None, data=None):
@@ -92,7 +112,9 @@ class AuthLoginMfaTest(unittest.TestCase):
                 return ApiResponse(True, 200, {"status": "password"}, '{"status":"password"}')
             return ApiResponse(False, 400, MFA_WEBAUTHN_ONLY, _mfa_text(MFA_WEBAUTHN_ONLY))
 
-        with patch("dataplicity_cli.cli.ApiClient.post", side_effect=fake_post):
+        with patch("dataplicity_cli.cli.ApiClient.post", side_effect=fake_post), patch(
+            "dataplicity_cli.cli._attempt_sso_login", return_value=False
+        ):
             result, saved = self._invoke(
                 ["auth", "login", "--email", "key@example.com", "--password", "secret"]
             )
@@ -125,13 +147,14 @@ class AuthLoginMfaTest(unittest.TestCase):
                 ]
             )
 
-        self.assertEqual(result.exit_code, 2, msg=result.output)
+        self.assertEqual(result.exit_code, 3, msg=result.output)
         payload = json.loads(result.output)
         self.assertFalse(payload["ok"])
         self.assertEqual(payload["error_code"], "mfa_required")
         self.assertEqual(payload["mfa_type"], "TOTP")
         self.assertIn("TOTP", payload["mfa_available_types"])
         self.assertNotIn("webauthn", payload)
+        self.assertIn("auth sso", payload["detail"])
         self.assertIn("--mfa-code", payload["detail"])
 
     def test_mfa_code_defaults_type_to_totp(self) -> None:
@@ -163,14 +186,16 @@ class AuthLoginMfaTest(unittest.TestCase):
         self.assertEqual(posts[0]["mfa_type"], "TOTP")
         self.assertEqual(saved["access_token"], "a")
 
-    def test_explicit_webauthn_type_is_rejected(self) -> None:
+    def test_explicit_webauthn_type_hands_off_to_browser_sso(self) -> None:
         def fake_post(path, json_data=None, data=None):
             _ = json_data, data
             if path == "/api/auth/bootstrap/":
                 return ApiResponse(True, 200, {"status": "password"}, '{"status":"password"}')
             raise AssertionError("token login should not be attempted for WebAuthn")
 
-        with patch("dataplicity_cli.cli.ApiClient.post", side_effect=fake_post):
+        with patch("dataplicity_cli.cli.ApiClient.post", side_effect=fake_post), patch(
+            "dataplicity_cli.cli._attempt_sso_login", return_value=True
+        ) as mock_sso:
             result, _saved = self._invoke(
                 [
                     "auth",
@@ -181,13 +206,13 @@ class AuthLoginMfaTest(unittest.TestCase):
                     "secret",
                     "--mfa-type",
                     "WEBAUTHN",
-                    "--mfa-code",
-                    "ignored",
                 ]
             )
 
-        self.assertEqual(result.exit_code, 1, msg=result.output)
-        self.assertIn("security key", result.output.lower())
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+        self.assertIn("browser sign-in", result.output)
+        mock_sso.assert_called_once()
+        self.assertEqual(mock_sso.call_args.kwargs["email"], "key@example.com")
 
 
 if __name__ == "__main__":

@@ -1729,6 +1729,98 @@ def config_show(ctx: typer.Context) -> None:
     state.console.print(table)
 
 
+def _attempt_sso_login(
+    ctx: typer.Context,
+    email: str,
+    *,
+    open_browser: bool = True,
+    timeout: int = 180,
+) -> bool:
+    """Complete browser SSO when the account supports it.
+
+    Returns False if SSO is not enabled so callers can fall back. Other
+    failures raise ``typer.Exit`` after printing an error.
+    """
+    state = _ctx(ctx)
+    timeout_seconds = _coerce_timeout_seconds(timeout)
+    listener: Optional[_SsoCallbackListener] = None
+    bootstrap_payload: Dict[str, Any] = {"email": email}
+    if open_browser:
+        listener = _SsoCallbackListener()
+        if listener.start() and listener.callback_url:
+            bootstrap_payload["callback_url"] = listener.callback_url
+            if not state.json_output:
+                state.console.print(f"Listening for SSO callback on [blue]{listener.callback_url}[/blue]")
+        else:
+            listener = None
+
+    response = state.api.post("/api/auth/bootstrap/", json_data=bootstrap_payload)
+    if not response.ok:
+        if listener:
+            listener.stop()
+        message = _friendly_response_message("Unable to start SSO.", response.data, response.text)
+        _fail_login(state, message)
+
+    if not isinstance(response.data, dict) or response.data.get("status") != "sso_redirect":
+        if listener:
+            listener.stop()
+        return False
+
+    redirect_url = response.data.get("redirect_url")
+    if not redirect_url:
+        if listener:
+            listener.stop()
+        _fail_login(state, "SSO redirect URL missing.")
+
+    try:
+        if open_browser:
+            webbrowser.open(redirect_url)
+        if not state.json_output:
+            state.console.print("Waiting for browser sign-in to complete...")
+        if _attempt_sso_auto_complete(state, listener, timeout_seconds=timeout_seconds):
+            state.config.last_email = email
+            state.config.preferred_login_method = "sso"
+            state.config.save(state.config_path)
+            if state.json_output:
+                _print_json({"ok": True, "detail": "SSO login complete"})
+            else:
+                state.console.print("[green]SSO login complete.[/green]")
+            return True
+    finally:
+        if listener:
+            listener.stop()
+
+    sso_complete_url = state.api._build_url("/api/auth/sso/complete/")
+    if state.json_output:
+        _print_json(
+            {
+                "ok": False,
+                "detail": "Automatic SSO completion timed out. Complete sign-in in your browser and run `dataplicity auth sso` again.",
+                "sso_complete_url": sso_complete_url,
+            }
+        )
+        raise typer.Exit(code=2)
+
+    state.console.print("[yellow]Automatic callback did not complete in time.[/yellow]")
+    state.console.print("Complete SSO in your browser, then open:")
+    state.console.print(f"[blue]{sso_complete_url}[/blue]")
+    state.console.print("Paste either the final browser URL, query string, or JSON payload below.")
+
+    raw = typer.prompt("SSO response")
+    payload = _parse_sso_user_artifact(raw)
+    if payload is None:
+        _show_error(state.console, "Could not parse SSO response.")
+        raise typer.Exit(code=1)
+    if not _apply_tokens_or_none(state, payload):
+        _show_error(state.console, "No access token found in payload.")
+        raise typer.Exit(code=1)
+    state.config.last_email = email
+    state.config.preferred_login_method = "sso"
+    state.config.save(state.config_path)
+    state.console.print("[green]SSO login complete.[/green]")
+    return True
+
+
 @auth_app.command("login")
 def auth_login(
     ctx: typer.Context,
@@ -1762,6 +1854,18 @@ def auth_login(
 
     requested_mfa_type = (mfa_type or "").strip().upper()
     if requested_mfa_type == "WEBAUTHN":
+        if state.json_output:
+            _fail_login(
+                state,
+                "Security keys are not supported in the CLI. Use `dataplicity auth sso --email ...`.",
+                extra={"error_code": "unsupported_mfa_type"},
+            )
+        state.console.print(
+            "[yellow]Security key (WebAuthn) verification is completed in the browser.[/yellow] "
+            "Redirecting to browser sign-in..."
+        )
+        if _attempt_sso_login(ctx, email=email, open_browser=True):
+            return
         _fail_login(state, _webauthn_unsupported_message(), extra={"error_code": "unsupported_mfa_type"})
 
     payload = _password_login_payload(email, password, mfa_code=mfa_code, mfa_type=mfa_type)
@@ -1770,35 +1874,32 @@ def auth_login(
         mfa = _extract_mfa_payload(response.data)
         available = _mfa_available_types(mfa)
         chosen = _cli_mfa_type(payload.get("mfa_type") or mfa_type, available)
-        if chosen == "WEBAUTHN" and "TOTP" not in available:
-            _fail_login(
-                state,
-                _webauthn_unsupported_message(),
-                extra={"error_code": "mfa_required", "mfa_type": chosen, "mfa_available_types": available},
-            )
-        chosen = "TOTP" if "TOTP" in available else chosen
+        extra = {"error_code": "mfa_required", "mfa_type": chosen, "mfa_available_types": available}
         if payload.get("mfa_code") and payload.get("mfa_type"):
             message = _friendly_response_message(
-                "Multi-factor authentication required. Pass `--mfa-code` and `--mfa-type TOTP`.",
+                "Multi-factor authentication required. Use `dataplicity auth sso --email ...` or pass `--mfa-code`.",
                 response.data,
                 response.text,
             )
-            _fail_login(
-                state,
-                message,
-                extra={"error_code": "mfa_required", "mfa_type": chosen, "mfa_available_types": available},
-            )
+            _fail_login(state, message, extra=extra)
         if state.json_output:
             _fail_login(
                 state,
-                "Multi-factor authentication required. Pass `--mfa-code` and `--mfa-type TOTP`.",
-                extra={"error_code": "mfa_required", "mfa_type": chosen, "mfa_available_types": available},
-                code=2,
+                "Multi-factor authentication required. Use `dataplicity auth sso --email ...` or pass `--mfa-code`.",
+                extra=extra,
+                code=3,
             )
-        state.console.print("[yellow]Multi-factor authentication required.[/yellow]")
-        mfa_code = typer.prompt("Authenticator app code")
-        payload = _password_login_payload(email, password, mfa_code=mfa_code, mfa_type=chosen)
-        response = state.api.post("/api/token/", json_data=payload)
+        state.console.print(
+            "[yellow]Multi-factor authentication required.[/yellow] Redirecting to browser sign-in..."
+        )
+        if _attempt_sso_login(ctx, email=email, open_browser=True):
+            return
+        if "TOTP" in available:
+            mfa_code = typer.prompt("Authenticator app code")
+            payload = _password_login_payload(email, password, mfa_code=mfa_code, mfa_type="TOTP")
+            response = state.api.post("/api/token/", json_data=payload)
+        else:
+            _fail_login(state, _webauthn_unsupported_message(), extra=extra)
 
     if not response.ok:
         message = _friendly_response_message(
@@ -1806,11 +1907,11 @@ def auth_login(
             response.data,
             response.text,
         )
-        extra: Optional[Dict[str, Any]] = None
+        login_extra: Optional[Dict[str, Any]] = None
         error_code = _extract_error_code(response.data)
         if error_code:
-            extra = {"error_code": error_code}
-        _fail_login(state, message, extra=extra)
+            login_extra = {"error_code": error_code}
+        _fail_login(state, message, extra=login_extra)
 
     access = None
     refresh = None
@@ -1848,96 +1949,14 @@ def auth_sso(
     """
     state = _ctx(ctx)
     email = _resolve_email_for_auth(state, provided_email=email)
-    timeout_seconds = _coerce_timeout_seconds(timeout)
-    listener: Optional[_SsoCallbackListener] = None
-    bootstrap_payload = {"email": email}
-    if open_browser:
-        listener = _SsoCallbackListener()
-        if listener.start() and listener.callback_url:
-            bootstrap_payload["callback_url"] = listener.callback_url
-            if not state.json_output:
-                state.console.print(f"Listening for SSO callback on [blue]{listener.callback_url}[/blue]")
-        else:
-            listener = None
-
-    response = state.api.post("/api/auth/bootstrap/", json_data=bootstrap_payload)
-    if not response.ok:
-        if listener:
-            listener.stop()
-        message = _friendly_response_message("Unable to start SSO.", response.data, response.text)
-        if state.json_output:
-            _print_json({"ok": False, "detail": message})
-        else:
-            _show_error(state.console, message)
-        raise typer.Exit(code=1)
-
-    if not isinstance(response.data, dict) or response.data.get("status") != "sso_redirect":
-        if listener:
-            listener.stop()
-        message = "SSO is not enabled for this account."
-        if state.json_output:
-            _print_json({"ok": False, "detail": message})
-        else:
-            _show_error(state.console, message)
-        raise typer.Exit(code=2)
-
-    redirect_url = response.data.get("redirect_url")
-    if not redirect_url:
-        if listener:
-            listener.stop()
-        message = "SSO redirect URL missing."
-        if state.json_output:
-            _print_json({"ok": False, "detail": message})
-        else:
-            _show_error(state.console, message)
-        raise typer.Exit(code=1)
-
-    try:
-        if open_browser:
-            webbrowser.open(redirect_url)
-        if not state.json_output:
-            state.console.print("Waiting for browser sign-in to complete...")
-        if _attempt_sso_auto_complete(state, listener, timeout_seconds=timeout_seconds):
-            state.config.last_email = email
-            state.config.preferred_login_method = "sso"
-            state.config.save(state.config_path)
-            if state.json_output:
-                _print_json({"ok": True, "detail": "SSO login complete"})
-            else:
-                state.console.print("[green]SSO login complete.[/green]")
-            return
-    finally:
-        if listener:
-            listener.stop()
-
-    sso_complete_url = state.api._build_url("/api/auth/sso/complete/")
+    if _attempt_sso_login(ctx, email, open_browser=open_browser, timeout=timeout):
+        return
+    message = "SSO is not enabled for this account."
     if state.json_output:
-        _print_json(
-            {
-                "ok": False,
-                "detail": "Automatic SSO completion timed out. Complete sign-in in your browser and run `dataplicity auth sso` again.",
-                "sso_complete_url": sso_complete_url,
-            }
-        )
-        raise typer.Exit(code=2)
-
-    state.console.print("[yellow]Automatic callback did not complete in time.[/yellow]")
-    state.console.print("Complete SSO in your browser, then open:")
-    state.console.print(f"[blue]{sso_complete_url}[/blue]")
-    state.console.print("Paste either the final browser URL, query string, or JSON payload below.")
-
-    raw = typer.prompt("SSO response")
-    payload = _parse_sso_user_artifact(raw)
-    if payload is None:
-        _show_error(state.console, "Could not parse SSO response.")
-        raise typer.Exit(code=1)
-    if not _apply_tokens_or_none(state, payload):
-        _show_error(state.console, "No access token found in payload.")
-        raise typer.Exit(code=1)
-    state.config.last_email = email
-    state.config.preferred_login_method = "sso"
-    state.config.save(state.config_path)
-    state.console.print("[green]SSO login complete.[/green]")
+        _print_json({"ok": False, "detail": message})
+    else:
+        _show_error(state.console, message)
+    raise typer.Exit(code=2)
 
 
 @auth_app.command("api-key")
