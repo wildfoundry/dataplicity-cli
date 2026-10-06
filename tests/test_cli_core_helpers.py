@@ -35,6 +35,8 @@ class CliCoreHelpersTest(unittest.TestCase):
         payload = {
             "safe": "ok",
             "token": "secret",
+            "password": "hide-password",
+            "mfa_code": "123456",
             "nested": {"api_key": "hide", "keep": 1},
             "list": [{"refresh": "hide"}, {"value": 2}],
         }

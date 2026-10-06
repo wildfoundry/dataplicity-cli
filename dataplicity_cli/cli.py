@@ -220,6 +220,10 @@ SENSITIVE_KEYS = {
     "apiKey",
     "token",
     "secret",
+    "password",
+    "mfa_code",
+    "mfa_token",
+    "mfa_credential",
     "private_key",
     "provisioning_key",
 }
