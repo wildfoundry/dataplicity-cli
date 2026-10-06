@@ -1,0 +1,194 @@
+from __future__ import annotations
+
+import json
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from typer.testing import CliRunner
+
+from dataplicity_cli.api import ApiResponse
+from dataplicity_cli.cli import app
+
+
+MFA_WEBAUTHN_AND_TOTP = {
+    "detail": ["Multi-factor authentication required."],
+    "error_code": ["mfa_required"],
+    "mfa": {
+        "type": "WEBAUTHN",
+        "available_types": ["TOTP", "WEBAUTHN"],
+        "webauthn": {
+            "token": "signed-challenge",
+            "options": {"allowCredentials": [{"type": "public-key", "id": "abc"}]},
+        },
+    },
+}
+
+MFA_WEBAUTHN_ONLY = {
+    "detail": ["Multi-factor authentication required."],
+    "error_code": ["mfa_required"],
+    "mfa": {
+        "type": "WEBAUTHN",
+        "available_types": ["WEBAUTHN"],
+        "webauthn": {
+            "token": "signed-challenge",
+            "options": {"allowCredentials": [{"type": "public-key", "id": "abc"}]},
+        },
+    },
+}
+
+
+def _mfa_text(payload: dict) -> str:
+    return json.dumps(payload, separators=(",", ":"))
+
+
+class AuthLoginMfaTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.runner = CliRunner()
+
+    def _invoke(self, args: list[str], **kwargs):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "cli.json"
+            result = self.runner.invoke(app, ["--config", str(config_path), *args], **kwargs)
+            saved = None
+            if config_path.exists():
+                saved = json.loads(config_path.read_text(encoding="utf-8"))
+            return result, saved
+
+    def test_login_prompts_totp_when_challenge_mentions_webauthn(self) -> None:
+        posts: list[dict] = []
+
+        def fake_post(path, json_data=None, data=None):
+            _ = data
+            if path == "/api/auth/bootstrap/":
+                return ApiResponse(True, 200, {"status": "password"}, '{"status":"password"}')
+            posts.append(json_data or {})
+            if json_data and json_data.get("mfa_code") == "654321" and json_data.get("mfa_type") == "TOTP":
+                return ApiResponse(True, 200, {"access": "access-token", "refresh": "refresh-token"}, "")
+            return ApiResponse(False, 400, MFA_WEBAUTHN_AND_TOTP, _mfa_text(MFA_WEBAUTHN_AND_TOTP))
+
+        with patch("dataplicity_cli.cli.ApiClient.post", side_effect=fake_post):
+            result, saved = self._invoke(
+                ["auth", "login", "--email", "mfa@example.com", "--password", "secret"],
+                input="654321\n",
+            )
+
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+        self.assertNotIn("Traceback", result.output)
+        self.assertIn("Multi-factor authentication required", result.output)
+        self.assertIn("Logged in", result.output)
+        self.assertEqual(len(posts), 2)
+        self.assertNotIn("mfa_code", posts[0])
+        self.assertEqual(posts[1]["mfa_code"], "654321")
+        self.assertEqual(posts[1]["mfa_type"], "TOTP")
+        self.assertEqual(saved["access_token"], "access-token")
+        self.assertEqual(saved["auth_method"], "jwt")
+
+    def test_login_webauthn_only_does_not_dump_challenge_or_crash(self) -> None:
+        def fake_post(path, json_data=None, data=None):
+            _ = json_data, data
+            if path == "/api/auth/bootstrap/":
+                return ApiResponse(True, 200, {"status": "password"}, '{"status":"password"}')
+            return ApiResponse(False, 400, MFA_WEBAUTHN_ONLY, _mfa_text(MFA_WEBAUTHN_ONLY))
+
+        with patch("dataplicity_cli.cli.ApiClient.post", side_effect=fake_post):
+            result, saved = self._invoke(
+                ["auth", "login", "--email", "key@example.com", "--password", "secret"]
+            )
+
+        self.assertEqual(result.exit_code, 1, msg=result.output)
+        self.assertNotIn("Traceback", result.output)
+        self.assertNotIn("signed-challenge", result.output)
+        self.assertNotIn("allowCredentials", result.output)
+        self.assertIn("security key", result.output.lower())
+        self.assertIn("WebAuthn", result.output)
+        self.assertTrue(saved is None or not saved.get("access_token"))
+
+    def test_json_login_reports_mfa_required_without_webauthn_blob(self) -> None:
+        def fake_post(path, json_data=None, data=None):
+            _ = json_data, data
+            if path == "/api/auth/bootstrap/":
+                return ApiResponse(True, 200, {"status": "password"}, '{"status":"password"}')
+            return ApiResponse(False, 400, MFA_WEBAUTHN_AND_TOTP, _mfa_text(MFA_WEBAUTHN_AND_TOTP))
+
+        with patch("dataplicity_cli.cli.ApiClient.post", side_effect=fake_post):
+            result, _saved = self._invoke(
+                [
+                    "--json",
+                    "auth",
+                    "login",
+                    "--email",
+                    "mfa@example.com",
+                    "--password",
+                    "secret",
+                ]
+            )
+
+        self.assertEqual(result.exit_code, 2, msg=result.output)
+        payload = json.loads(result.output)
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["error_code"], "mfa_required")
+        self.assertEqual(payload["mfa_type"], "TOTP")
+        self.assertIn("TOTP", payload["mfa_available_types"])
+        self.assertNotIn("webauthn", payload)
+        self.assertIn("--mfa-code", payload["detail"])
+
+    def test_mfa_code_defaults_type_to_totp(self) -> None:
+        posts: list[dict] = []
+
+        def fake_post(path, json_data=None, data=None):
+            _ = data
+            if path == "/api/auth/bootstrap/":
+                return ApiResponse(True, 200, {"status": "password"}, '{"status":"password"}')
+            posts.append(json_data or {})
+            return ApiResponse(True, 200, {"access": "a", "refresh": "r"}, "")
+
+        with patch("dataplicity_cli.cli.ApiClient.post", side_effect=fake_post):
+            result, saved = self._invoke(
+                [
+                    "auth",
+                    "login",
+                    "--email",
+                    "mfa@example.com",
+                    "--password",
+                    "secret",
+                    "--mfa-code",
+                    "111222",
+                ]
+            )
+
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+        self.assertEqual(posts[0]["mfa_code"], "111222")
+        self.assertEqual(posts[0]["mfa_type"], "TOTP")
+        self.assertEqual(saved["access_token"], "a")
+
+    def test_explicit_webauthn_type_is_rejected(self) -> None:
+        def fake_post(path, json_data=None, data=None):
+            _ = json_data, data
+            if path == "/api/auth/bootstrap/":
+                return ApiResponse(True, 200, {"status": "password"}, '{"status":"password"}')
+            raise AssertionError("token login should not be attempted for WebAuthn")
+
+        with patch("dataplicity_cli.cli.ApiClient.post", side_effect=fake_post):
+            result, _saved = self._invoke(
+                [
+                    "auth",
+                    "login",
+                    "--email",
+                    "key@example.com",
+                    "--password",
+                    "secret",
+                    "--mfa-type",
+                    "WEBAUTHN",
+                    "--mfa-code",
+                    "ignored",
+                ]
+            )
+
+        self.assertEqual(result.exit_code, 1, msg=result.output)
+        self.assertIn("security key", result.output.lower())
+
+
+if __name__ == "__main__":
+    unittest.main()

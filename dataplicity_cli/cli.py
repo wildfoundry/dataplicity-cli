@@ -24,6 +24,7 @@ from urllib.parse import parse_qs, urlparse
 import typer
 from rich.console import Console
 from rich.live import Live
+from rich.markup import escape
 from rich.prompt import Prompt
 from rich.table import Table
 
@@ -241,7 +242,7 @@ def _print_json(data: Any) -> None:
 
 
 def _show_error(console: Console, message: str) -> None:
-    console.print(f"[red]Error:[/red] {message}")
+    console.print(f"[red]Error:[/red] {escape(str(message))}")
 
 
 def _extract_sso_tokens(payload: Any) -> Tuple[Optional[str], Optional[str]]:
@@ -560,17 +561,116 @@ def _coerce_timeout_seconds(value: Any, default: int = 180) -> int:
     return max(timeout, 1)
 
 
+def _first_text(value: Any) -> Optional[str]:
+    if isinstance(value, str):
+        text = value.strip()
+        return text or None
+    if isinstance(value, list):
+        for item in value:
+            text = _first_text(item)
+            if text:
+                return text
+    return None
+
+
+def _extract_error_code(response_data: Any) -> Optional[str]:
+    if not isinstance(response_data, dict):
+        return None
+    return _first_text(response_data.get("error_code") or response_data.get("code"))
+
+
+def _extract_mfa_payload(response_data: Any) -> Dict[str, Any]:
+    if not isinstance(response_data, dict):
+        return {}
+    mfa = response_data.get("mfa")
+    if isinstance(mfa, list) and mfa:
+        mfa = mfa[0]
+    return mfa if isinstance(mfa, dict) else {}
+
+
+def _mfa_available_types(mfa: Dict[str, Any]) -> List[str]:
+    raw = mfa.get("available_types") or []
+    if isinstance(raw, str):
+        raw = [raw]
+    types: List[str] = []
+    if isinstance(raw, list):
+        for item in raw:
+            text = _first_text(item)
+            if text:
+                normalized = text.upper()
+                if normalized not in types:
+                    types.append(normalized)
+    preferred = _first_text(mfa.get("type"))
+    if preferred:
+        preferred = preferred.upper()
+        if preferred not in types:
+            types.insert(0, preferred)
+    return types
+
+
+def _cli_mfa_type(requested: Optional[str], available: List[str]) -> str:
+    requested_type = (requested or "").strip().upper()
+    if requested_type:
+        return requested_type
+    if "TOTP" in available:
+        return "TOTP"
+    if available:
+        return available[0]
+    return "TOTP"
+
+
+def _webauthn_unsupported_message() -> str:
+    return (
+        "This account requires a security key (WebAuthn), which the CLI does not support. "
+        "Use `dataplicity auth sso`, or add an authenticator app and retry with `--mfa-code`."
+    )
+
+
+def _password_login_payload(
+    email: str,
+    password: str,
+    *,
+    mfa_code: Optional[str] = None,
+    mfa_type: Optional[str] = None,
+) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {"email": email, "password": password}
+    code = (mfa_code or "").strip()
+    method = (mfa_type or "").strip().upper()
+    if code:
+        payload["mfa_code"] = code
+        payload["mfa_type"] = method or "TOTP"
+    elif method:
+        payload["mfa_type"] = method
+    return payload
+
+
+def _fail_login(
+    state: AppContext,
+    message: str,
+    *,
+    extra: Optional[Dict[str, Any]] = None,
+    code: int = 1,
+) -> None:
+    if state.json_output:
+        payload: Dict[str, Any] = {"ok": False, "detail": message}
+        if extra:
+            payload.update(extra)
+        _print_json(payload)
+    else:
+        _show_error(state.console, message)
+    raise typer.Exit(code=code)
+
+
 def _friendly_response_message(default_message: str, response_data: Any, response_text: str) -> str:
     detail = None
     if isinstance(response_data, dict):
-        detail = response_data.get("detail") or response_data.get("error") or response_data.get("message")
-        if isinstance(detail, str) and detail.strip():
-            detail = detail.strip()
-        else:
-            detail = None
-        non_field = response_data.get("non_field_errors")
-        if detail is None and isinstance(non_field, list) and non_field:
-            detail = str(non_field[0])
+        detail = _first_text(
+            response_data.get("detail") or response_data.get("error") or response_data.get("message")
+        )
+        if detail is None:
+            detail = _first_text(response_data.get("non_field_errors"))
+        if detail is None:
+            detail = _first_text(response_data.get("mfa_code") or response_data.get("mfa_type"))
     message = detail or response_text or default_message
     if _looks_like_invalid_auth_message(message):
         return "Saved login appears expired or invalid. Run `dataplicity setup` to sign in again."
@@ -1660,20 +1760,57 @@ def auth_login(
         auth_sso(ctx, email=email, open_browser=True)
         return
 
-    payload: Dict[str, Any] = {"email": email, "password": password}
-    if mfa_code:
-        payload["mfa_code"] = mfa_code
-    if mfa_type:
-        payload["mfa_type"] = mfa_type
+    requested_mfa_type = (mfa_type or "").strip().upper()
+    if requested_mfa_type == "WEBAUTHN":
+        _fail_login(state, _webauthn_unsupported_message(), extra={"error_code": "unsupported_mfa_type"})
 
+    payload = _password_login_payload(email, password, mfa_code=mfa_code, mfa_type=mfa_type)
     response = state.api.post("/api/token/", json_data=payload)
-    if not response.ok:
-        message = _friendly_response_message("Login failed. Check your credentials and try again.", response.data, response.text)
+    if not response.ok and _extract_error_code(response.data) == "mfa_required":
+        mfa = _extract_mfa_payload(response.data)
+        available = _mfa_available_types(mfa)
+        chosen = _cli_mfa_type(payload.get("mfa_type") or mfa_type, available)
+        if chosen == "WEBAUTHN" and "TOTP" not in available:
+            _fail_login(
+                state,
+                _webauthn_unsupported_message(),
+                extra={"error_code": "mfa_required", "mfa_type": chosen, "mfa_available_types": available},
+            )
+        chosen = "TOTP" if "TOTP" in available else chosen
+        if payload.get("mfa_code") and payload.get("mfa_type"):
+            message = _friendly_response_message(
+                "Multi-factor authentication required. Pass `--mfa-code` and `--mfa-type TOTP`.",
+                response.data,
+                response.text,
+            )
+            _fail_login(
+                state,
+                message,
+                extra={"error_code": "mfa_required", "mfa_type": chosen, "mfa_available_types": available},
+            )
         if state.json_output:
-            _print_json({"ok": False, "detail": message})
-        else:
-            _show_error(state.console, message)
-        raise typer.Exit(code=1)
+            _fail_login(
+                state,
+                "Multi-factor authentication required. Pass `--mfa-code` and `--mfa-type TOTP`.",
+                extra={"error_code": "mfa_required", "mfa_type": chosen, "mfa_available_types": available},
+                code=2,
+            )
+        state.console.print("[yellow]Multi-factor authentication required.[/yellow]")
+        mfa_code = typer.prompt("Authenticator app code")
+        payload = _password_login_payload(email, password, mfa_code=mfa_code, mfa_type=chosen)
+        response = state.api.post("/api/token/", json_data=payload)
+
+    if not response.ok:
+        message = _friendly_response_message(
+            "Login failed. Check your credentials and try again.",
+            response.data,
+            response.text,
+        )
+        extra: Optional[Dict[str, Any]] = None
+        error_code = _extract_error_code(response.data)
+        if error_code:
+            extra = {"error_code": error_code}
+        _fail_login(state, message, extra=extra)
 
     access = None
     refresh = None
@@ -1681,12 +1818,7 @@ def auth_login(
         access = response.data.get("access")
         refresh = response.data.get("refresh")
     if not access:
-        message = "Login succeeded but no access token was returned."
-        if state.json_output:
-            _print_json({"ok": False, "detail": message})
-        else:
-            _show_error(state.console, message)
-        raise typer.Exit(code=1)
+        _fail_login(state, "Login succeeded but no access token was returned.")
 
     state.config.access_token = access
     state.config.refresh_token = refresh

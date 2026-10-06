@@ -5,13 +5,20 @@ import unittest
 
 from dataplicity_cli.cli import (
     LOGGING_MAX_OUTPUT_ITEMS,
+    _cli_mfa_type,
+    _extract_error_code,
     _extract_log_device,
+    _extract_mfa_payload,
     _extract_objects,
     _extract_port_forwarding_ports,
     _extract_port_numbers,
     _find_allowed_ports,
+    _first_text,
     _format_log_ts,
     _friendly_response_message,
+    _mfa_available_types,
+    _password_login_payload,
+    _show_error,
     _org_logs_params_from_developer_params,
     _parse_kv_pairs,
     _parse_log_time_expr,
@@ -40,6 +47,45 @@ class CliCoreHelpersTest(unittest.TestCase):
 
         message = _friendly_response_message("fallback", {"non_field_errors": ["bad request"]}, "")
         self.assertEqual(message, "bad request")
+
+        message = _friendly_response_message(
+            "fallback",
+            {"detail": ["Multi-factor authentication required."], "error_code": ["mfa_required"]},
+            '{"error_code":["mfa_required"],"mfa":{"type":"WEBAUTHN"}}',
+        )
+        self.assertEqual(message, "Multi-factor authentication required.")
+
+    def test_error_code_and_mfa_payload_unwrap_drf_lists(self) -> None:
+        payload = {
+            "error_code": ["mfa_required"],
+            "mfa": {
+                "type": "WEBAUTHN",
+                "available_types": ["TOTP", "WEBAUTHN"],
+                "webauthn": {"options": {"allowCredentials": [{"type": "public-key"}]}},
+            },
+        }
+        self.assertEqual(_first_text(["mfa_required"]), "mfa_required")
+        self.assertEqual(_extract_error_code(payload), "mfa_required")
+        self.assertEqual(_mfa_available_types(_extract_mfa_payload(payload)), ["TOTP", "WEBAUTHN"])
+        self.assertEqual(_cli_mfa_type(None, ["WEBAUTHN", "TOTP"]), "TOTP")
+        self.assertEqual(_cli_mfa_type("webauthn", ["WEBAUTHN"]), "WEBAUTHN")
+        self.assertEqual(
+            _password_login_payload("a@b.com", "secret", mfa_code="123456"),
+            {"email": "a@b.com", "password": "secret", "mfa_code": "123456", "mfa_type": "TOTP"},
+        )
+
+    def test_show_error_does_not_crash_on_webauthn_json(self) -> None:
+        from io import StringIO
+
+        from rich.console import Console
+
+        buf = StringIO()
+        console = Console(file=buf, force_terminal=True, width=160, color_system=None)
+        _show_error(
+            console,
+            '{"error_code":["mfa_required"],"mfa":{"type":"WEBAUTHN","available_types":["WEBAUTHN"]}}',
+        )
+        self.assertIn("WEBAUTHN", buf.getvalue())
 
     def test_extract_port_numbers_supports_int_ranges_and_dict_ranges(self) -> None:
         self.assertEqual(_extract_port_numbers(443), {443})
