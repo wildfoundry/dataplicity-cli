@@ -101,7 +101,11 @@ Login with email/password:
 
 ```
 dataplicity auth login --email you@example.com
+dataplicity auth login --email you@example.com --mfa-code 123456
 ```
+
+If the account uses MFA, pass `--mfa-code` for an authenticator app, or complete
+security-key / MFA sign-in in the browser when the CLI opens a loopback login URL.
 
 SSO login:
 

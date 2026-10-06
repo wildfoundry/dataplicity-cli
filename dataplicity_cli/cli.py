@@ -625,9 +625,140 @@ def _cli_mfa_type(requested: Optional[str], available: List[str]) -> str:
 
 def _webauthn_unsupported_message() -> str:
     return (
-        "This account requires a security key (WebAuthn), which the CLI does not support. "
-        "Use `dataplicity auth sso`, or add an authenticator app and retry with `--mfa-code`."
+        "This account requires a security key (WebAuthn), which cannot be completed in the terminal. "
+        "Complete MFA in the browser when the CLI opens a login URL, or add an authenticator app "
+        "and retry with `--mfa-code`."
     )
+
+
+def _second_factor_login_hint(*, has_totp: bool, browser_login_url: Optional[str] = None) -> str:
+    if browser_login_url:
+        return (
+            "Multi-factor authentication required. Complete sign-in in the browser, "
+            "or pass an authenticator app code with the login command."
+        )
+    if has_totp:
+        return (
+            "Multi-factor authentication required. Pass an authenticator app code with the login command, "
+            "or run `dataplicity auth login` without `--json` to complete verification in the browser."
+        )
+    return (
+        "Multi-factor authentication required. Security-key verification must be completed in the browser. "
+        "Run `dataplicity auth login` without `--json`."
+    )
+
+
+def _looks_like_cli_login_url(url: str) -> bool:
+    parsed = urlparse(url)
+    query = parse_qs(parsed.query, keep_blank_values=True)
+    return any(key in query for key in ("cli", "cli_state", "cli_callback", "cli_callback_url"))
+
+
+def _browser_login_url_from_bootstrap(data: Any) -> Optional[str]:
+    if not isinstance(data, dict):
+        return None
+    status = str(data.get("status") or "").strip()
+    url = _first_text(data.get("redirect_url") or data.get("login_url") or data.get("browser_login_url"))
+    if not url:
+        return None
+    if status in {"sso_redirect", "cli_browser_login"}:
+        return url
+    if status == "password" and _looks_like_cli_login_url(url):
+        return url
+    return None
+
+
+def _bootstrap_cli_login(
+    state: AppContext,
+    email: str,
+    *,
+    callback_url: Optional[str] = None,
+) -> ApiResponse:
+    payload: Dict[str, Any] = {"email": email}
+    if callback_url:
+        payload["callback_url"] = callback_url
+        payload["cli_callback"] = callback_url
+    return state.api.post("/api/auth/bootstrap/", json_data=payload)
+
+
+def _start_cli_callback_listener() -> Optional[_SsoCallbackListener]:
+    listener = _SsoCallbackListener()
+    if listener.start() and listener.callback_url:
+        return listener
+    listener.stop()
+    return None
+
+
+def _complete_loopback_browser_login(
+    state: AppContext,
+    *,
+    email: str,
+    redirect_url: str,
+    listener: Optional[_SsoCallbackListener],
+    timeout_seconds: int,
+    preferred_method: str,
+    success_detail: str,
+) -> bool:
+    try:
+        webbrowser.open(redirect_url)
+        if not state.json_output:
+            state.console.print("Waiting for browser sign-in to complete...")
+        if _attempt_sso_auto_complete(state, listener, timeout_seconds=timeout_seconds):
+            state.config.last_email = email
+            state.config.preferred_login_method = preferred_method
+            state.config.save(state.config_path)
+            if state.json_output:
+                _print_json({"ok": True, "detail": success_detail})
+            else:
+                state.console.print(f"[green]{success_detail}.[/green]")
+            return True
+    finally:
+        if listener:
+            listener.stop()
+    return False
+
+
+def _attempt_password_browser_login(
+    state: AppContext,
+    email: str,
+    *,
+    timeout: int = 180,
+) -> bool:
+    """Complete password+MFA in the browser when the gateway issues a CLI login URL.
+
+    Returns False when bootstrap stays ``status: password`` with no loopback login URL,
+    so callers can fall back to ``--mfa-code`` / an authenticator prompt.
+    """
+    timeout_seconds = _coerce_timeout_seconds(timeout)
+    listener = _start_cli_callback_listener()
+    callback_url = listener.callback_url if listener else None
+    response = _bootstrap_cli_login(state, email, callback_url=callback_url)
+    if not response.ok:
+        if listener:
+            listener.stop()
+        return False
+    redirect_url = _browser_login_url_from_bootstrap(response.data)
+    if not redirect_url:
+        if listener:
+            listener.stop()
+        return False
+    if not state.json_output:
+        if callback_url:
+            state.console.print(f"Listening for login callback on [blue]{callback_url}[/blue]")
+        state.console.print(
+            "[yellow]Multi-factor authentication required.[/yellow] Redirecting to browser sign-in..."
+        )
+    if _complete_loopback_browser_login(
+        state,
+        email=email,
+        redirect_url=redirect_url,
+        listener=listener,
+        timeout_seconds=timeout_seconds,
+        preferred_method="email-password",
+        success_detail="Logged in",
+    ):
+        return True
+    return False
 
 
 def _password_login_payload(
@@ -673,8 +804,7 @@ def _friendly_response_message(default_message: str, response_data: Any, respons
         )
         if detail is None:
             detail = _first_text(response_data.get("non_field_errors"))
-        if detail is None:
-            detail = _first_text(response_data.get("mfa_code") or response_data.get("mfa_type"))
+        # Do not copy credential-named field values (password, mfa_*, etc.) into stdout/logs.
     message = detail or response_text or default_message
     if _looks_like_invalid_auth_message(message):
         return "Saved login appears expired or invalid. Run `dataplicity setup` to sign in again."
@@ -1832,6 +1962,7 @@ def auth_login(
     password: Optional[str] = typer.Option(None, "--password", help="Account password"),
     mfa_code: Optional[str] = typer.Option(None, "--mfa-code"),
     mfa_type: Optional[str] = typer.Option(None, "--mfa-type"),
+    timeout: int = typer.Option(180, "--timeout", help="Seconds to wait for automatic browser callback"),
 ) -> None:
     """Sign in with email and password.
 
@@ -1859,16 +1990,16 @@ def auth_login(
     requested_mfa_type = (mfa_type or "").strip().upper()
     if requested_mfa_type == "WEBAUTHN":
         if state.json_output:
+            extra = {"error_code": "unsupported_mfa_type"}
+            browser_login_url = _browser_login_url_from_bootstrap(bootstrap.data)
+            if browser_login_url:
+                extra["browser_login_url"] = browser_login_url
             _fail_login(
                 state,
-                "Security keys are not supported in the CLI. Use `dataplicity auth sso --email ...`.",
-                extra={"error_code": "unsupported_mfa_type"},
+                _webauthn_unsupported_message(),
+                extra=extra,
             )
-        state.console.print(
-            "[yellow]Security key (WebAuthn) verification is completed in the browser.[/yellow] "
-            "Redirecting to browser sign-in..."
-        )
-        if _attempt_sso_login(ctx, email=email, open_browser=True):
+        if _attempt_password_browser_login(state, email, timeout=timeout):
             return
         _fail_login(state, _webauthn_unsupported_message(), extra={"error_code": "unsupported_mfa_type"})
 
@@ -1878,10 +2009,18 @@ def auth_login(
         mfa = _extract_mfa_payload(response.data)
         available = _mfa_available_types(mfa)
         chosen = _cli_mfa_type(payload.get("mfa_type") or mfa_type, available)
-        extra = {"error_code": "mfa_required", "mfa_type": chosen, "mfa_available_types": available}
+        has_totp = "TOTP" in available
+        extra: Dict[str, Any] = {
+            "error_code": "mfa_required",
+            "mfa_type": chosen,
+            "mfa_available_types": available,
+        }
+        browser_login_url = _browser_login_url_from_bootstrap(bootstrap.data)
+        if browser_login_url:
+            extra["browser_login_url"] = browser_login_url
         if payload.get("mfa_code") and payload.get("mfa_type"):
             message = _friendly_response_message(
-                "Multi-factor authentication required. Use `dataplicity auth sso --email ...` or pass `--mfa-code`.",
+                _second_factor_login_hint(has_totp=has_totp, browser_login_url=browser_login_url),
                 response.data,
                 response.text,
             )
@@ -1889,16 +2028,13 @@ def auth_login(
         if state.json_output:
             _fail_login(
                 state,
-                "Multi-factor authentication required. Use `dataplicity auth sso --email ...` or pass `--mfa-code`.",
+                _second_factor_login_hint(has_totp=has_totp, browser_login_url=browser_login_url),
                 extra=extra,
                 code=3,
             )
-        state.console.print(
-            "[yellow]Multi-factor authentication required.[/yellow] Redirecting to browser sign-in..."
-        )
-        if _attempt_sso_login(ctx, email=email, open_browser=True):
+        if _attempt_password_browser_login(state, email, timeout=timeout):
             return
-        if "TOTP" in available:
+        if has_totp:
             mfa_code = typer.prompt("Authenticator app code")
             payload = _password_login_payload(email, password, mfa_code=mfa_code, mfa_type="TOTP")
             response = state.api.post("/api/token/", json_data=payload)

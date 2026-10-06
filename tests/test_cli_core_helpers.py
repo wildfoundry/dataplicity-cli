@@ -57,6 +57,17 @@ class CliCoreHelpersTest(unittest.TestCase):
         )
         self.assertEqual(message, "Multi-factor authentication required.")
 
+        message = _friendly_response_message(
+            "fallback",
+            {"mfa_code": ["123456"], "mfa_type": ["This field is required."]},
+            "",
+        )
+        self.assertEqual(message, "fallback")
+        self.assertNotIn("123456", message)
+
+        message = _friendly_response_message("fallback", {"mfa_code": ["123456"]}, "")
+        self.assertEqual(message, "fallback")
+
     def test_error_code_and_mfa_payload_unwrap_drf_lists(self) -> None:
         payload = {
             "error_code": ["mfa_required"],
