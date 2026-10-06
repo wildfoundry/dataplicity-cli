@@ -24,6 +24,7 @@ from urllib.parse import parse_qs, urlparse
 import typer
 from rich.console import Console
 from rich.live import Live
+from rich.markup import escape
 from rich.prompt import Prompt
 from rich.table import Table
 
@@ -219,6 +220,10 @@ SENSITIVE_KEYS = {
     "apiKey",
     "token",
     "secret",
+    "password",
+    "mfa_code",
+    "mfa_token",
+    "mfa_credential",
     "private_key",
     "provisioning_key",
 }
@@ -241,7 +246,7 @@ def _print_json(data: Any) -> None:
 
 
 def _show_error(console: Console, message: str) -> None:
-    console.print(f"[red]Error:[/red] {message}")
+    console.print(f"[red]Error:[/red] {escape(str(message))}")
 
 
 def _extract_sso_tokens(payload: Any) -> Tuple[Optional[str], Optional[str]]:
@@ -560,17 +565,116 @@ def _coerce_timeout_seconds(value: Any, default: int = 180) -> int:
     return max(timeout, 1)
 
 
+def _first_text(value: Any) -> Optional[str]:
+    if isinstance(value, str):
+        text = value.strip()
+        return text or None
+    if isinstance(value, list):
+        for item in value:
+            text = _first_text(item)
+            if text:
+                return text
+    return None
+
+
+def _extract_error_code(response_data: Any) -> Optional[str]:
+    if not isinstance(response_data, dict):
+        return None
+    return _first_text(response_data.get("error_code") or response_data.get("code"))
+
+
+def _extract_mfa_payload(response_data: Any) -> Dict[str, Any]:
+    if not isinstance(response_data, dict):
+        return {}
+    mfa = response_data.get("mfa")
+    if isinstance(mfa, list) and mfa:
+        mfa = mfa[0]
+    return mfa if isinstance(mfa, dict) else {}
+
+
+def _mfa_available_types(mfa: Dict[str, Any]) -> List[str]:
+    raw = mfa.get("available_types") or []
+    if isinstance(raw, str):
+        raw = [raw]
+    types: List[str] = []
+    if isinstance(raw, list):
+        for item in raw:
+            text = _first_text(item)
+            if text:
+                normalized = text.upper()
+                if normalized not in types:
+                    types.append(normalized)
+    preferred = _first_text(mfa.get("type"))
+    if preferred:
+        preferred = preferred.upper()
+        if preferred not in types:
+            types.insert(0, preferred)
+    return types
+
+
+def _cli_mfa_type(requested: Optional[str], available: List[str]) -> str:
+    requested_type = (requested or "").strip().upper()
+    if requested_type:
+        return requested_type
+    if "TOTP" in available:
+        return "TOTP"
+    if available:
+        return available[0]
+    return "TOTP"
+
+
+def _webauthn_unsupported_message() -> str:
+    return (
+        "This account requires a security key (WebAuthn), which the CLI does not support. "
+        "Use `dataplicity auth sso`, or add an authenticator app and retry with `--mfa-code`."
+    )
+
+
+def _password_login_payload(
+    email: str,
+    password: str,
+    *,
+    mfa_code: Optional[str] = None,
+    mfa_type: Optional[str] = None,
+) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {"email": email, "password": password}
+    code = (mfa_code or "").strip()
+    method = (mfa_type or "").strip().upper()
+    if code:
+        payload["mfa_code"] = code
+        payload["mfa_type"] = method or "TOTP"
+    elif method:
+        payload["mfa_type"] = method
+    return payload
+
+
+def _fail_login(
+    state: AppContext,
+    message: str,
+    *,
+    extra: Optional[Dict[str, Any]] = None,
+    code: int = 1,
+) -> None:
+    if state.json_output:
+        payload: Dict[str, Any] = {"ok": False, "detail": message}
+        if extra:
+            payload.update(extra)
+        _print_json(payload)
+    else:
+        _show_error(state.console, message)
+    raise typer.Exit(code=code)
+
+
 def _friendly_response_message(default_message: str, response_data: Any, response_text: str) -> str:
     detail = None
     if isinstance(response_data, dict):
-        detail = response_data.get("detail") or response_data.get("error") or response_data.get("message")
-        if isinstance(detail, str) and detail.strip():
-            detail = detail.strip()
-        else:
-            detail = None
-        non_field = response_data.get("non_field_errors")
-        if detail is None and isinstance(non_field, list) and non_field:
-            detail = str(non_field[0])
+        detail = _first_text(
+            response_data.get("detail") or response_data.get("error") or response_data.get("message")
+        )
+        if detail is None:
+            detail = _first_text(response_data.get("non_field_errors"))
+        if detail is None:
+            detail = _first_text(response_data.get("mfa_code") or response_data.get("mfa_type"))
     message = detail or response_text or default_message
     if _looks_like_invalid_auth_message(message):
         return "Saved login appears expired or invalid. Run `dataplicity setup` to sign in again."
@@ -1629,96 +1733,22 @@ def config_show(ctx: typer.Context) -> None:
     state.console.print(table)
 
 
-@auth_app.command("login")
-def auth_login(
+def _attempt_sso_login(
     ctx: typer.Context,
-    email: Optional[str] = typer.Option(None, "--email", help="Account email"),
-    password: Optional[str] = typer.Option(None, "--password", help="Account password"),
-    mfa_code: Optional[str] = typer.Option(None, "--mfa-code"),
-    mfa_type: Optional[str] = typer.Option(None, "--mfa-type"),
-) -> None:
-    """Sign in with email and password.
+    email: str,
+    *,
+    open_browser: bool = True,
+    timeout: int = 180,
+) -> bool:
+    """Complete browser SSO when the account supports it.
 
-    Examples:
-      dataplicity auth login --email you@example.com
-      dataplicity auth login --email you@example.com --mfa-code 123456
+    Returns False if SSO is not enabled so callers can fall back. Other
+    failures raise ``typer.Exit`` after printing an error.
     """
     state = _ctx(ctx)
-    email = _resolve_email_for_auth(state, provided_email=email)
-    if password is None:
-        if state.json_output:
-            _print_json({"ok": False, "detail": "Password is required in --json mode. Pass `--password`."})
-            raise typer.Exit(code=2)
-        password = typer.prompt("Password", hide_input=True)
-    bootstrap = state.api.post("/api/auth/bootstrap/", json_data={"email": email})
-    if bootstrap.ok and isinstance(bootstrap.data, dict) and bootstrap.data.get("status") == "sso_redirect":
-        if state.json_output:
-            message = "SSO is required for this account. Use `dataplicity auth sso --email ...`."
-            _print_json({"ok": False, "detail": message})
-            raise typer.Exit(code=3)
-        state.console.print("[yellow]SSO is required for this account.[/yellow] Redirecting to SSO login...")
-        auth_sso(ctx, email=email, open_browser=True)
-        return
-
-    payload: Dict[str, Any] = {"email": email, "password": password}
-    if mfa_code:
-        payload["mfa_code"] = mfa_code
-    if mfa_type:
-        payload["mfa_type"] = mfa_type
-
-    response = state.api.post("/api/token/", json_data=payload)
-    if not response.ok:
-        message = _friendly_response_message("Login failed. Check your credentials and try again.", response.data, response.text)
-        if state.json_output:
-            _print_json({"ok": False, "detail": message})
-        else:
-            _show_error(state.console, message)
-        raise typer.Exit(code=1)
-
-    access = None
-    refresh = None
-    if isinstance(response.data, dict):
-        access = response.data.get("access")
-        refresh = response.data.get("refresh")
-    if not access:
-        message = "Login succeeded but no access token was returned."
-        if state.json_output:
-            _print_json({"ok": False, "detail": message})
-        else:
-            _show_error(state.console, message)
-        raise typer.Exit(code=1)
-
-    state.config.access_token = access
-    state.config.refresh_token = refresh
-    state.config.auth_method = "jwt"
-    state.config.last_email = email
-    state.config.preferred_login_method = "email-password"
-    state.config.save(state.config_path)
-    if state.json_output:
-        _print_json({"ok": True, "detail": "Logged in"})
-    else:
-        state.console.print("[green]Logged in.[/green]")
-
-
-@auth_app.command("sso")
-def auth_sso(
-    ctx: typer.Context,
-    email: Optional[str] = typer.Option(None, "--email", help="Account email"),
-    open_browser: bool = typer.Option(True, "--open-browser/--no-open-browser", help="Open SSO login in the browser"),
-    timeout: int = typer.Option(180, "--timeout", help="Seconds to wait for automatic browser callback"),
-) -> None:
-    """Start SSO login flow for your email.
-
-    Examples:
-      dataplicity auth sso --email you@example.com
-      dataplicity auth sso --email you@example.com --no-open-browser
-      dataplicity auth sso --email you@example.com --timeout 300
-    """
-    state = _ctx(ctx)
-    email = _resolve_email_for_auth(state, provided_email=email)
     timeout_seconds = _coerce_timeout_seconds(timeout)
     listener: Optional[_SsoCallbackListener] = None
-    bootstrap_payload = {"email": email}
+    bootstrap_payload: Dict[str, Any] = {"email": email}
     if open_browser:
         listener = _SsoCallbackListener()
         if listener.start() and listener.callback_url:
@@ -1733,32 +1763,18 @@ def auth_sso(
         if listener:
             listener.stop()
         message = _friendly_response_message("Unable to start SSO.", response.data, response.text)
-        if state.json_output:
-            _print_json({"ok": False, "detail": message})
-        else:
-            _show_error(state.console, message)
-        raise typer.Exit(code=1)
+        _fail_login(state, message)
 
     if not isinstance(response.data, dict) or response.data.get("status") != "sso_redirect":
         if listener:
             listener.stop()
-        message = "SSO is not enabled for this account."
-        if state.json_output:
-            _print_json({"ok": False, "detail": message})
-        else:
-            _show_error(state.console, message)
-        raise typer.Exit(code=2)
+        return False
 
     redirect_url = response.data.get("redirect_url")
     if not redirect_url:
         if listener:
             listener.stop()
-        message = "SSO redirect URL missing."
-        if state.json_output:
-            _print_json({"ok": False, "detail": message})
-        else:
-            _show_error(state.console, message)
-        raise typer.Exit(code=1)
+        _fail_login(state, "SSO redirect URL missing.")
 
     try:
         if open_browser:
@@ -1773,7 +1789,7 @@ def auth_sso(
                 _print_json({"ok": True, "detail": "SSO login complete"})
             else:
                 state.console.print("[green]SSO login complete.[/green]")
-            return
+            return True
     finally:
         if listener:
             listener.stop()
@@ -1806,6 +1822,145 @@ def auth_sso(
     state.config.preferred_login_method = "sso"
     state.config.save(state.config_path)
     state.console.print("[green]SSO login complete.[/green]")
+    return True
+
+
+@auth_app.command("login")
+def auth_login(
+    ctx: typer.Context,
+    email: Optional[str] = typer.Option(None, "--email", help="Account email"),
+    password: Optional[str] = typer.Option(None, "--password", help="Account password"),
+    mfa_code: Optional[str] = typer.Option(None, "--mfa-code"),
+    mfa_type: Optional[str] = typer.Option(None, "--mfa-type"),
+) -> None:
+    """Sign in with email and password.
+
+    Examples:
+      dataplicity auth login --email you@example.com
+      dataplicity auth login --email you@example.com --mfa-code 123456
+    """
+    state = _ctx(ctx)
+    email = _resolve_email_for_auth(state, provided_email=email)
+    if password is None:
+        if state.json_output:
+            _print_json({"ok": False, "detail": "Password is required in --json mode. Pass `--password`."})
+            raise typer.Exit(code=2)
+        password = typer.prompt("Password", hide_input=True)
+    bootstrap = state.api.post("/api/auth/bootstrap/", json_data={"email": email})
+    if bootstrap.ok and isinstance(bootstrap.data, dict) and bootstrap.data.get("status") == "sso_redirect":
+        if state.json_output:
+            message = "SSO is required for this account. Use `dataplicity auth sso --email ...`."
+            _print_json({"ok": False, "detail": message})
+            raise typer.Exit(code=3)
+        state.console.print("[yellow]SSO is required for this account.[/yellow] Redirecting to SSO login...")
+        auth_sso(ctx, email=email, open_browser=True)
+        return
+
+    requested_mfa_type = (mfa_type or "").strip().upper()
+    if requested_mfa_type == "WEBAUTHN":
+        if state.json_output:
+            _fail_login(
+                state,
+                "Security keys are not supported in the CLI. Use `dataplicity auth sso --email ...`.",
+                extra={"error_code": "unsupported_mfa_type"},
+            )
+        state.console.print(
+            "[yellow]Security key (WebAuthn) verification is completed in the browser.[/yellow] "
+            "Redirecting to browser sign-in..."
+        )
+        if _attempt_sso_login(ctx, email=email, open_browser=True):
+            return
+        _fail_login(state, _webauthn_unsupported_message(), extra={"error_code": "unsupported_mfa_type"})
+
+    payload = _password_login_payload(email, password, mfa_code=mfa_code, mfa_type=mfa_type)
+    response = state.api.post("/api/token/", json_data=payload)
+    if not response.ok and _extract_error_code(response.data) == "mfa_required":
+        mfa = _extract_mfa_payload(response.data)
+        available = _mfa_available_types(mfa)
+        chosen = _cli_mfa_type(payload.get("mfa_type") or mfa_type, available)
+        extra = {"error_code": "mfa_required", "mfa_type": chosen, "mfa_available_types": available}
+        if payload.get("mfa_code") and payload.get("mfa_type"):
+            message = _friendly_response_message(
+                "Multi-factor authentication required. Use `dataplicity auth sso --email ...` or pass `--mfa-code`.",
+                response.data,
+                response.text,
+            )
+            _fail_login(state, message, extra=extra)
+        if state.json_output:
+            _fail_login(
+                state,
+                "Multi-factor authentication required. Use `dataplicity auth sso --email ...` or pass `--mfa-code`.",
+                extra=extra,
+                code=3,
+            )
+        state.console.print(
+            "[yellow]Multi-factor authentication required.[/yellow] Redirecting to browser sign-in..."
+        )
+        if _attempt_sso_login(ctx, email=email, open_browser=True):
+            return
+        if "TOTP" in available:
+            mfa_code = typer.prompt("Authenticator app code")
+            payload = _password_login_payload(email, password, mfa_code=mfa_code, mfa_type="TOTP")
+            response = state.api.post("/api/token/", json_data=payload)
+        else:
+            _fail_login(state, _webauthn_unsupported_message(), extra=extra)
+
+    if not response.ok:
+        message = _friendly_response_message(
+            "Login failed. Check your credentials and try again.",
+            response.data,
+            response.text,
+        )
+        login_extra: Optional[Dict[str, Any]] = None
+        error_code = _extract_error_code(response.data)
+        if error_code:
+            login_extra = {"error_code": error_code}
+        _fail_login(state, message, extra=login_extra)
+
+    access = None
+    refresh = None
+    if isinstance(response.data, dict):
+        access = response.data.get("access")
+        refresh = response.data.get("refresh")
+    if not access:
+        _fail_login(state, "Login succeeded but no access token was returned.")
+
+    state.config.access_token = access
+    state.config.refresh_token = refresh
+    state.config.auth_method = "jwt"
+    state.config.last_email = email
+    state.config.preferred_login_method = "email-password"
+    state.config.save(state.config_path)
+    if state.json_output:
+        _print_json({"ok": True, "detail": "Logged in"})
+    else:
+        state.console.print("[green]Logged in.[/green]")
+
+
+@auth_app.command("sso")
+def auth_sso(
+    ctx: typer.Context,
+    email: Optional[str] = typer.Option(None, "--email", help="Account email"),
+    open_browser: bool = typer.Option(True, "--open-browser/--no-open-browser", help="Open SSO login in the browser"),
+    timeout: int = typer.Option(180, "--timeout", help="Seconds to wait for automatic browser callback"),
+) -> None:
+    """Start SSO login flow for your email.
+
+    Examples:
+      dataplicity auth sso --email you@example.com
+      dataplicity auth sso --email you@example.com --no-open-browser
+      dataplicity auth sso --email you@example.com --timeout 300
+    """
+    state = _ctx(ctx)
+    email = _resolve_email_for_auth(state, provided_email=email)
+    if _attempt_sso_login(ctx, email, open_browser=open_browser, timeout=timeout):
+        return
+    message = "SSO is not enabled for this account."
+    if state.json_output:
+        _print_json({"ok": False, "detail": message})
+    else:
+        _show_error(state.console, message)
+    raise typer.Exit(code=2)
 
 
 @auth_app.command("api-key")
