@@ -222,7 +222,7 @@ class AuthLoginMfaTest(unittest.TestCase):
         self.assertIn("TOTP", payload["mfa_available_types"])
         self.assertNotIn("webauthn", payload)
         self.assertNotIn("browser_login_url", payload)
-        self.assertIn("--mfa-code", payload["detail"])
+        self.assertIn("authenticator app code", payload["detail"])
         self.assertNotIn("signed-challenge", result.output)
 
     def test_mfa_code_defaults_type_to_totp(self) -> None:

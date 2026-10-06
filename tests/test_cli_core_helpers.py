@@ -62,7 +62,7 @@ class CliCoreHelpersTest(unittest.TestCase):
             {"mfa_code": ["123456"], "mfa_type": ["This field is required."]},
             "",
         )
-        self.assertEqual(message, "This field is required.")
+        self.assertEqual(message, "fallback")
         self.assertNotIn("123456", message)
 
         message = _friendly_response_message("fallback", {"mfa_code": ["123456"]}, "")

@@ -631,16 +631,16 @@ def _webauthn_unsupported_message() -> str:
     )
 
 
-def _mfa_required_detail(*, has_totp: bool, browser_login_url: Optional[str] = None) -> str:
+def _second_factor_login_hint(*, has_totp: bool, browser_login_url: Optional[str] = None) -> str:
     if browser_login_url:
         return (
             "Multi-factor authentication required. Complete sign-in in the browser, "
-            "or pass `--mfa-code` for authenticator-app login."
+            "or pass an authenticator app code with the login command."
         )
     if has_totp:
         return (
-            "Multi-factor authentication required. Pass `--mfa-code` for authenticator-app login, "
-            "or run `dataplicity auth login` without `--json` to complete MFA in the browser."
+            "Multi-factor authentication required. Pass an authenticator app code with the login command, "
+            "or run `dataplicity auth login` without `--json` to complete verification in the browser."
         )
     return (
         "Multi-factor authentication required. Security-key verification must be completed in the browser. "
@@ -804,9 +804,7 @@ def _friendly_response_message(default_message: str, response_data: Any, respons
         )
         if detail is None:
             detail = _first_text(response_data.get("non_field_errors"))
-        if detail is None:
-            # Surface MFA field errors without copying secret-named values into logs/stdout.
-            detail = _first_text(response_data.get("mfa_type"))
+        # Do not copy credential-named field values (password, mfa_*, etc.) into stdout/logs.
     message = detail or response_text or default_message
     if _looks_like_invalid_auth_message(message):
         return "Saved login appears expired or invalid. Run `dataplicity setup` to sign in again."
@@ -2022,7 +2020,7 @@ def auth_login(
             extra["browser_login_url"] = browser_login_url
         if payload.get("mfa_code") and payload.get("mfa_type"):
             message = _friendly_response_message(
-                _mfa_required_detail(has_totp=has_totp, browser_login_url=browser_login_url),
+                _second_factor_login_hint(has_totp=has_totp, browser_login_url=browser_login_url),
                 response.data,
                 response.text,
             )
@@ -2030,7 +2028,7 @@ def auth_login(
         if state.json_output:
             _fail_login(
                 state,
-                _mfa_required_detail(has_totp=has_totp, browser_login_url=browser_login_url),
+                _second_factor_login_hint(has_totp=has_totp, browser_login_url=browser_login_url),
                 extra=extra,
                 code=3,
             )
