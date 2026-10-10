@@ -396,11 +396,7 @@ client.run_forever()
             response = await asyncio.to_thread(admit)
             legacy['diagnostics']['http_status'] = response.status_code
             legacy['diagnostics']['admission_stage'] = 2
-            if not response.ok:
-                raise LegacyAdmissionRejected()
-            port = await client.wait_for_channel_open()
-            legacy['diagnostics']['admission_stage'] = 3
-            return port
+            return await _legacy_admitted_channel(client, response, identity, legacy['diagnostics'])
         local_port = _port()
         listening = asyncio.Event()
         def progress(event):
@@ -436,6 +432,14 @@ class LegacyAdmissionRejected(RuntimeError):
     """Ports API explicitly rejected a legacy channel."""
 
 
+class LegacyAdmissionMalformed(RuntimeError):
+    """Ports API did not return the requested client/device/service route."""
+
+
+class LegacyNotifyOpenMismatch(RuntimeError):
+    """NotifyOpen identified a different channel from the API admission."""
+
+
 class LegacyNotifyOpenTimeout(RuntimeError):
     """Ports API accepted the channel but NotifyOpen did not arrive."""
 
@@ -464,11 +468,62 @@ class LegacyAgentExited(RuntimeError):
     """The unchanged agent subprocess exited during the probe."""
 
 
+def _legacy_failure(legacy, fallback, *, admission=True):
+    diagnostic = legacy['diagnostics']
+    if legacy['process'].returncode is not None:
+        return LegacyAgentExited()
+    if diagnostic.get('shared_close_event') is True:
+        return LegacyAgentGlobalShutdown()
+    if legacy['client'].ws is None or legacy['client'].ws.state.name != 'OPEN':
+        return LegacyRouterSocketClosed()
+    if admission:
+        failure = diagnostic.get('admission_failure')
+        if failure == 'rejected':
+            return LegacyAdmissionRejected()
+        if failure == 'malformed':
+            return LegacyAdmissionMalformed()
+        if failure == 'mismatch':
+            return LegacyNotifyOpenMismatch()
+        stage = diagnostic['admission_stage']
+        if stage < 2:
+            return LegacyAdmissionTimeout()
+        if diagnostic['http_status'] not in range(200, 300):
+            return LegacyAdmissionRejected()
+        if stage < 3:
+            return LegacyNotifyOpenTimeout()
+    return fallback()
+
+
+async def _legacy_admitted_channel(client, response, device_identity, diagnostic):
+    payload = response.data
+    if not response.ok or isinstance(payload, dict) and payload.get('status') in ('fail', 'error'):
+        diagnostic['admission_failure'] = 'rejected'
+        raise LegacyAdmissionRejected()
+    port = payload.get('port') if isinstance(payload, dict) else None
+    route = payload.get('route') if isinstance(payload, dict) else None
+    if (not isinstance(payload, dict) or payload.get('status') != 'ok'
+            or type(port) is not int or not 0 < port < 2 ** 63
+            or payload.get('service') != 'redirect-port'
+            or not isinstance(route, list) or len(route) != 4
+            or type(route[1]) is not int or type(route[3]) is not int
+            or route != [client.identity, port, device_identity, port]):
+        diagnostic['admission_failure'] = 'malformed'
+        raise LegacyAdmissionMalformed()
+    opened = await client.wait_for_channel_open()
+    diagnostic['expected_channel_match'] = type(opened) is int and opened == port
+    if type(opened) is not int or opened != port:
+        diagnostic['admission_failure'] = 'mismatch'
+        raise LegacyNotifyOpenMismatch()
+    diagnostic['admission_stage'] = 3
+    return port
+
+
 async def _legacy_exchange(legacy, payload):
     diagnostic = legacy['diagnostics']
     diagnostic.update(admission_stage=0, http_status=0, bytes_up=0, bytes_down=0)
+    diagnostic.pop('admission_failure', None)
     diagnostic['probe_count'] = diagnostic.get('probe_count', 0) + 1
-    probes = [asyncio.create_task(_exchange(legacy['local_port'], payload))]
+    probes = [asyncio.create_task(_exchange(legacy['local_port'], b'fresh:' + payload))]
     if legacy.get('persistent_writer'):
         # Keep testing freshly admitted connections as well as the old stream;
         # establishing a new stream never substitutes for continuity evidence.
@@ -478,20 +533,7 @@ async def _legacy_exchange(legacy, payload):
     except (asyncio.TimeoutError, asyncio.IncompleteReadError) as exc:
         # Distinct safe exception names survive backend evidence filtering.
         # No retries, replacement probes or weaker success criteria hide failure.
-        if legacy['process'].returncode is not None:
-            raise LegacyAgentExited() from exc
-        if diagnostic.get('shared_close_event') is True:
-            raise LegacyAgentGlobalShutdown() from exc
-        if legacy['client'].ws is None or legacy['client'].ws.state.name != 'OPEN':
-            raise LegacyRouterSocketClosed() from exc
-        stage = diagnostic['admission_stage']
-        if stage < 2:
-            raise LegacyAdmissionTimeout() from exc
-        if diagnostic['http_status'] not in range(200, 300):
-            raise LegacyAdmissionRejected() from exc
-        if stage < 3:
-            raise LegacyNotifyOpenTimeout() from exc
-        raise LegacyPayloadTimeout() from exc
+        raise _legacy_failure(legacy, LegacyPayloadTimeout) from exc
     finally:
         for probe in probes:
             probe.cancel()
@@ -499,6 +541,7 @@ async def _legacy_exchange(legacy, payload):
 
 
 async def _legacy_existing_exchange(legacy, payload):
+    payload = b'persistent:' + payload
     async with legacy['persistent_lock']:
         reader, writer = legacy['persistent_reader'], legacy['persistent_writer']
         if writer.is_closing() or reader.at_eof():
@@ -508,11 +551,14 @@ async def _legacy_existing_exchange(legacy, payload):
             await writer.drain()
             result = await asyncio.wait_for(reader.readexactly(len(payload)), 20)
         except asyncio.TimeoutError as exc:
-            raise LegacyExistingStreamTimeout() from exc
+            raise _legacy_failure(legacy, LegacyExistingStreamTimeout,
+                                  admission=not legacy.get('persistent_admitted')) from exc
         except (OSError, asyncio.IncompleteReadError) as exc:
-            raise LegacyExistingStreamClosed() from exc
+            raise _legacy_failure(legacy, LegacyExistingStreamClosed,
+                                  admission=not legacy.get('persistent_admitted')) from exc
         if result != payload:
             raise RuntimeError('Established legacy stream changed probe bytes')
+        legacy['persistent_admitted'] = True
         legacy['diagnostics']['persistent_probe_count'] = legacy['diagnostics'].get('persistent_probe_count', 0) + 1
 
 
@@ -525,7 +571,7 @@ def _legacy_diagnostics(legacy):
     diagnostic['persistent_stream_open'] = bool(writer and not writer.is_closing() and not reader.at_eof())
     limits = {'admission_stage': 3, 'http_status': 599, 'bytes_up': 2 ** 30, 'bytes_down': 2 ** 30,
               'agent_channel_count': 4096, 'probe_count': 256, 'persistent_probe_count': 256}
-    booleans = {'shared_close_event', 'agent_m2m_closed', 'websocket_open', 'agent_running', 'persistent_stream_open'}
+    booleans = {'shared_close_event', 'agent_m2m_closed', 'websocket_open', 'agent_running', 'persistent_stream_open', 'expected_channel_match'}
     return {key: value for key, value in diagnostic.items() if
             key in limits and type(value) is int and 0 <= value <= limits[key]
             or key in booleans and type(value) is bool}
