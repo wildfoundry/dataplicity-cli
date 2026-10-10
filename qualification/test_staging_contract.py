@@ -318,7 +318,7 @@ def test_wormhole_probe_uses_exact_staging_https_domain():
         'https://friendly-device-1234.wormhole.staging.dpenv.com/qualification-health')
 
 
-@pytest.mark.parametrize('failure', [None, 'http', 'legacy'])
+@pytest.mark.parametrize('failure', [None, 'http', 'legacy', 'dns', 'connect', 'marker', 'short', 'extra', 'http_cleanup', 'http_runner_cleanup'])
 def test_wormhole_requires_real_marker_and_legacy_and_restores_fixture(monkeypatch, failure):
     import sys
     from types import SimpleNamespace
@@ -341,21 +341,30 @@ def test_wormhole_requires_real_marker_and_legacy_and_restores_fixture(monkeypat
             assert url.startswith('https://friendly-device-1234.wormhole.staging.dpenv.com/')
             assert kwargs == {'allow_redirects': False}
             calls.append('public')
+            if failure in ('dns', 'connect'):
+                import socket
+                raise socket.gaierror('secret hostname') if failure == 'dns' else OSError('secret URL')
             return self
         @property
         def status(self):
-            return 503 if failure == 'http' else 200
+            return 503 if failure in ('http', 'http_cleanup', 'http_runner_cleanup') else 200
         @property
         def content(self):
             return self
         async def readexactly(self, size):
             assert size == len(b'staging-wormhole-' + b'aa' * 16)
+            if failure == 'short':
+                raise asyncio.IncompleteReadError(b'secret', size)
+            if failure == 'marker':
+                return b'x' * size
             return b'staging-wormhole-' + b'aa' * 16
         async def read(self, size):
             assert size == 1
-            return b''
+            return b'x' if failure == 'extra' else b''
     async def device(fixture, method, payload=None):
         calls.append((method, payload))
+        if failure == 'http_cleanup' and payload == {'wormhole_enabled': False}:
+            raise ValueError('secret cleanup response')
         return {'wormhole_enabled': payload['wormhole_enabled'] if payload else False,
                 'wormhole_slug': 'friendly-device-1234'}
     async def legacy(_legacy, payload):
@@ -371,6 +380,8 @@ def test_wormhole_requires_real_marker_and_legacy_and_restores_fixture(monkeypat
             pass
         async def cleanup(self):
             calls.append('cleanup')
+            if failure == 'http_runner_cleanup':
+                raise ValueError('secret cleanup response')
     web = SimpleNamespace(
         Application=lambda **kwargs: SimpleNamespace(router=SimpleNamespace(add_get=lambda *args: None)),
         AppRunner=Runner, TCPSite=Site)
@@ -380,11 +391,27 @@ def test_wormhole_requires_real_marker_and_legacy_and_restores_fixture(monkeypat
     monkeypatch.setattr(acceptance, '_mobile_device', device)
     monkeypatch.setattr(acceptance, '_legacy_exchange', legacy)
     monkeypatch.setattr(acceptance, '_exchange', exchange)
+    diagnostics = {}
     if failure:
-        with pytest.raises(RuntimeError):
-            asyncio.run(acceptance._wormhole_acceptance({}, 12345, {}))
+        expected = RuntimeError if failure not in ('dns', 'connect', 'short') else (OSError, asyncio.IncompleteReadError)
+        with pytest.raises(expected):
+            asyncio.run(acceptance._wormhole_acceptance({}, 12345, {}, diagnostics))
     else:
-        asyncio.run(acceptance._wormhole_acceptance({}, 12345, {}))
+        asyncio.run(acceptance._wormhole_acceptance({}, 12345, {}, diagnostics))
+    if failure in ('dns', 'connect'):
+        assert diagnostics['failure'] == failure
+        assert 'http_status' not in diagnostics
+    elif failure in ('http', 'http_cleanup', 'http_runner_cleanup'):
+        assert diagnostics['http_status'] == 503
+        assert diagnostics['failure'] == 'status'
+    elif failure in ('marker', 'short', 'extra'):
+        assert diagnostics['http_status'] == 200
+        assert diagnostics['failure'] == 'marker'
+        assert diagnostics['marker_match'] is False
+    if failure in ('http_cleanup', 'http_runner_cleanup'):
+        assert diagnostics['cleanup_failed'] is True
+        assert diagnostics['stage'] == 'status'
+    assert 'secret' not in str(diagnostics)
     assert calls.count('public') == 1, 'A failed public probe must not be retried'
     assert 'legacy' in calls and 'named' in calls
     assert calls[-2:] == [('PATCH', {'wormhole_enabled': False}), 'cleanup']
