@@ -80,7 +80,8 @@ async def _denied(control, resource, *, method='GET', payload=None, params=None)
     def request():
         with control._request_lock:
             return control.api.request(method, control.base + resource, json_data=payload,
-                                       params=params, headers=control.headers, allow_refresh=False)
+                                       params=params, headers=control.headers,
+                                       allow_refresh=control.headers is None)
     response = await asyncio.to_thread(request)
     if response.status_code not in {401, 403, 404, 409}:
         raise RuntimeError('Forbidden operation did not return an authentication or authorisation rejection')

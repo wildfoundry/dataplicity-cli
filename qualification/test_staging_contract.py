@@ -90,6 +90,21 @@ def test_sibling_fixture_tunnels_share_rotating_user_session_and_request_lock():
     assert second._request_lock is first._request_lock
 
 
+@pytest.mark.parametrize('machine', [False, True])
+def test_negative_admission_refreshes_user_session_but_never_scoped_credential(machine):
+    from unittest.mock import Mock
+    from qualification.staging_acceptance import _api, _denied
+    from dataplicity_cli.tunnels import TunnelAPI
+    from dataplicity_cli.api import ApiClient
+    from dataplicity_cli.config import Config
+    control = (TunnelAPI(ApiClient(Config(base_url='https://api.staging.dpenv.com')), 'org', token='scoped')
+               if machine else _api({'api_url': 'https://api.staging.dpenv.com',
+                   'organisation_hash': 'org', 'consumer_jwt': 'access'}, 'consumer'))
+    control.api.request = Mock(return_value=Mock(status_code=403))
+    asyncio.run(_denied(control, 'bootstrap/'))
+    assert control.api.request.call_args.kwargs['allow_refresh'] is (not machine)
+
+
 def test_continuity_probe_keeps_same_stream_and_still_admits_new_connections(monkeypatch):
     from types import SimpleNamespace
     from qualification import staging_acceptance as acceptance
