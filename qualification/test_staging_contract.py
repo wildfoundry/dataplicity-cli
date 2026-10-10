@@ -233,3 +233,72 @@ def test_initial_persistent_timeout_distinguishes_admission_from_established_str
         with pytest.raises(getattr(acceptance, expected)):
             await acceptance._legacy_existing_exchange(legacy, b'probe')
     asyncio.run(exercise())
+
+
+@pytest.mark.parametrize('failure', [None, 'payload', 'legacy'])
+def test_104_stream_gate_holds_distinct_streams_and_cleans_every_resource(monkeypatch, failure):
+    from qualification import staging_acceptance as acceptance
+    live, sessions, payloads = [], [], []
+    class Session:
+        def __init__(self, control, name, callback):
+            assert control == 'admin'
+            self.callback, self.closed = callback, False
+            sessions.append(self)
+        async def publish(self, port):
+            self.callback({'event': 'published'})
+            await asyncio.Event().wait()
+        async def connect(self, port):
+            self.callback({'event': 'listener_started'})
+            await asyncio.Event().wait()
+        async def close(self):
+            self.closed = True
+    class Writer:
+        def __init__(self):
+            self.payload = None
+            self.closed = False
+        def write(self, payload):
+            self.payload = payload
+            payloads.append(payload)
+        async def drain(self):
+            pass
+        def is_closing(self):
+            return self.closed
+        def close(self):
+            self.closed = True
+        async def wait_closed(self):
+            pass
+    class Reader:
+        def __init__(self, writer):
+            self.writer = writer
+        async def readexactly(self, size):
+            if failure == 'payload':
+                return b'wrong'
+            assert len(self.writer.payload) == size
+            return self.writer.payload
+        def at_eof(self):
+            return False
+    async def connect(host, port):
+        writer = Writer()
+        live.append(writer)
+        return Reader(writer), writer
+    async def legacy(_legacy, payload):
+        assert len(live) == 104
+        assert all(not writer.closed for writer in live)
+        assert len(set(payloads)) == 104
+        if failure == 'legacy':
+            raise RuntimeError('Actual legacy probe failed')
+    monkeypatch.setattr(acceptance, 'TunnelSession', Session)
+    monkeypatch.setattr(acceptance, '_api', lambda fixture, role: role)
+    monkeypatch.setattr(acceptance, '_port', lambda: 12345)
+    monkeypatch.setattr(acceptance.asyncio, 'open_connection', connect)
+    monkeypatch.setattr(acceptance, '_legacy_exchange', legacy)
+    if failure:
+        with pytest.raises(RuntimeError):
+            asyncio.run(acceptance._concurrency_acceptance({}, 'qualification', 12345, {}))
+    else:
+        asyncio.run(acceptance._concurrency_acceptance({}, 'qualification', 12345, {}))
+        assert len(payloads) == 208
+        assert len(set(payloads)) == 208
+    assert len(sessions) == 8
+    assert all(session.closed for session in sessions)
+    assert live and all(writer.closed for writer in live)

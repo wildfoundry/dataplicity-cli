@@ -156,6 +156,9 @@ async def qualify_named_and_legacy(fixture):
         finally:
             writer.close()
             await writer.wait_closed()
+        phase = '104_simultaneous_named_streams_and_legacy'
+        await asyncio.wait_for(_concurrency_acceptance(fixture, name, target_port, legacy), 180)
+        report['cases']['104_simultaneous_named_streams_and_actual_legacy_mesh'] = True
         phase = 'actual_http_websocket_ssh_postgresql_protocols'
         await _protocol_acceptance(fixture, name, legacy, report)
         phase = 'live_frontend_active'
@@ -597,6 +600,73 @@ async def _stop_legacy(legacy):
             legacy['process'].kill()
             await legacy['process'].wait()
     legacy['directory'].cleanup()
+
+
+async def _concurrency_acceptance(fixture, name, target_port, legacy):
+    """Bounded functional concurrency, under ordinary server-owned quotas."""
+    tasks, sessions, connections = [], [], []
+    try:
+        ports = []
+        for index in range(4):
+            pub_ready, cons_ready = asyncio.Event(), asyncio.Event()
+            def published(event, ready=pub_ready):
+                if event['event'] == 'published':
+                    ready.set()
+            def listening(event, ready=cons_ready):
+                if event['event'] == 'listener_started':
+                    ready.set()
+            tunnel_name = f'{name}-concurrent-{index}'
+            publisher = TunnelSession(_api(fixture, 'admin'), tunnel_name, published)
+            consumer = TunnelSession(_api(fixture, 'admin'), tunnel_name, listening)
+            sessions.extend((publisher, consumer))
+            pub_task = asyncio.create_task(publisher.publish(target_port)); tasks.append(pub_task)
+            await _ready(pub_task, pub_ready)
+            port = _port()
+            cons_task = asyncio.create_task(consumer.connect(port)); tasks.append(cons_task)
+            await _ready(cons_task, cons_ready)
+            ports.append(port)
+
+        async def admitted(index):
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection('127.0.0.1', ports[index // 26]), 10)
+            # Register ownership before any awaited I/O, including failed admission.
+            payload = index.to_bytes(4, 'big') + os.urandom(1020)
+            connections.append((reader, writer, payload))
+            writer.write(payload); await writer.drain()
+            if await asyncio.wait_for(reader.readexactly(len(payload)), 30) != payload:
+                raise RuntimeError('Concurrent stream payload changed')
+
+        admissions = [asyncio.create_task(admitted(index)) for index in range(104)]
+        tasks.extend(admissions)
+        await asyncio.gather(*admissions)
+        if len(connections) != 104 or any(writer.is_closing() or reader.at_eof()
+                                         for reader, writer, _ in connections):
+            raise RuntimeError('Concurrent streams were not all retained')
+        # _legacy_exchange requires both a fresh admission and the existing
+        # cross-router stream; neither substitutes for the other.
+        await _legacy_exchange(legacy, b'legacy-during-104-held-streams')
+        async def retained(reader, writer, payload):
+            payload = b'held:' + payload
+            writer.write(payload); await writer.drain()
+            if await asyncio.wait_for(reader.readexactly(len(payload)), 30) != payload:
+                raise RuntimeError('Retained concurrent stream payload changed')
+        checks = [asyncio.create_task(retained(*connection)) for connection in connections]
+        tasks.extend(checks)
+        await asyncio.gather(*checks)
+        if any(writer.is_closing() or reader.at_eof() for reader, writer, _ in connections):
+            raise RuntimeError('Concurrent stream closed during legacy probes')
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        for _, writer, _ in connections:
+            writer.close()
+        for _, writer, _ in connections:
+            with suppress(OSError):
+                await writer.wait_closed()
+        for session in sessions:
+            with suppress(Exception):
+                await session.close()
 
 
 async def _protocol_acceptance(fixture, name, legacy, report):
