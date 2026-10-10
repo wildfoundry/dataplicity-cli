@@ -16,6 +16,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 from urllib.parse import urlsplit
 
 from dataplicity_cli.api import ApiClient
@@ -32,10 +33,19 @@ def _port():
 
 
 def _api(fixture, principal, org=None):
-    client = ApiClient(Config(base_url=fixture['api_url'], auth_method='jwt',
-                              access_token=fixture[principal + '_jwt'],
-                              refresh_token=fixture.get(principal + '_refresh_jwt')))
-    return TunnelAPI(client, org or fixture['organisation_hash'])
+    # Normal rotating refresh tokens represent one user session. Reuse its
+    # client/config and lock across this user's tunnel controls; otherwise one
+    # rotation blacklists refresh tokens still held by sibling probe sessions.
+    clients = fixture.setdefault('_qualification_api_clients', {})
+    if principal not in clients:
+        client = ApiClient(Config(base_url=fixture['api_url'], auth_method='jwt',
+                                 access_token=fixture[principal + '_jwt'],
+                                 refresh_token=fixture.get(principal + '_refresh_jwt')))
+        clients[principal] = (client, threading.Lock())
+    client, lock = clients[principal]
+    control = TunnelAPI(client, org or fixture['organisation_hash'])
+    control._request_lock = lock
+    return control
 
 
 async def _ready(task, event, timeout=45):
@@ -67,9 +77,11 @@ async def _exchange(port, payload):
 
 
 async def _denied(control, resource, *, method='GET', payload=None, params=None):
-    response = await asyncio.to_thread(control.api.request, method, control.base + resource,
-                                       json_data=payload, params=params, headers=control.headers,
-                                       allow_refresh=False)
+    def request():
+        with control._request_lock:
+            return control.api.request(method, control.base + resource, json_data=payload,
+                                       params=params, headers=control.headers, allow_refresh=False)
+    response = await asyncio.to_thread(request)
     if response.status_code not in {401, 403, 404, 409}:
         raise RuntimeError('Forbidden operation did not return an authentication or authorisation rejection')
 
@@ -354,7 +366,8 @@ client.run_forever()
         else:
             raise RuntimeError('Actual older agent did not authenticate and associate in staging')
         device_node = identity.split('~', 1)[0]
-        api = _api(fixture, 'admin').api
+        admin_control = _api(fixture, 'admin')
+        api = admin_control.api
         # Public ALB ingress is retried, never assumed sticky; distinct returned
         # identity prefixes are direct evidence that traffic crosses router nodes.
         for _ in range(40):
@@ -371,9 +384,11 @@ client.run_forever()
             raise RuntimeError('Unable to place actual agent and consumer on distinct staging router nodes')
         async def open_channel():
             legacy['diagnostics']['admission_stage'] = 1
-            response = await asyncio.to_thread(api.post,
-                '/api/remote/devices/' + fixture['device_hash'] + '/ports/',
-                json_data={'m2m_identity': client.identity, 'service': 'redirect-port', 'port': target_port})
+            def admit():
+                with admin_control._request_lock:
+                    return api.post('/api/remote/devices/' + fixture['device_hash'] + '/ports/',
+                        json_data={'m2m_identity': client.identity, 'service': 'redirect-port', 'port': target_port})
+            response = await asyncio.to_thread(admit)
             legacy['diagnostics']['http_status'] = response.status_code
             legacy['diagnostics']['admission_stage'] = 2
             if not response.ok:

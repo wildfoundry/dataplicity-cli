@@ -75,3 +75,16 @@ def test_failed_legacy_probe_keeps_failure_and_distinguishes_admission_delivery(
     with pytest.raises(getattr(acceptance, expected)):
         asyncio.run(acceptance._legacy_exchange(legacy, b'probe'))
     assert calls == [1], 'Qualification must not conceal a failure with a retry'
+
+
+def test_sibling_fixture_tunnels_share_rotating_user_session_and_request_lock():
+    from qualification.staging_acceptance import _api
+    fixture = {'api_url': 'https://api.staging.dpenv.com', 'organisation_hash': 'same-org',
+               'publisher_jwt': 'initial-access', 'publisher_refresh_jwt': 'initial-refresh'}
+    first = _api(fixture, 'publisher')
+    first.api.config.access_token = 'rotated-access'
+    first.api.config.refresh_token = 'rotated-refresh'
+    second = _api(fixture, 'publisher')
+    assert second.api.config.access_token == 'rotated-access'
+    assert second.api.config.refresh_token == 'rotated-refresh'
+    assert second._request_lock is first._request_lock
