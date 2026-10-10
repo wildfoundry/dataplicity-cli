@@ -91,7 +91,7 @@ def test_sibling_fixture_tunnels_share_rotating_user_session_and_request_lock():
 
 
 @pytest.mark.parametrize('machine', [False, True])
-def test_negative_admission_refreshes_user_session_but_never_scoped_credential(machine):
+def test_negative_admission_refreshes_user_session_but_never_scoped_credential(machine, monkeypatch):
     from unittest.mock import Mock
     from qualification.staging_acceptance import _api, _denied
     from dataplicity_cli.tunnels import TunnelAPI
@@ -101,6 +101,9 @@ def test_negative_admission_refreshes_user_session_but_never_scoped_credential(m
                if machine else _api({'api_url': 'https://api.staging.dpenv.com',
                    'organisation_hash': 'org', 'consumer_jwt': 'access'}, 'consumer'))
     control.api.request = Mock(return_value=Mock(status_code=403))
+    async def in_current_thread(function):
+        return function()
+    monkeypatch.setattr(asyncio, 'to_thread', in_current_thread)
     asyncio.run(_denied(control, 'bootstrap/'))
     assert control.api.request.call_args.kwargs['allow_refresh'] is (not machine)
 
