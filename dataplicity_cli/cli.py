@@ -18,7 +18,7 @@ from contextlib import suppress
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, NoReturn, Optional, Set, Tuple
 from urllib.parse import parse_qs, urlparse
 
 import typer
@@ -125,7 +125,7 @@ def _tunnel_control(state: AppContext, organisation: Optional[str], token: Optio
     return TunnelAPI(api, organisation, token=token)
 
 
-def _tunnel_failure(state: AppContext, exc: Exception, json_output: bool = False) -> None:
+def _tunnel_failure(state: AppContext, exc: Exception, json_output: bool = False) -> NoReturn:
     from .tunnels import TunnelError
 
     message = str(exc) if isinstance(exc, TunnelError) else (

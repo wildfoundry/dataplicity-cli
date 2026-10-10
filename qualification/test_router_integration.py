@@ -237,6 +237,7 @@ async def test_actual_cli_router_http_multistream_half_close_and_uncooperative_r
     monkeypatch.setenv("SSL_CERT_FILE", str(ca))
     tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     tls.load_cert_chain(cert, key)
+    peer_pin = hashlib.sha256(ssl.PEM_cert_to_DER_cert(cert.read_text())).hexdigest()
     directory = PeerDirectory()
     runners, services, tasks, writers = [], [], [], set()
     received = bytearray()
@@ -253,7 +254,8 @@ async def test_actual_cli_router_http_multistream_half_close_and_uncooperative_r
             await writer.drain()
             writer.write_eof()
         except (OSError, asyncio.CancelledError):
-            pass
+            # Connection revocation intentionally interrupts test services.
+            return
         finally:
             writer.close()
             with suppress(OSError):
@@ -287,7 +289,7 @@ async def test_actual_cli_router_http_multistream_half_close_and_uncooperative_r
             outer = web.TCPSite(runner, host, 0 if index == 0 else outer_port, ssl_context=tls)
             await outer.start()
             outer_port = outer._server.sockets[0].getsockname()[1]
-            directory.records[redis_keys.ROUTER_PEERS + node_id.encode()] = json.dumps({"mesh_host": host}).encode()
+            directory.records[redis_keys.ROUTER_PEERS + node_id.encode()] = json.dumps({"mesh_host": host, "named_tls_port": outer_port, "named_tls_sha256": peer_pin}).encode()
             services.append(router_service)
         monkeypatch.setattr(constants, "ROUTER_PORT", inner_port)
         async with ClientSession() as http:

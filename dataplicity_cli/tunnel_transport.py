@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from contextlib import suppress
 from typing import Any, Dict, List
 
 import websockets
@@ -51,9 +52,10 @@ class TunnelM2MClient(M2MClient):
 
     async def close(self) -> None:
         try:
-            await asyncio.wait_for(super().close(), timeout=10)
-        except asyncio.TimeoutError:
-            pass
+            # Shutdown has a bounded deadline; the finally block always tears
+            # down the receiver and wakes streams if the peer is unresponsive.
+            with suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(super().close(), timeout=10)
         finally:
             self._wake_channels()
             if self._recv_task:
