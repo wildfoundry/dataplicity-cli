@@ -163,6 +163,18 @@ async def qualify_named_and_legacy(fixture):
         report['cases']['104_simultaneous_named_streams_and_actual_legacy_mesh'] = True
         phase = 'actual_http_websocket_ssh_postgresql_protocols'
         await _protocol_acceptance(fixture, name, legacy, report)
+        phase = 'independent_named_server_revocation'
+        from qualification.adversarial_named import qualify_adversarial
+        async def unaffected_security_probe():
+            await asyncio.gather(_exchange(local_port, b'named-survives-hostile-peer'),
+                                 _legacy_exchange(legacy, b'legacy-survives-hostile-peer'))
+        def machine_api(secret):
+            return TunnelAPI(ApiClient(Config(base_url=fixture['api_url'])),
+                             fixture['organisation_hash'], token=secret)
+        await asyncio.wait_for(qualify_adversarial(
+            _api(fixture, 'admin'), _api(fixture, 'publisher'), machine_api,
+            name + '-hostile', target_port, observed, unaffected_security_probe), 120)
+        report['cases']['independent_raw_peer_both_direction_server_revocation'] = True
         phase = 'actual_legacy_agent_wormhole_http'
         await _wormhole_acceptance(fixture, local_port, legacy, report.setdefault('wormhole_diagnostics', {}))
         report['cases']['actual_legacy_agent_wormhole_http_with_named_traffic'] = True
