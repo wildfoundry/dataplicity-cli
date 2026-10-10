@@ -124,10 +124,24 @@ async def qualify_named_and_legacy(fixture):
         phase = 'actual_legacy_agent_association_and_mesh'
         legacy = await _start_legacy(fixture, target_port, report)
         phase = 'simultaneous_named_and_legacy'
-        payloads = [os.urandom(131072) for _ in range(6)]
+        # Stay within the fixture's measured protective one-MiB/s bidirectional
+        # budget; quota-exhaustion tests must be a separate acceptance case.
+        payloads = [os.urandom(65536) for _ in range(6)]
         await asyncio.gather(*(_exchange(local_port, payload) for payload in payloads),
                              _legacy_exchange(legacy, payloads[0]))
         report['cases']['simultaneous_named_and_actual_legacy_mesh'] = True
+        reader, writer = await asyncio.open_connection('127.0.0.1', local_port)
+        try:
+            payload = os.urandom(65536)
+            writer.write(payload)
+            await writer.drain()
+            writer.write_eof()
+            assert await asyncio.wait_for(reader.readexactly(len(payload)), 20) == payload
+            assert await asyncio.wait_for(reader.read(1), 20) == b''
+            report['cases']['actual_tcp_half_close_through_staging'] = True
+        finally:
+            writer.close()
+            await writer.wait_closed()
         phase = 'actual_http_websocket_ssh_postgresql_protocols'
         await _protocol_acceptance(fixture, name, legacy, report)
         phase = 'live_frontend_active'
