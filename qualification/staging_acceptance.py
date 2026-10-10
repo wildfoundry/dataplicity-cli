@@ -173,7 +173,8 @@ async def qualify_named_and_legacy(fixture):
                              fixture['organisation_hash'], token=secret)
         await asyncio.wait_for(qualify_adversarial(
             _api(fixture, 'admin'), _api(fixture, 'publisher'), machine_api,
-            name + '-hostile', target_port, observed, unaffected_security_probe), 120)
+            name + '-hostile', target_port, observed, unaffected_security_probe,
+            report.setdefault('independent_named_diagnostics', {})), 120)
         report['cases']['independent_raw_peer_both_direction_server_revocation'] = True
         phase = 'actual_legacy_agent_wormhole_http'
         await _wormhole_acceptance(fixture, local_port, legacy, report.setdefault('wormhole_diagnostics', {}))
