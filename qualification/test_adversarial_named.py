@@ -156,11 +156,11 @@ def test_orchestration_revokes_exact_grant_and_token_with_cleanup_and_no_pass_on
                 if failure == 'token_replay' and state['revoked']:
                     return {}
                 raise TunnelError('denied')
-        async def bind(control, name, mode, target_port=None):
+        async def bind(control, name, mode, target_port=None, diagnostics=None, role=None):
             peer = Peer(target_port)
             peers.append(peer)
             return peer, {'session_id': str(len(peers)), 'generation': 1}
-        async def channel(control, peer, session):
+        async def channel(control, peer, session, diagnostics=None, role=None):
             return int(session['session_id'])
         async def healthy():
             healthy_calls.append(True)
@@ -256,4 +256,45 @@ def test_withdrawal_rechecks_leaks_delivered_during_server_close_wait(direction)
         with pytest.raises(RuntimeError, match='delivered before server closure'):
             await prove_withdrawal(peer, 7, marker, withdraw, observed, healthy, publisher)
         publisher.ws.close.assert_not_called()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('code,expected', [('permission_denied', 'permission_denied'),
+                                         ('session_fenced', 'session_fenced'),
+                                         ('private-bearer-token', None)])
+def test_independent_diagnostics_identify_failed_operation_without_reflecting_errors(code, expected):
+    from qualification.adversarial_named import qualify_adversarial
+    from dataplicity_cli.tunnels import TunnelError
+    async def scenario():
+        control = AsyncMock()
+        control.call.side_effect = TunnelError('private-secret-message', code)
+        diagnostics = {}
+        with pytest.raises(TunnelError):
+            await qualify_adversarial(control, None, None, 'fixture', 3000, bytearray(),
+                                      AsyncMock(), diagnostics)
+        assert diagnostics == ({'stage': 'permission_list', 'error_code': expected}
+                               if expected else {'stage': 'permission_list'})
+        assert 'private-secret-message' not in str(diagnostics)
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('operation', ['bootstrap', 'socket', 'admit'])
+def test_independent_bind_marks_the_exact_failing_stage_and_cleans_up(monkeypatch, operation):
+    from qualification import adversarial_named as gate
+    async def scenario():
+        control = AsyncMock()
+        peer = AsyncMock()
+        peer.connect.return_value = ('identity', 'challenge')
+        control.call.side_effect = ([RuntimeError('private')] if operation == 'bootstrap' else
+            [{'m2m_url': 'wss://example.invalid/'}, RuntimeError('private')] if operation == 'admit' else
+            [{'m2m_url': 'wss://example.invalid/'}])
+        if operation == 'socket':
+            peer.connect.side_effect = RuntimeError('private')
+        monkeypatch.setattr(gate, 'RawNamedPeer', lambda *args: peer)
+        diagnostics = {}
+        with pytest.raises(RuntimeError):
+            await gate.bind_peer(control, 'fixture', 'consumer', None, diagnostics, 'hostile')
+        assert diagnostics == {'stage': 'hostile_' + operation}
+        if operation != 'bootstrap':
+            peer.close.assert_awaited_once()
     asyncio.run(scenario())

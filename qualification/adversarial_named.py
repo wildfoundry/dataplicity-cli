@@ -10,6 +10,9 @@ from dataplicity_cli.m2m import PACKETS, bencode_decode, bencode_encode
 from dataplicity_cli.tunnels import websocket_url
 
 
+NAMED_ERROR_CODES = frozenset(('tunnel_error', 'authentication_unavailable', 'publisher_authentication_denied', 'invalid_publisher_credential', 'human_authentication_required', 'invalid_name', 'invalid_ports', 'invalid_principal', 'invalid_transport_proof', 'invalid_identity', 'unknown_router_owner', 'wrong_router_owner', 'router_unavailable', 'router_rejected', 'session_denied', 'session_fenced', 'session_expired', 'publisher_cannot_consume', 'publisher_scope_denied', 'permission_denied', 'paid_plan_required', 'tunnels_unavailable', 'publishing_disabled', 'relay_disabled', 'name_disabled', 'credential_rotated', 'credential_expired', 'replacement_denied', 'tunnel_offline', 'publisher_revoked', 'credential_limit', 'permission_limit', 'publisher_limit', 'stream_limit', 'admission_limit', 'transport_lost'))
+
+
 class RawNamedPeer:
     """Only server socket closure stops this peer; no CLI lifecycle/policy code."""
     def __init__(self, target_port=None):
@@ -170,14 +173,20 @@ class RawNamedPeer:
                 await asyncio.wait_for(writer.wait_closed(), 3)
 
 
-async def bind_peer(control, name, mode, target_port=None):
+async def bind_peer(control, name, mode, target_port=None, diagnostics=None, role=None):
+    def stage(operation):
+        if diagnostics is not None:
+            diagnostics["stage"] = (role or mode) + "_" + operation
+    stage("bootstrap")
     bootstrap = await control.call('GET', 'bootstrap/', params={'name': name, 'mode': mode})
     peer = RawNamedPeer(target_port if mode == 'publisher' else None)
     try:
+        stage('socket')
         identity, challenge = await peer.connect(bootstrap['m2m_url'])
         payload = {'name': name, 'identity': identity, 'challenge': challenge}
         if mode == 'publisher':
             payload['port'] = target_port
+        stage('admit')
         session = await control.call('POST', 'publish/' if mode == 'publisher' else 'connect/', payload=payload)
         return peer, session
     except BaseException:
@@ -185,7 +194,9 @@ async def bind_peer(control, name, mode, target_port=None):
         raise
 
 
-async def open_channel(control, peer, session):
+async def open_channel(control, peer, session, diagnostics=None, role=None):
+    if diagnostics is not None:
+        diagnostics["stage"] = role + "_channel"
     result = await control.call('POST', f"sessions/{session['session_id']}/channels/",
                                 payload={'generation': session['generation']})
     port = result['port']
@@ -242,39 +253,44 @@ async def prove_withdrawal(peer, port, marker, withdraw, observed, other_probe, 
 
 
 async def qualify_adversarial(admin, publisher_user, machine_factory, name, target_port,
-                              observed, unaffected_probe):
+                              observed, unaffected_probe, diagnostics=None):
     """Normal API grants; independent socket behavior and real TCP byte evidence."""
     from dataplicity_cli.tunnels import TunnelError
+    diagnostics = diagnostics if diagnostics is not None else {}
     peers, loops = [], []
     credential = permission = None
     primary_error = None
     try:
+        diagnostics['stage'] = 'permission_list'
         rows = (await admin.call('GET', 'permissions/'))['results']
         users = {row['user_id'] for row in rows if row['action'] == 'publish'
                  and row['name'] == '*' and type(row.get('user_id')) is int}
         if len(users) != 1:
             raise RuntimeError('Isolated publisher principal is ambiguous')
+        diagnostics['stage'] = 'permission_grant'
         permission = await admin.call('POST', 'permissions/', payload={
             'name': name, 'action': 'consume', 'user_id': users.pop(), 'ports': [target_port]})
+        diagnostics['stage'] = 'credential_create'
         credential = await admin.call('POST', 'credentials/', payload={
             'name': name, 'ports': [target_port], 'can_replace': False, 'label': 'Staging independent peer'})
         machine = machine_factory(credential['secret'])
-        publisher, p_session = await bind_peer(machine, name, 'publisher', target_port)
+        publisher, p_session = await bind_peer(machine, name, 'publisher', target_port, diagnostics, 'publisher')
         peers.append(publisher)
         loops.append(asyncio.create_task(heartbeat(machine, p_session)))
-        hostile, h_session = await bind_peer(publisher_user, name, 'consumer')
+        hostile, h_session = await bind_peer(publisher_user, name, 'consumer', None, diagnostics, 'hostile')
         peers.append(hostile)
         loops.append(asyncio.create_task(heartbeat(publisher_user, h_session)))
-        port = await open_channel(publisher_user, hostile, h_session)
-        unaffected, u_session = await bind_peer(admin, name, 'consumer')
+        port = await open_channel(publisher_user, hostile, h_session, diagnostics, 'hostile')
+        unaffected, u_session = await bind_peer(admin, name, 'consumer', None, diagnostics, 'unaffected')
         peers.append(unaffected)
         loops.append(asyncio.create_task(heartbeat(admin, u_session)))
-        other_port = await open_channel(admin, unaffected, u_session)
-        attacker, a_session = await bind_peer(publisher_user, name, 'consumer')
+        other_port = await open_channel(admin, unaffected, u_session, diagnostics, 'unaffected')
+        attacker, a_session = await bind_peer(publisher_user, name, 'consumer', None, diagnostics, 'attacker')
         peers.append(attacker)
         loops.append(asyncio.create_task(heartbeat(publisher_user, a_session)))
-        attacker_port = await open_channel(publisher_user, attacker, a_session)
+        attacker_port = await open_channel(publisher_user, attacker, a_session, diagnostics, 'attacker')
         await attacker.echo(attacker_port, b'independent-attacker-authorised')
+        diagnostics['stage'] = 'channel_retarget'
         forged = b'independent-forged-channel-' + name.encode()
         await attacker.send('route', other_port, forged)
         await asyncio.sleep(0.5)
@@ -283,6 +299,7 @@ async def qualify_adversarial(admin, publisher_user, machine_factory, name, targ
         await unaffected.echo(other_port, b'independent-after-forged-channel')
         await hostile.echo(port, b'independent-before-permission')
         await unaffected.echo(other_port, b'independent-authorised-other')
+        diagnostics['stage'] = 'permission_withdrawal'
         marker = b'independent-revoked-consumer-' + name.encode()
         async def withdraw_permission():
             nonlocal permission
@@ -292,6 +309,7 @@ async def qualify_adversarial(admin, publisher_user, machine_factory, name, targ
             await asyncio.gather(unaffected.echo(other_port, b'independent-other-survives'), unaffected_probe())
         await prove_withdrawal(hostile, port, marker, withdraw_permission, observed, healthy, publisher)
         permission = None
+        diagnostics['stage'] = 'consumer_replay'
         try:
             await publisher_user.call('GET', 'bootstrap/', params={'name': name, 'mode': 'consumer'})
         except TunnelError:
@@ -300,6 +318,7 @@ async def qualify_adversarial(admin, publisher_user, machine_factory, name, targ
             raise RuntimeError('Withdrawn consumer was admitted again')
         # Credential withdrawal fences both ends. Both raw peers attempt writes,
         # even if server closure already prevents the send from succeeding.
+        diagnostics['stage'] = 'credential_withdrawal'
         marker = b'independent-revoked-token-' + name.encode()
         async def withdraw_credential():
             nonlocal credential
@@ -323,6 +342,7 @@ async def qualify_adversarial(admin, publisher_user, machine_factory, name, targ
         if publisher.closed_at is None or publisher.closed_at - credential_withdrawn > 15:
             raise RuntimeError('Independent publisher closure exceeded the measured bound')
         unaffected.check(); publisher.check()
+        diagnostics['stage'] = 'publisher_replay'
         try:
             await machine.call('GET', 'bootstrap/', params={'name': name, 'mode': 'publisher'})
         except TunnelError:
@@ -331,6 +351,9 @@ async def qualify_adversarial(admin, publisher_user, machine_factory, name, targ
             raise RuntimeError('Revoked publisher token was replayed successfully')
         credential = None
     except BaseException as exc:
+        # Never emit arbitrary server error codes or exception text.
+        if isinstance(exc, TunnelError) and exc.code in NAMED_ERROR_CODES:
+            diagnostics['error_code'] = exc.code
         primary_error = exc
         raise
     finally:
