@@ -15,6 +15,8 @@ import os
 import socket
 import ssl
 import subprocess
+import socketserver
+import threading
 from contextlib import suppress
 from pathlib import Path
 from types import SimpleNamespace
@@ -22,7 +24,7 @@ from uuid import uuid4
 from unittest.mock import Mock
 
 import pytest
-from aiohttp import BasicAuth, ClientSession, web
+from aiohttp import BasicAuth, ClientSession, WSMsgType, web
 
 from dataplicity_cli.m2m import bencode_decode
 from dataplicity_cli.tunnel_transport import TunnelM2MClient
@@ -126,6 +128,81 @@ def unused_port():
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
         return probe.getsockname()[1]
+
+
+class SSHFixture:
+    """A real SSH server with fixed test credentials and a single inert command."""
+    def __init__(self):
+        import paramiko
+        self.key = paramiko.RSAKey.generate(2048)
+        key = self.key
+
+        class Authority(paramiko.ServerInterface):
+            def __init__(self):
+                self.executed = threading.Event()
+
+            def check_auth_password(self, username, password):
+                return paramiko.AUTH_SUCCESSFUL if (username, password) == ("qualification", "test-only") else paramiko.AUTH_FAILED
+
+            def get_allowed_auths(self, username):
+                return "password"
+
+            def check_channel_request(self, kind, channel_id):
+                return paramiko.OPEN_SUCCEEDED if kind == "session" else paramiko.OPEN_FAILED_ADMINISTRATIVELY_PROHIBITED
+
+            def check_channel_exec_request(self, channel, command):
+                if command != b"qualification":
+                    return False
+                self.executed.set()
+                return True
+
+        class Handler(socketserver.BaseRequestHandler):
+            def handle(self):
+                with paramiko.Transport(self.request) as transport:
+                    transport.add_server_key(key)
+                    authority = Authority()
+                    transport.start_server(server=authority)
+                    channel = transport.accept(5)
+                    if channel is not None:
+                        if authority.executed.wait(5):
+                            channel.sendall(b"named-tunnel-ssh-ok\n")
+                            channel.send_exit_status(0)
+                            channel.shutdown_write()
+                            transport.join(timeout=5)
+                        channel.close()
+
+        class Server(socketserver.ThreadingTCPServer):
+            daemon_threads = True
+
+        self.server = Server(("127.0.0.1", 0), Handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def probe(self, port):
+        import paramiko
+        with paramiko.SSHClient() as client:
+            # The fixture's public key is known before connection; reject changes.
+            client.get_host_keys().add(f"[127.0.0.1]:{port}", self.key.get_name(), self.key)
+            client.connect("127.0.0.1", port=port, username="qualification", password="test-only",
+                           allow_agent=False, look_for_keys=False, timeout=5, auth_timeout=5, banner_timeout=5)
+            _, stdout, stderr = client.exec_command("qualification", timeout=5)
+            assert stdout.read() == b"named-tunnel-ssh-ok\n"
+            assert stderr.read() == b""
+            assert stdout.channel.recv_exit_status() == 0
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=5)
+
+
+def postgres_probe(port):
+    import psycopg
+    with psycopg.connect(host="127.0.0.1", port=port, user="postgres", password="tunnels-test-only",
+                          dbname="postgres", connect_timeout=5, sslmode="disable") as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT current_user, 749, repeat('named-tunnel-', 1000)")
+            assert cursor.fetchone() == ("postgres", 749, "named-tunnel-" * 1000)
 
 
 @pytest.mark.asyncio
@@ -274,6 +351,64 @@ async def test_actual_cli_router_http_multistream_half_close_and_uncooperative_r
             await adversary.close()
             adversary = None
             await eventually(lambda: not services[0].router.named_tunnels.sessions)
+
+            async def through_tunnel(target_port, probe):
+                broker.port = target_port
+                published.clear()
+                listening.clear()
+                publisher = TunnelSession(broker.control("publisher"), "test-api", lambda event: published.set() if event["event"] == "published" else None)
+                consumer = TunnelSession(broker.control("consumer"), "test-api", lambda event: listening.set() if event["event"] == "listener_started" else None)
+                tasks.append(asyncio.create_task(publisher.publish(target_port)))
+                await ready(published, tasks[-1])
+                port = unused_port()
+                tasks.append(asyncio.create_task(consumer.connect(port)))
+                await ready(listening, tasks[-1])
+                try:
+                    await asyncio.wait_for(probe(port), 15)
+                finally:
+                    for task in tasks:
+                        task.cancel()
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                    tasks.clear()
+                await eventually(lambda: not services[0].router.named_tunnels.sessions)
+                assert not services[1].router.named_tunnels.sessions
+
+            async def websocket_echo(request):
+                websocket = web.WebSocketResponse(compress=False)
+                await websocket.prepare(request)
+                async for message in websocket:
+                    if message.type == WSMsgType.TEXT:
+                        await websocket.send_str(message.data)
+                    elif message.type == WSMsgType.BINARY:
+                        await websocket.send_bytes(message.data)
+                return websocket
+
+            ws_app = web.Application()
+            ws_app.router.add_get("/echo", websocket_echo)
+            ws_runner = web.AppRunner(ws_app)
+            await ws_runner.setup()
+            runners.append(ws_runner)
+            ws_site = web.TCPSite(ws_runner, "127.0.0.1", 0)
+            await ws_site.start()
+
+            async def websocket_probe(port):
+                async with http.ws_connect(f"http://127.0.0.1:{port}/echo", compress=0) as websocket:
+                    await websocket.send_json({"protocol": "websocket", "qualification": 749})
+                    assert await websocket.receive_json() == {"protocol": "websocket", "qualification": 749}
+                    payload = bytes(range(256)) * 256
+                    await websocket.send_bytes(payload)
+                    assert (await websocket.receive()).data == payload
+                    await websocket.send_str("still-open")
+                    assert (await websocket.receive()).data == "still-open"
+
+            await through_tunnel(ws_site._server.sockets[0].getsockname()[1], websocket_probe)
+            await through_tunnel(int(os.environ.get("DATAPLICITY_TEST_POSTGRES_PORT", "55432")),
+                                 lambda port: asyncio.to_thread(postgres_probe, port))
+            ssh = await asyncio.to_thread(SSHFixture)
+            try:
+                await through_tunnel(ssh.server.server_address[1], lambda port: asyncio.to_thread(ssh.probe, port))
+            finally:
+                await asyncio.to_thread(ssh.close)
     finally:
         for task in tasks:
             task.cancel()
