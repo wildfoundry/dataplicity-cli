@@ -29,6 +29,11 @@ jobs:
         run: |
           pytest -q --maxfail=1 --cov=dataplicity_cli --cov-report=term-missing --cov-fail-under=100
 
+      - name: Staging acceptance security contracts
+        run: >-
+          pytest -q qualification/test_staging_contract.py
+          qualification/test_presence_browser_contract.py qualification/test_adversarial_named.py
+
   lint-and-smoke:
     name: Compile + help smoke
     runs-on: ${{ matrix.os }}
