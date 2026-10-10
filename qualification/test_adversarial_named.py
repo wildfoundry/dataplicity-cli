@@ -109,7 +109,7 @@ def test_receiver_only_records_remote_socket_close_without_closing_tcp_or_websoc
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize('failure', [None, 'retarget', 'token_forward', 'token_replay', 'cleanup'])
+@pytest.mark.parametrize('failure', [None, 'retarget', 'token_forward', 'token_replay', 'cleanup', 'replay_unavailable', 'token_replay_unavailable'])
 def test_orchestration_revokes_exact_grant_and_token_with_cleanup_and_no_pass_on_leaks(monkeypatch, failure):
     from qualification import adversarial_named as gate
     from dataplicity_cli.tunnels import TunnelError
@@ -155,7 +155,9 @@ def test_orchestration_revokes_exact_grant_and_token_with_cleanup_and_no_pass_on
             async def call(self, method, resource, **kwargs):
                 if failure == 'token_replay' and state['revoked']:
                     return {}
-                raise TunnelError('denied')
+                if failure == 'replay_unavailable' or (failure == 'token_replay_unavailable' and state['revoked']):
+                    raise TunnelError('private', 'router_unavailable')
+                raise TunnelError('denied', 'invalid_publisher_credential' if state['revoked'] else 'permission_denied')
         async def bind(control, name, mode, target_port=None, diagnostics=None, role=None):
             peer = Peer(target_port)
             peers.append(peer)

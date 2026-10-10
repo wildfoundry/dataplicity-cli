@@ -312,8 +312,9 @@ async def qualify_adversarial(admin, publisher_user, machine_factory, name, targ
         diagnostics['stage'] = 'consumer_replay'
         try:
             await publisher_user.call('GET', 'bootstrap/', params={'name': name, 'mode': 'consumer'})
-        except TunnelError:
-            pass
+        except TunnelError as exc:
+            if exc.code != 'permission_denied':
+                raise
         else:
             raise RuntimeError('Withdrawn consumer was admitted again')
         # Credential withdrawal fences both ends. Both raw peers attempt writes,
@@ -345,8 +346,9 @@ async def qualify_adversarial(admin, publisher_user, machine_factory, name, targ
         diagnostics['stage'] = 'publisher_replay'
         try:
             await machine.call('GET', 'bootstrap/', params={'name': name, 'mode': 'publisher'})
-        except TunnelError:
-            pass
+        except TunnelError as exc:
+            if exc.code not in {'invalid_publisher_credential', 'publisher_authentication_denied'}:
+                raise
         else:
             raise RuntimeError('Revoked publisher token was replayed successfully')
         credential = None
