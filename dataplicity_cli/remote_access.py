@@ -308,9 +308,11 @@ async def run_port_forward(
     *,
     channel_factory: Optional[PortForwardChannelFactory] = None,
     event_callback: Optional[PortForwardEventCallback] = None,
+    half_close: bool = False,
 ) -> None:
     initial_channel_claimed = False
     initial_channel_lock = asyncio.Lock()
+    clients: set[asyncio.Task] = set()
 
     def emit(kind: str, *, bytes_count: int = 0, detail: str = "") -> None:
         if event_callback:
@@ -334,6 +336,13 @@ async def run_port_forward(
         return await channel_factory()
 
     async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        client_task = asyncio.current_task()
+        if half_close and len(clients) >= m2m.MAX_CHANNELS:
+            emit("connection_rejected", detail="Tunnel stream limit reached")
+            await _close_stream_writer(writer)
+            return
+        if client_task is not None:
+            clients.add(client_task)
         peer = writer.get_extra_info("peername")
         peer_label = str(peer) if peer else "unknown"
         connection_label = f"{peer_label}/{id(writer):x}"
@@ -384,6 +393,9 @@ async def run_port_forward(
             except Exception as exc:
                 emit("connection_rejected", detail=f"{connection_label}: {exc}")
                 return
+            if half_close:
+                await bridge_tcp_channel(m2m, channel_for_client, reader, writer, event_callback=event_callback)
+                return
             to_remote_task = asyncio.create_task(local_to_remote())
             to_local_task = asyncio.create_task(remote_to_local())
             done, pending = await asyncio.wait(
@@ -401,6 +413,8 @@ async def run_port_forward(
                     emit("channel_close_failed", detail=f"{connection_label}: {exc}")
             await _close_stream_writer(writer)
             emit("connection_closed", detail=connection_label)
+            if client_task is not None:
+                clients.discard(client_task)
 
     server = await asyncio.start_server(handle_client, host="127.0.0.1", port=local_port)
     emit("listener_started", detail=f"127.0.0.1:{local_port}")
@@ -410,3 +424,55 @@ async def run_port_forward(
     except asyncio.CancelledError:
         emit("listener_stopped")
         raise
+    finally:
+        for task in list(clients):
+            task.cancel()
+        await asyncio.gather(*list(clients), return_exceptions=True)
+
+
+async def bridge_tcp_channel(
+    m2m: M2MClient,
+    channel_port: int,
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+    *,
+    event_callback: Optional[PortForwardEventCallback] = None,
+) -> None:
+    """Bridge an admitted TCP channel, retaining the read half after local EOF.
+
+    Tunnel-capable M2M clients supply an EOF marker and send_channel_eof method.
+    The caller owns channel and socket cleanup; cancellation joins both pumps.
+    """
+    async def upstream() -> None:
+        while True:
+            data = await reader.read(getattr(m2m, "frame_bytes", 65536))
+            if not data:
+                await m2m.send_channel_eof(channel_port)
+                return
+            await m2m.send_route(channel_port, data)
+            if event_callback:
+                event_callback(PortForwardEvent("bytes_up", time.monotonic(), len(data)))
+
+    async def downstream() -> None:
+        queue = m2m.channel_queue(channel_port)
+        while True:
+            data = await queue.get()
+            if data is None:
+                raise ConnectionError("Tunnel channel closed")
+            if data is m2m.EOF:
+                if writer.can_write_eof():
+                    writer.write_eof()
+                    await writer.drain()
+                return
+            writer.write(data)
+            await writer.drain()
+            if event_callback:
+                event_callback(PortForwardEvent("bytes_down", time.monotonic(), len(data)))
+
+    tasks = [asyncio.create_task(upstream()), asyncio.create_task(downstream())]
+    try:
+        await asyncio.gather(*tasks)
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)

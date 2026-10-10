@@ -11,6 +11,9 @@ smoke_binary() {
   local binary="$1"
   "${binary}" --version
   "${binary}" --help >/dev/null
+  "${binary}" tunnel publish --help >/dev/null
+  "${binary}" tunnel connect --help >/dev/null
+  "${binary}" tunnel token create --help >/dev/null
 }
 
 if [[ "${1:-}" == "--binary" ]]; then

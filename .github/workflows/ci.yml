@@ -45,11 +45,18 @@ jobs:
       - name: Install
         run: |
           python -m pip install --upgrade pip
-          pip install .
+          pip install ".[test]"
       - name: Compile
         run: python -m compileall -q dataplicity_cli
       - name: Help smoke
-        run: python -m dataplicity_cli --help
+        run: |
+          python -m dataplicity_cli --help
+          python -m dataplicity_cli tunnel --help
+          python -m dataplicity_cli tunnel publish --help
+          python -m dataplicity_cli tunnel connect --help
+          python -m dataplicity_cli tunnel token --help
+      - name: Native named tunnel TCP and protocol tests
+        run: pytest -q tests/test_tunnel_transport.py tests/test_tunnel_tcp.py tests/test_tunnels.py tests/test_tunnel_cli.py
 
   windows-unit-tests:
     name: Windows unit tests
@@ -88,6 +95,8 @@ jobs:
             dataplicity_cli/__main__.py
           ./pyinstaller-dist/dataplicity.exe --version
           ./pyinstaller-dist/dataplicity.exe --help
+          ./pyinstaller-dist/dataplicity.exe tunnel publish --help
+          ./pyinstaller-dist/dataplicity.exe tunnel connect --help
           ./build/windows/build_msi.ps1 -Version $env:VERSION
           "MSI_PATH=$((Resolve-Path "dist/dataplicity-cli-$env:VERSION-windows-x64.msi").Path)" >> $env:GITHUB_ENV
       - name: Install, verify, and uninstall MSI
@@ -115,6 +124,14 @@ jobs:
             & $installedExe --help
             if ($LASTEXITCODE -ne 0) {
               throw "Installed executable --help failed."
+            }
+            & $installedExe tunnel publish --help
+            if ($LASTEXITCODE -ne 0) {
+              throw "Installed executable tunnel publish --help failed."
+            }
+            & $installedExe tunnel connect --help
+            if ($LASTEXITCODE -ne 0) {
+              throw "Installed executable tunnel connect --help failed."
             }
             $machinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
             $expectedPathEntry = $installDir -replace '[\\/]+$', ''
@@ -144,6 +161,36 @@ jobs:
           if ($pathEntriesAfterUninstall -contains $expectedPathEntry) {
             throw "Installer PATH entry remains after uninstall: $installDir"
           }
+
+  macos-pkg-smoke:
+    name: macOS existing PKG smoke
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install existing build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install . pyinstaller
+      - name: Build existing executable and PKG
+        run: |
+          VERSION="$(python build/get_version.py)"
+          pyinstaller --noconfirm --clean --onefile --name dataplicity \
+            --target-architecture universal2 --exclude-module websockets.speedups \
+            --workpath pyinstaller-build --distpath pyinstaller-dist \
+            dataplicity_cli/__main__.py
+          mkdir -p dist
+          bash build/macos/build_pkg.sh "${VERSION}" universal2
+          sudo installer -pkg "dist/dataplicity-cli-${VERSION}-macos-universal2.pkg" -target /
+      - name: Verify installed CLI commands and existing forwarding
+        run: |
+          /usr/local/bin/dataplicity --version
+          /usr/local/bin/dataplicity tunnel publish --help
+          /usr/local/bin/dataplicity tunnel connect --help
+          /usr/local/bin/dataplicity tunnel token create --help
+          bash scripts/linux_port_forward_smoke.sh /usr/local/bin/dataplicity
 
   linux-packages-smoke:
     name: Linux packages smoke
