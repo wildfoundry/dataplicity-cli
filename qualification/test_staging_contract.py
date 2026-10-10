@@ -113,10 +113,12 @@ def test_continuity_probe_keeps_same_stream_and_still_admits_new_connections(mon
     from qualification import staging_acceptance as acceptance
     async def exercise():
         reader = asyncio.StreamReader()
+        persistent = []
         class Writer:
             def is_closing(self):
                 return False
             def write(self, data):
+                persistent.append(data)
                 reader.feed_data(data)
             async def drain(self):
                 return
@@ -131,7 +133,8 @@ def test_continuity_probe_keeps_same_stream_and_still_admits_new_connections(mon
         await acceptance._legacy_exchange(legacy, b'before-replacement')
         await acceptance._legacy_exchange(legacy, b'after-replacement')
         assert legacy['persistent_writer'] is writer
-        assert fresh == [b'before-replacement', b'after-replacement']
+        assert fresh == [b'fresh:before-replacement', b'fresh:after-replacement']
+        assert persistent == [b'persistent:before-replacement', b'persistent:after-replacement']
         assert legacy['diagnostics']['probe_count'] == 2
         assert legacy['diagnostics']['persistent_probe_count'] == 2
     asyncio.run(exercise())
@@ -152,7 +155,7 @@ def test_closed_existing_stream_cannot_pass_because_new_connection_works(monkeyp
                   'persistent_lock': asyncio.Lock()}
         with pytest.raises(acceptance.LegacyExistingStreamClosed):
             await acceptance._legacy_exchange(legacy, b'after-revocation')
-        assert fresh == [b'after-revocation']
+        assert fresh == [b'fresh:after-revocation']
     asyncio.run(exercise())
 
 
@@ -168,3 +171,65 @@ def test_legacy_failure_diagnostics_drop_secrets_unknowns_and_unbounded_values()
     assert evidence == {'http_status': 201, 'admission_stage': 3, 'shared_close_event': False,
                         'agent_channel_count': 2, 'websocket_open': True, 'agent_running': True,
                         'persistent_stream_open': False}
+
+
+@pytest.mark.parametrize('payload,expected', [
+    ({'status': 'fail'}, 'LegacyAdmissionRejected'),
+    ({'status': 'error'}, 'LegacyAdmissionRejected'),
+    ({'status': 'ok'}, 'LegacyAdmissionMalformed'),
+    ({'status': 'ok', 'port': True, 'service': 'redirect-port', 'route': ['client', True, 'device', True]}, 'LegacyAdmissionMalformed'),
+    ({'status': 'ok', 'port': 749, 'service': 'terminal', 'route': ['client', 749, 'device', 749]}, 'LegacyAdmissionMalformed'),
+    ({'status': 'ok', 'port': 749, 'service': 'redirect-port', 'route': ['someone-else', 749, 'device', 749]}, 'LegacyAdmissionMalformed'),
+])
+def test_legacy_http_success_cannot_admit_failed_or_wrong_route(monkeypatch, payload, expected):
+    from types import SimpleNamespace
+    from qualification import staging_acceptance as acceptance
+    async def forbidden_wait():
+        raise AssertionError('Invalid API response must fail before waiting for NotifyOpen')
+    client = SimpleNamespace(identity='client', wait_for_channel_open=forbidden_wait)
+    response = SimpleNamespace(ok=True, data=payload)
+    with pytest.raises(getattr(acceptance, expected)):
+        asyncio.run(acceptance._legacy_admitted_channel(client, response, 'device', {}))
+
+
+def test_legacy_notify_open_must_match_admitted_port_without_retry_or_discard():
+    from qualification import staging_acceptance as acceptance
+    from dataplicity_cli.api import ApiResponse
+    from dataplicity_cli.m2m import M2MClient
+    async def exercise():
+        client = M2MClient('wss://qualification.invalid/m2m/')
+        client.identity = 'client'
+        response = ApiResponse(True, 200, {'status': 'ok', 'port': 749,
+            'service': 'redirect-port', 'route': ['client', 749, 'device', 749]}, '')
+        client._channel_open_queue.put_nowait(748)
+        client._channel_open_queue.put_nowait(749)
+        diagnostic = {}
+        with pytest.raises(acceptance.LegacyNotifyOpenMismatch):
+            await acceptance._legacy_admitted_channel(client, response, 'device', diagnostic)
+        assert diagnostic['expected_channel_match'] is False
+        assert client._channel_open_queue.get_nowait() == 749
+        client._channel_open_queue.put_nowait(749)
+        assert await acceptance._legacy_admitted_channel(client, response, 'device', diagnostic) == 749
+        assert diagnostic['expected_channel_match'] is True
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize('admitted,expected', [
+    (False, 'LegacyNotifyOpenTimeout'), (True, 'LegacyExistingStreamTimeout')])
+def test_initial_persistent_timeout_distinguishes_admission_from_established_stream(admitted, expected):
+    from types import SimpleNamespace
+    from qualification import staging_acceptance as acceptance
+    async def timeout(_length):
+        raise asyncio.TimeoutError()
+    async def drain():
+        return
+    async def exercise():
+        legacy = {'diagnostics': {'admission_stage': 2, 'http_status': 200},
+                  'process': SimpleNamespace(returncode=None),
+                  'client': SimpleNamespace(ws=SimpleNamespace(state=SimpleNamespace(name='OPEN'))),
+                  'persistent_lock': asyncio.Lock(), 'persistent_admitted': admitted,
+                  'persistent_reader': SimpleNamespace(at_eof=lambda: False, readexactly=timeout),
+                  'persistent_writer': SimpleNamespace(is_closing=lambda: False, write=lambda data: None, drain=drain)}
+        with pytest.raises(getattr(acceptance, expected)):
+            await acceptance._legacy_existing_exchange(legacy, b'probe')
+    asyncio.run(exercise())
