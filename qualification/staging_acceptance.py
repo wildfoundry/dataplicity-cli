@@ -271,12 +271,15 @@ async def qualify_named_and_legacy(fixture):
         legacy = await _start_legacy(fixture, target_port, report)
         await _legacy_exchange(legacy, b'actual-legacy-agent-reconnect')
         report['cases']['actual_legacy_agent_restart_and_mesh_reconnect'] = True
+        report['cases']['existing_legacy_stream_survives_named_operations'] = True
         report['actual_legacy_agent_verified'] = True
         report['status'] = 'passed'
     except Exception as exc:
         report['failure_type'] = type(exc).__name__
         report['failed_phase'] = phase
     finally:
+        if legacy:
+            report['legacy_diagnostics'] = _legacy_diagnostics(legacy)
         # Cancel lifecycle loops before closing transports so publishers cannot
         # interpret qualification cleanup as a loss and start reconnecting.
         for task in tasks:
@@ -339,7 +342,8 @@ client.run_forever()
         {'remote_directory': remote.name}) + '\n').encode())
     await process.stdin.drain(); process.stdin.close()
     legacy = {'process': process, 'directory': remote, 'tasks': [], 'client': None,
-              'diagnostics': {'admission_stage': 0, 'http_status': 0, 'bytes_up': 0, 'bytes_down': 0}}
+              'diagnostics': {'admission_stage': 0, 'http_status': 0, 'bytes_up': 0, 'bytes_down': 0,
+                              'probe_count': 0, 'persistent_probe_count': 0}}
     async def collect_state():
         while line := await process.stdout.readline():
             try:
@@ -409,11 +413,16 @@ client.run_forever()
         legacy['local_port'] = local_port
         await _ready(forward, listening)
         await _legacy_exchange(legacy, b'actual-released-agent-bidirectional-mesh')
+        legacy['persistent_reader'], legacy['persistent_writer'] = await asyncio.wait_for(
+            asyncio.open_connection('127.0.0.1', local_port), 10)
+        legacy['persistent_lock'] = asyncio.Lock()
+        await _legacy_existing_exchange(legacy, b'actual-existing-legacy-stream')
         report['cases']['actual_released_legacy_agent_distinct_router_nodes'] = True
         report['legacy_agent'] = {'version': version, 'commit_sha': actual}
         report['router_node_ids'] = sorted(set(report['router_node_ids']))
         return legacy
     except BaseException:
+        report['legacy_diagnostics'] = _legacy_diagnostics(legacy)
         await _stop_legacy(legacy)
         raise
 
@@ -442,6 +451,14 @@ class LegacyRouterSocketClosed(RuntimeError):
     """The legacy client router WebSocket closed during the probe."""
 
 
+class LegacyExistingStreamTimeout(RuntimeError):
+    """The already established legacy TCP stream did not return probe bytes."""
+
+
+class LegacyExistingStreamClosed(RuntimeError):
+    """The already established legacy TCP stream closed during named operations."""
+
+
 class LegacyAgentExited(RuntimeError):
     """The unchanged agent subprocess exited during the probe."""
 
@@ -449,8 +466,14 @@ class LegacyAgentExited(RuntimeError):
 async def _legacy_exchange(legacy, payload):
     diagnostic = legacy['diagnostics']
     diagnostic.update(admission_stage=0, http_status=0, bytes_up=0, bytes_down=0)
+    diagnostic['probe_count'] = diagnostic.get('probe_count', 0) + 1
+    probes = [asyncio.create_task(_exchange(legacy['local_port'], payload))]
+    if legacy.get('persistent_writer'):
+        # Keep testing freshly admitted connections as well as the old stream;
+        # establishing a new stream never substitutes for continuity evidence.
+        probes.append(asyncio.create_task(_legacy_existing_exchange(legacy, payload)))
     try:
-        await _exchange(legacy['local_port'], payload)
+        await asyncio.gather(*probes)
     except (asyncio.TimeoutError, asyncio.IncompleteReadError) as exc:
         # Distinct safe exception names survive backend evidence filtering.
         # No retries, replacement probes or weaker success criteria hide failure.
@@ -468,9 +491,50 @@ async def _legacy_exchange(legacy, payload):
         if stage < 3:
             raise LegacyNotifyOpenTimeout() from exc
         raise LegacyPayloadTimeout() from exc
+    finally:
+        for probe in probes:
+            probe.cancel()
+        await asyncio.gather(*probes, return_exceptions=True)
+
+
+async def _legacy_existing_exchange(legacy, payload):
+    async with legacy['persistent_lock']:
+        reader, writer = legacy['persistent_reader'], legacy['persistent_writer']
+        if writer.is_closing() or reader.at_eof():
+            raise LegacyExistingStreamClosed()
+        try:
+            writer.write(payload)
+            await writer.drain()
+            result = await asyncio.wait_for(reader.readexactly(len(payload)), 20)
+        except asyncio.TimeoutError as exc:
+            raise LegacyExistingStreamTimeout() from exc
+        except (OSError, asyncio.IncompleteReadError) as exc:
+            raise LegacyExistingStreamClosed() from exc
+        if result != payload:
+            raise RuntimeError('Established legacy stream changed probe bytes')
+        legacy['diagnostics']['persistent_probe_count'] = legacy['diagnostics'].get('persistent_probe_count', 0) + 1
+
+
+def _legacy_diagnostics(legacy):
+    diagnostic = dict(legacy['diagnostics'])
+    client = legacy.get('client')
+    diagnostic['websocket_open'] = bool(client and client.ws and client.ws.state.name == 'OPEN')
+    diagnostic['agent_running'] = legacy['process'].returncode is None
+    writer, reader = legacy.get('persistent_writer'), legacy.get('persistent_reader')
+    diagnostic['persistent_stream_open'] = bool(writer and not writer.is_closing() and not reader.at_eof())
+    limits = {'admission_stage': 3, 'http_status': 599, 'bytes_up': 2 ** 30, 'bytes_down': 2 ** 30,
+              'agent_channel_count': 4096, 'probe_count': 256, 'persistent_probe_count': 256}
+    booleans = {'shared_close_event', 'agent_m2m_closed', 'websocket_open', 'agent_running', 'persistent_stream_open'}
+    return {key: value for key, value in diagnostic.items() if
+            key in limits and type(value) is int and 0 <= value <= limits[key]
+            or key in booleans and type(value) is bool}
 
 
 async def _stop_legacy(legacy):
+    if legacy.get('persistent_writer'):
+        legacy['persistent_writer'].close()
+        with suppress(OSError):
+            await legacy['persistent_writer'].wait_closed()
     for task in legacy.get('tasks', []):
         task.cancel()
     await asyncio.gather(*legacy.get('tasks', []), return_exceptions=True)
