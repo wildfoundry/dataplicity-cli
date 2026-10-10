@@ -38,6 +38,16 @@ def websocket_url(url: str) -> str:
     return urlunsplit(("wss", parts.netloc, parts.path, query, ""))
 
 
+def frame_limit(payload: dict) -> int:
+    limits = payload.get("limits", {})
+    if not isinstance(limits, dict):
+        raise TunnelError("The server returned invalid tunnel limits.")
+    value = limits.get("frame_bytes", limits.get("max_buffer_bytes", 65536))
+    if type(value) is not int or not 1024 <= value <= 65536:
+        raise TunnelError("The server returned an invalid tunnel frame limit.")
+    return value
+
+
 class TunnelAPI:
     def __init__(self, api: ApiClient, organisation: str, token: Optional[str] = None) -> None:
         if not re.fullmatch(r"[A-Za-z0-9_-]+", organisation):
@@ -97,9 +107,11 @@ class TunnelSession:
         self.emit = emit
         self.session: Optional[dict] = None
         self.m2m: Optional[TunnelM2MClient] = None
+        self.frame_bytes = 65536
 
     async def _transport(self, url: str) -> tuple[str, str]:
         self.m2m = TunnelM2MClient(websocket_url(url), identity_headers(self.control.api.config.install_id))
+        self.m2m.frame_bytes = self.frame_bytes
         await self.m2m.connect()
         return await self.m2m.wait_for_binding()
 
@@ -107,7 +119,10 @@ class TunnelSession:
         assert self.session is not None
         while True:
             await asyncio.sleep(min(15, max(1, self.session.get("heartbeat_seconds", 15))))
-            await self.control.call("POST", f"sessions/{self.session['session_id']}/heartbeat/", payload={"generation": self.session["generation"]})
+            renewed = await self.control.call("POST", f"sessions/{self.session['session_id']}/heartbeat/", payload={"generation": self.session["generation"]})
+            self.frame_bytes = min(self.frame_bytes, frame_limit(renewed))
+            if self.m2m is not None:
+                self.m2m.frame_bytes = self.frame_bytes
 
     async def _run_until_closed(self, action: Any) -> None:
         assert self.m2m is not None
@@ -136,6 +151,7 @@ class TunnelSession:
 
     async def publish(self, port: int) -> None:
         bootstrap = await self.control.call("GET", "bootstrap/", params={"name": self.name, "mode": "publisher"})
+        self.frame_bytes = frame_limit(bootstrap)
         failures = 0
         try:
             while True:
@@ -145,6 +161,9 @@ class TunnelSession:
                         self.session = await self.control.call("POST", "publish/", payload={"name": self.name, "port": port, "identity": identity, "challenge": challenge})
                     else:
                         self.session = await self.control.call("POST", f"sessions/{self.session['session_id']}/resume/", payload={"generation": self.session["generation"], "identity": identity, "challenge": challenge})
+                    self.frame_bytes = min(self.frame_bytes, frame_limit(self.session))
+                    if self.m2m is not None:
+                        self.m2m.frame_bytes = self.frame_bytes
                     failures = 0
                     self.emit({"event": "published", "name": self.name, "target_port": port})
                     await self._run_until_closed(self._serve_publisher(port))
@@ -200,9 +219,11 @@ class TunnelSession:
     async def connect(self, local_port: int) -> None:
         try:
             bootstrap = await self.control.call("GET", "bootstrap/", params={"name": self.name, "mode": "consumer"})
+            self.frame_bytes = frame_limit(bootstrap)
             identity, challenge = await self._transport(bootstrap["m2m_url"])
             self.session = await self.control.call("POST", "connect/", payload={"name": self.name, "identity": identity, "challenge": challenge})
             assert self.m2m is not None
+            self.m2m.frame_bytes = min(self.frame_bytes, frame_limit(self.session))
 
             async def channel_factory() -> int:
                 assert self.session is not None

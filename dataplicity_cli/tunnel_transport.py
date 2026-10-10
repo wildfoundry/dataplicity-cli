@@ -14,6 +14,7 @@ class TunnelM2MClient(M2MClient):
     EOF = object()
     MAX_CHANNELS = 32
     MAX_FRAME = 65536
+    frame_bytes = MAX_FRAME
     QUEUE_FRAMES = 16
 
     def __init__(self, url: str, extra_headers: Dict[str, str]) -> None:

@@ -6,10 +6,19 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 from dataplicity_cli.api import ApiResponse
-from dataplicity_cli.tunnels import TunnelAPI, TunnelError, TunnelSession, validate_name, websocket_url
+from dataplicity_cli.tunnels import TunnelAPI, TunnelError, TunnelSession, frame_limit, validate_name, websocket_url
 
 
 class ControlTests(unittest.TestCase):
+    def test_server_frame_limits(self):
+        self.assertEqual(frame_limit({}), 65536)
+        self.assertEqual(frame_limit({"limits": {"frame_bytes": 1024}}), 1024)
+        self.assertEqual(frame_limit({"limits": {"max_buffer_bytes": 2048}}), 2048)
+        for limit in [0, True, "1024", 65537]:
+            with self.assertRaises(TunnelError):
+                frame_limit({"limits": {"frame_bytes": limit}})
+        with self.assertRaises(TunnelError):
+            frame_limit({"limits": None})
     def test_names_and_secure_owner_urls(self):
         self.assertEqual(validate_name(" Test.API_1 "), "test.api_1")
         for value in ["", "-dash", "spaces are invalid", "../secret", "a" * 64, "a;echo", "é"]:
@@ -72,11 +81,13 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
     async def test_heartbeat_and_transport_closure(self):
         session = self.session()
         session.session = {"session_id": "s", "generation": 4, "heartbeat_seconds": 1}
-        session.control.call.side_effect = TunnelError("revoked", "revoked")
+        session.m2m = Mock()
+        session.control.call.side_effect = [{"limits": {"frame_bytes": 1024}}, TunnelError("revoked", "revoked")]
         with patch("dataplicity_cli.tunnels.asyncio.sleep", new=AsyncMock()):
             with self.assertRaises(TunnelError):
                 await session._heartbeat()
         session.control.call.assert_awaited_with("POST", "sessions/s/heartbeat/", payload={"generation": 4})
+        self.assertEqual(session.m2m.frame_bytes, 1024)
 
         async def pending():
             await asyncio.Future()
@@ -98,6 +109,7 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_publish_resume_never_fresh_publishes_after_loss(self):
         session = self.session()
+        session.m2m = Mock()
         session._transport = AsyncMock(return_value=("id", "proof"))
         session._serve_publisher = Mock(return_value=object())
         session._run_until_closed = AsyncMock(side_effect=TunnelError("lost", "transport_lost"))

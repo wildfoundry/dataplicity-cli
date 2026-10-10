@@ -445,7 +445,7 @@ async def bridge_tcp_channel(
     """
     async def upstream() -> None:
         while True:
-            data = await reader.read(65536)
+            data = await reader.read(getattr(m2m, "frame_bytes", 65536))
             if not data:
                 await m2m.send_channel_eof(channel_port)
                 return

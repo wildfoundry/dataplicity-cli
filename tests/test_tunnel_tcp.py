@@ -12,6 +12,7 @@ from dataplicity_cli.remote_access import bridge_tcp_channel, run_port_forward
 class PairedM2M:
     EOF = object()
     MAX_CHANNELS = 32
+    frame_bytes = 1024
     def __init__(self):
         self.queues = {}
         self.other = None
@@ -20,6 +21,7 @@ class PairedM2M:
         return self.queues.setdefault(channel, asyncio.Queue(maxsize=16))
 
     async def send_route(self, channel, data):
+        assert len(data) <= self.frame_bytes
         await self.other.channel_queue(channel).put(data)
 
     async def send_channel_eof(self, channel):
