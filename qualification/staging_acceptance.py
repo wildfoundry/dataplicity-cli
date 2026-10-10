@@ -164,7 +164,7 @@ async def qualify_named_and_legacy(fixture):
         phase = 'actual_http_websocket_ssh_postgresql_protocols'
         await _protocol_acceptance(fixture, name, legacy, report)
         phase = 'actual_legacy_agent_wormhole_http'
-        await _wormhole_acceptance(fixture, local_port, legacy)
+        await _wormhole_acceptance(fixture, local_port, legacy, report.setdefault('wormhole_diagnostics', {}))
         report['cases']['actual_legacy_agent_wormhole_http_with_named_traffic'] = True
         phase = 'live_frontend_active'
         await _live_browser(fixture, name, 'active', report)
@@ -637,9 +637,12 @@ def _wormhole_url(device):
     return f'https://{slug}.wormhole.staging.dpenv.com/qualification-health'
 
 
-async def _wormhole_acceptance(fixture, named_port, legacy):
+async def _wormhole_acceptance(fixture, named_port, legacy, diagnostics=None):
     """Actual released agent's built-in web service and public staging ingress."""
     from aiohttp import ClientSession, ClientTimeout, web
+    diagnostics = diagnostics if diagnostics is not None else {}
+    diagnostics['stage'] = 'setup'
+    primary_error = None
     marker = 'staging-wormhole-' + os.urandom(16).hex()
     async def health(request):
         return web.Response(text=marker)
@@ -652,24 +655,43 @@ async def _wormhole_acceptance(fixture, named_port, legacy):
         # The released agent's existing `web` service targets 127.0.0.1:80.
         # Root is already configured for this isolated qualification container.
         await web.TCPSite(runner, '127.0.0.1', 80).start()
+        diagnostics['stage'] = 'enable'
         original = await _mobile_device(fixture, 'GET')
         if original.get('wormhole_enabled') is not False:
             raise RuntimeError('Isolated fixture Wormhole was unexpectedly enabled')
         enabled = await _mobile_device(fixture, 'PATCH', {'wormhole_enabled': True})
         if enabled.get('wormhole_enabled') is not True:
             raise RuntimeError('Normal device API did not enable Wormhole')
+        diagnostics['stage'] = 'hostname'
         url = _wormhole_url(enabled)
         async def public_probe():
             # No credentials, redirects or retries can substitute for this exact
             # TLS-verified staging hostname and the actual agent-local marker.
-            async with ClientSession(timeout=ClientTimeout(total=45)) as client:
-                async with client.get(url, allow_redirects=False) as response:
-                    if response.status != 200:
-                        raise RuntimeError('Actual agent Wormhole response failed')
-                    body = await response.content.readexactly(len(marker))
-                    extra = await response.content.read(1)
-                    if body != marker.encode() or extra:
-                        raise RuntimeError('Actual agent Wormhole response failed')
+            try:
+                diagnostics['stage'] = 'connect'
+                async with ClientSession(timeout=ClientTimeout(total=45)) as client:
+                    async with client.get(url, allow_redirects=False) as response:
+                        diagnostics['http_status'] = response.status
+                        diagnostics['stage'] = 'status'
+                        if response.status != 200:
+                            diagnostics['failure'] = 'status'
+                            raise RuntimeError('Actual agent Wormhole response failed')
+                        diagnostics['stage'] = 'marker'
+                        try:
+                            body = await response.content.readexactly(len(marker))
+                        except asyncio.IncompleteReadError as exc:
+                            diagnostics.update(failure='marker', response_length=len(exc.partial), marker_match=False)
+                            raise
+                        extra = await response.content.read(1)
+                        diagnostics.update(response_length=len(body) + len(extra), marker_match=body == marker.encode() and not extra)
+                        if body != marker.encode() or extra:
+                            diagnostics['failure'] = 'marker'
+                            raise RuntimeError('Actual agent Wormhole response failed')
+            except Exception as exc:
+                if diagnostics.get('stage') == 'connect':
+                    error = getattr(exc, 'os_error', exc)
+                    diagnostics['failure'] = 'dns' if isinstance(error, socket.gaierror) else 'connect'
+                raise
         probes = [asyncio.create_task(probe) for probe in (
             public_probe(), _exchange(named_port, b'named-during-wormhole'),
             _legacy_exchange(legacy, b'legacy-during-wormhole'))]
@@ -679,14 +701,29 @@ async def _wormhole_acceptance(fixture, named_port, legacy):
             for probe in probes:
                 probe.cancel()
             await asyncio.gather(*probes, return_exceptions=True)
+    except BaseException as exc:
+        primary_error = exc
+        raise
     finally:
         try:
             if original is not None and original.get('wormhole_enabled') is False:
                 disabled = await _mobile_device(fixture, 'PATCH', {'wormhole_enabled': False})
                 if disabled.get('wormhole_enabled') is not False:
                     raise RuntimeError('Normal device API did not disable Wormhole')
+        except Exception:
+            diagnostics['cleanup_failed'] = True
+            if primary_error is None:
+                diagnostics['stage'] = 'cleanup'
+                raise
         finally:
-            await runner.cleanup()
+            pending_error = sys.exc_info()[0] is not None
+            try:
+                await runner.cleanup()
+            except Exception:
+                diagnostics['cleanup_failed'] = True
+                if primary_error is None and not pending_error:
+                    diagnostics['stage'] = 'cleanup'
+                    raise
 
 
 async def _concurrency_acceptance(fixture, name, target_port, legacy):
