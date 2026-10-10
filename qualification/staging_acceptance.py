@@ -915,12 +915,12 @@ async def _start_presence_browser(fixture, report):
     script = Path(named_script).with_name('staging-legacy-presence-browser.mjs') if named_script else None
     if script is None or not script.is_file():
         raise RuntimeError('Retained live presence browser helper is required')
-    process = await asyncio.create_subprocess_exec('node', str(script),
-        stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.DEVNULL)
     payload = {'base_url': 'https://staging.dpenv.com', 'username': fixture['admin_email'],
         'password': fixture['admin_password'], 'device_hash': fixture['device_hash'],
         'output_dir': '/tmp/staging-legacy-presence-' + fixture['run_id']}
+    process = await asyncio.create_subprocess_exec('node', str(script),
+        stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL)
     try:
         process.stdin.write((json.dumps(payload) + '\n').encode())
         await process.stdin.drain()
