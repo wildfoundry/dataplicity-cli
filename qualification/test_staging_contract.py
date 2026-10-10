@@ -233,3 +233,158 @@ def test_initial_persistent_timeout_distinguishes_admission_from_established_str
         with pytest.raises(getattr(acceptance, expected)):
             await acceptance._legacy_existing_exchange(legacy, b'probe')
     asyncio.run(exercise())
+
+
+@pytest.mark.parametrize('failure', [None, 'payload', 'legacy'])
+def test_104_stream_gate_holds_distinct_streams_and_cleans_every_resource(monkeypatch, failure):
+    from qualification import staging_acceptance as acceptance
+    live, sessions, payloads = [], [], []
+    class Session:
+        def __init__(self, control, name, callback):
+            assert control == 'admin'
+            self.callback, self.closed = callback, False
+            sessions.append(self)
+        async def publish(self, port):
+            self.callback({'event': 'published'})
+            await asyncio.Event().wait()
+        async def connect(self, port):
+            self.callback({'event': 'listener_started'})
+            await asyncio.Event().wait()
+        async def close(self):
+            self.closed = True
+    class Writer:
+        def __init__(self):
+            self.payload = None
+            self.closed = False
+        def write(self, payload):
+            self.payload = payload
+            payloads.append(payload)
+        async def drain(self):
+            pass
+        def is_closing(self):
+            return self.closed
+        def close(self):
+            self.closed = True
+        async def wait_closed(self):
+            pass
+    class Reader:
+        def __init__(self, writer):
+            self.writer = writer
+        async def readexactly(self, size):
+            if failure == 'payload':
+                return b'wrong'
+            assert len(self.writer.payload) == size
+            return self.writer.payload
+        def at_eof(self):
+            return False
+    async def connect(host, port):
+        writer = Writer()
+        live.append(writer)
+        return Reader(writer), writer
+    async def legacy(_legacy, payload):
+        assert len(live) == 104
+        assert all(not writer.closed for writer in live)
+        assert len(set(payloads)) == 104
+        if failure == 'legacy':
+            raise RuntimeError('Actual legacy probe failed')
+    monkeypatch.setattr(acceptance, 'TunnelSession', Session)
+    monkeypatch.setattr(acceptance, '_api', lambda fixture, role: role)
+    monkeypatch.setattr(acceptance, '_port', lambda: 12345)
+    monkeypatch.setattr(acceptance.asyncio, 'open_connection', connect)
+    monkeypatch.setattr(acceptance, '_legacy_exchange', legacy)
+    if failure:
+        with pytest.raises(RuntimeError):
+            asyncio.run(acceptance._concurrency_acceptance({}, 'qualification', 12345, {}))
+    else:
+        asyncio.run(acceptance._concurrency_acceptance({}, 'qualification', 12345, {}))
+        assert len(payloads) == 208
+        assert len(set(payloads)) == 208
+    assert len(sessions) == 8
+    assert all(session.closed for session in sessions)
+    assert live and all(writer.closed for writer in live)
+
+
+@pytest.mark.parametrize('slug', ['evil.com', 'https://evil.com', 'a/b', 'name@evil.com',
+                                  'name?x=1', 'UPPERCASE', None, 'a' * 41])
+def test_wormhole_probe_cannot_escape_staging_hostname(slug):
+    from qualification.staging_acceptance import _wormhole_url
+    with pytest.raises(RuntimeError, match='hostname'):
+        _wormhole_url({'wormhole_slug': slug})
+
+
+def test_wormhole_probe_uses_exact_staging_https_domain():
+    from qualification.staging_acceptance import _wormhole_url
+    assert _wormhole_url({'wormhole_slug': 'friendly-device-1234'}) == (
+        'https://friendly-device-1234.wormhole.staging.dpenv.com/qualification-health')
+
+
+@pytest.mark.parametrize('failure', [None, 'http', 'legacy'])
+def test_wormhole_requires_real_marker_and_legacy_and_restores_fixture(monkeypatch, failure):
+    import sys
+    from types import SimpleNamespace
+    from qualification import staging_acceptance as acceptance
+    calls = []
+    class Site:
+        def __init__(self, runner, host, port):
+            assert (host, port) == ('127.0.0.1', 80)
+            self.runner = runner
+        async def start(self):
+            calls.append('server')
+    class Client:
+        def __init__(self, **kwargs):
+            assert kwargs['timeout'].total == 45
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *args):
+            pass
+        def get(self, url, **kwargs):
+            assert url.startswith('https://friendly-device-1234.wormhole.staging.dpenv.com/')
+            assert kwargs == {'allow_redirects': False}
+            calls.append('public')
+            return self
+        @property
+        def status(self):
+            return 503 if failure == 'http' else 200
+        @property
+        def content(self):
+            return self
+        async def readexactly(self, size):
+            assert size == len(b'staging-wormhole-' + b'aa' * 16)
+            return b'staging-wormhole-' + b'aa' * 16
+        async def read(self, size):
+            assert size == 1
+            return b''
+    async def device(fixture, method, payload=None):
+        calls.append((method, payload))
+        return {'wormhole_enabled': payload['wormhole_enabled'] if payload else False,
+                'wormhole_slug': 'friendly-device-1234'}
+    async def legacy(_legacy, payload):
+        calls.append('legacy')
+        if failure == 'legacy':
+            raise RuntimeError('Actual legacy probe failed')
+    async def exchange(port, payload):
+        calls.append('named')
+    class Runner:
+        def __init__(self, app, **kwargs):
+            assert kwargs == {'access_log': None}
+        async def setup(self):
+            pass
+        async def cleanup(self):
+            calls.append('cleanup')
+    web = SimpleNamespace(
+        Application=lambda **kwargs: SimpleNamespace(router=SimpleNamespace(add_get=lambda *args: None)),
+        AppRunner=Runner, TCPSite=Site)
+    monkeypatch.setitem(sys.modules, 'aiohttp', SimpleNamespace(
+        web=web, ClientSession=Client, ClientTimeout=lambda **kwargs: SimpleNamespace(**kwargs)))
+    monkeypatch.setattr(acceptance.os, 'urandom', lambda size: b'\xaa' * size)
+    monkeypatch.setattr(acceptance, '_mobile_device', device)
+    monkeypatch.setattr(acceptance, '_legacy_exchange', legacy)
+    monkeypatch.setattr(acceptance, '_exchange', exchange)
+    if failure:
+        with pytest.raises(RuntimeError):
+            asyncio.run(acceptance._wormhole_acceptance({}, 12345, {}))
+    else:
+        asyncio.run(acceptance._wormhole_acceptance({}, 12345, {}))
+    assert calls.count('public') == 1, 'A failed public probe must not be retried'
+    assert 'legacy' in calls and 'named' in calls
+    assert calls[-2:] == [('PATCH', {'wormhole_enabled': False}), 'cleanup']

@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 import ast
 import json
 import os
+import re
 from pathlib import Path
 import socket
 import subprocess
@@ -156,8 +157,14 @@ async def qualify_named_and_legacy(fixture):
         finally:
             writer.close()
             await writer.wait_closed()
+        phase = '104_simultaneous_named_streams_and_legacy'
+        await asyncio.wait_for(_concurrency_acceptance(fixture, name, target_port, legacy), 180)
+        report['cases']['104_simultaneous_named_streams_and_actual_legacy_mesh'] = True
         phase = 'actual_http_websocket_ssh_postgresql_protocols'
         await _protocol_acceptance(fixture, name, legacy, report)
+        phase = 'actual_legacy_agent_wormhole_http'
+        await _wormhole_acceptance(fixture, local_port, legacy)
+        report['cases']['actual_legacy_agent_wormhole_http_with_named_traffic'] = True
         phase = 'live_frontend_active'
         await _live_browser(fixture, name, 'active', report)
         phase = 'permissions_and_cross_organisation'
@@ -597,6 +604,146 @@ async def _stop_legacy(legacy):
             legacy['process'].kill()
             await legacy['process'].wait()
     legacy['directory'].cleanup()
+
+
+async def _mobile_device(fixture, method, payload=None):
+    control = _api(fixture, 'admin')
+    device_hash = fixture['device_hash']
+    if not re.fullmatch(r'[0-9a-f]{64}', device_hash):
+        raise RuntimeError('Invalid isolated fixture device')
+    def request():
+        with control._request_lock:
+            response = control.api.request(method, f'/devices/{device_hash}/', json_data=payload)
+        if not response.ok or not isinstance(response.data, dict):
+            raise RuntimeError('Normal device API failed')
+        return response.data
+    return await asyncio.to_thread(request)
+
+
+def _wormhole_url(device):
+    slug = device.get('wormhole_override') or device.get('wormhole_slug')
+    if not isinstance(slug, str) or not re.fullmatch(r'[a-z0-9][a-z0-9-]{6,38}[a-z0-9]', slug):
+        raise RuntimeError('Invalid staging Wormhole hostname')
+    return f'https://{slug}.wormhole.staging.dpenv.com/qualification-health'
+
+
+async def _wormhole_acceptance(fixture, named_port, legacy):
+    """Actual released agent's built-in web service and public staging ingress."""
+    from aiohttp import ClientSession, ClientTimeout, web
+    marker = 'staging-wormhole-' + os.urandom(16).hex()
+    async def health(request):
+        return web.Response(text=marker)
+    app = web.Application(client_max_size=1024)
+    app.router.add_get('/qualification-health', health)
+    runner = web.AppRunner(app, access_log=None)
+    await runner.setup()
+    original = None
+    try:
+        # The released agent's existing `web` service targets 127.0.0.1:80.
+        # Root is already configured for this isolated qualification container.
+        await web.TCPSite(runner, '127.0.0.1', 80).start()
+        original = await _mobile_device(fixture, 'GET')
+        if original.get('wormhole_enabled') is not False:
+            raise RuntimeError('Isolated fixture Wormhole was unexpectedly enabled')
+        enabled = await _mobile_device(fixture, 'PATCH', {'wormhole_enabled': True})
+        if enabled.get('wormhole_enabled') is not True:
+            raise RuntimeError('Normal device API did not enable Wormhole')
+        url = _wormhole_url(enabled)
+        async def public_probe():
+            # No credentials, redirects or retries can substitute for this exact
+            # TLS-verified staging hostname and the actual agent-local marker.
+            async with ClientSession(timeout=ClientTimeout(total=45)) as client:
+                async with client.get(url, allow_redirects=False) as response:
+                    if response.status != 200:
+                        raise RuntimeError('Actual agent Wormhole response failed')
+                    body = await response.content.readexactly(len(marker))
+                    extra = await response.content.read(1)
+                    if body != marker.encode() or extra:
+                        raise RuntimeError('Actual agent Wormhole response failed')
+        probes = [asyncio.create_task(probe) for probe in (
+            public_probe(), _exchange(named_port, b'named-during-wormhole'),
+            _legacy_exchange(legacy, b'legacy-during-wormhole'))]
+        try:
+            await asyncio.gather(*probes)
+        finally:
+            for probe in probes:
+                probe.cancel()
+            await asyncio.gather(*probes, return_exceptions=True)
+    finally:
+        try:
+            if original is not None and original.get('wormhole_enabled') is False:
+                disabled = await _mobile_device(fixture, 'PATCH', {'wormhole_enabled': False})
+                if disabled.get('wormhole_enabled') is not False:
+                    raise RuntimeError('Normal device API did not disable Wormhole')
+        finally:
+            await runner.cleanup()
+
+
+async def _concurrency_acceptance(fixture, name, target_port, legacy):
+    """Bounded functional concurrency, under ordinary server-owned quotas."""
+    tasks, sessions, connections = [], [], []
+    try:
+        ports = []
+        for index in range(4):
+            pub_ready, cons_ready = asyncio.Event(), asyncio.Event()
+            def published(event, ready=pub_ready):
+                if event['event'] == 'published':
+                    ready.set()
+            def listening(event, ready=cons_ready):
+                if event['event'] == 'listener_started':
+                    ready.set()
+            tunnel_name = f'{name}-concurrent-{index}'
+            publisher = TunnelSession(_api(fixture, 'admin'), tunnel_name, published)
+            consumer = TunnelSession(_api(fixture, 'admin'), tunnel_name, listening)
+            sessions.extend((publisher, consumer))
+            pub_task = asyncio.create_task(publisher.publish(target_port)); tasks.append(pub_task)
+            await _ready(pub_task, pub_ready)
+            port = _port()
+            cons_task = asyncio.create_task(consumer.connect(port)); tasks.append(cons_task)
+            await _ready(cons_task, cons_ready)
+            ports.append(port)
+
+        async def admitted(index):
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection('127.0.0.1', ports[index // 26]), 10)
+            # Register ownership before any awaited I/O, including failed admission.
+            payload = index.to_bytes(4, 'big') + os.urandom(1020)
+            connections.append((reader, writer, payload))
+            writer.write(payload); await writer.drain()
+            if await asyncio.wait_for(reader.readexactly(len(payload)), 30) != payload:
+                raise RuntimeError('Concurrent stream payload changed')
+
+        admissions = [asyncio.create_task(admitted(index)) for index in range(104)]
+        tasks.extend(admissions)
+        await asyncio.gather(*admissions)
+        if len(connections) != 104 or any(writer.is_closing() or reader.at_eof()
+                                         for reader, writer, _ in connections):
+            raise RuntimeError('Concurrent streams were not all retained')
+        # _legacy_exchange requires both a fresh admission and the existing
+        # cross-router stream; neither substitutes for the other.
+        await _legacy_exchange(legacy, b'legacy-during-104-held-streams')
+        async def retained(reader, writer, payload):
+            payload = b'held:' + payload
+            writer.write(payload); await writer.drain()
+            if await asyncio.wait_for(reader.readexactly(len(payload)), 30) != payload:
+                raise RuntimeError('Retained concurrent stream payload changed')
+        checks = [asyncio.create_task(retained(*connection)) for connection in connections]
+        tasks.extend(checks)
+        await asyncio.gather(*checks)
+        if any(writer.is_closing() or reader.at_eof() for reader, writer, _ in connections):
+            raise RuntimeError('Concurrent stream closed during legacy probes')
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        for _, writer, _ in connections:
+            writer.close()
+        for _, writer, _ in connections:
+            with suppress(OSError):
+                await writer.wait_closed()
+        for session in sessions:
+            with suppress(Exception):
+                await session.close()
 
 
 async def _protocol_acceptance(fixture, name, legacy, report):
