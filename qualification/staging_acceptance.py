@@ -75,8 +75,12 @@ async def _denied(control, resource, *, method='GET', payload=None, params=None)
 
 async def qualify_named_and_legacy(fixture):
     """Exercise real CLI transports, public admission and an actual older agent."""
-    if urlsplit(fixture['api_url']).hostname != 'api.staging.dpenv.com':
+    if (urlsplit(fixture['api_url']).scheme != 'https'
+            or urlsplit(fixture['api_url']).hostname != 'api.staging.dpenv.com'):
         raise RuntimeError('Live acceptance only targets staging')
+    relay = urlsplit(fixture['m2m_url'])
+    if relay.scheme != 'wss' or relay.hostname != 'm2m.staging.dpenv.com':
+        raise RuntimeError('Actual agent relay must be the secure staging endpoint')
     report = {'status': 'failed', 'cases': {}, 'router_node_ids': [],
               'actual_legacy_agent_verified': False}
     tasks, sessions, writers = [], [], set()

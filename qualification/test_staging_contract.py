@@ -40,3 +40,10 @@ def test_alpha_agent_cannot_satisfy_legacy_release_gate(monkeypatch, tmp_path):
     monkeypatch.setenv('DATAPLICITY_LEGACY_AGENT_SHA', 'a' * 40)
     with pytest.raises(RuntimeError, match='stable released version'):
         asyncio.run(_start_legacy({}, 12345, {}))
+
+
+def test_actual_agent_cannot_be_sent_to_production_relay():
+    with pytest.raises(RuntimeError, match='secure staging endpoint'):
+        asyncio.run(qualify_named_and_legacy({
+            'api_url': 'https://api.staging.dpenv.com',
+            'm2m_url': 'wss://m2m.dataplicity.com/m2m/'}))
