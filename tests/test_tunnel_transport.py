@@ -17,13 +17,17 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
     async def test_binding_and_identity(self):
         client = self.client()
         await client._handle_packet(9, [b"identity"])
-        await client._handle_packet(16, [{b"action": b"named-tunnel-binding", b"version": 1, b"challenge": b"a" * 64}])
+        await client._handle_packet(16, [b"router", {b"action": b"named-tunnel-binding", b"version": 1, b"challenge": b"a" * 64}])
         self.assertEqual(await client.wait_for_binding(), ("identity", "a" * 64))
         with self.assertRaises(ValueError):
-            await client._handle_packet(16, [42])
+            await client._handle_packet(16, [b"router", 42])
         with self.assertRaises(ValueError):
-            await client._handle_packet(16, [{b"action": b"named-tunnel-binding", b"version": 2}])
-        await client._handle_packet(16, [{b"action": b"unrelated"}])
+            await client._handle_packet(16, [b"router", {b"action": b"named-tunnel-binding", b"version": 2}])
+        await client._handle_packet(16, [b"router", {b"action": b"unrelated"}])
+        with self.assertRaises(ValueError):
+            await client._handle_packet(16, [b"untrusted", {}])
+        with self.assertRaises(ValueError):
+            await client._handle_packet(16, [{}])
 
     async def test_data_eof_and_close(self):
         client = self.client()
@@ -42,7 +46,7 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(999, client._channel_queues)
         await client.close_channel(7)
         self.assertNotIn(7, client._channel_queues)
-        await client._handle_packet(16, [{b"action": b"named-tunnel-open", b"port": 11}])
+        await client._handle_packet(16, [b"router", {b"action": b"named-tunnel-open", b"port": 11}])
         self.assertEqual(client.instructions.get_nowait()[b"port"], 11)
 
     async def test_malformed_and_bounded_queues(self):

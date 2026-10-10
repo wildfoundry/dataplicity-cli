@@ -91,7 +91,10 @@ class TunnelM2MClient(M2MClient):
 
     async def _handle_packet(self, packet_type: int, packet_body: List[Any]) -> None:
         if packet_type == PACKETS["instruction"] and packet_body:
-            instruction = packet_body[0]
+            # Existing Instruction is (sender, data), including router messages.
+            if len(packet_body) != 2 or packet_body[0] != b"router":
+                raise ValueError("Invalid tunnel instruction sender")
+            instruction = packet_body[1]
             if not isinstance(instruction, dict):
                 raise ValueError("Invalid tunnel instruction")
             action = instruction.get(b"action")
