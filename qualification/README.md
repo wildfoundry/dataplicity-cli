@@ -23,3 +23,10 @@ renewal, revocation, host routing and TCP bridging execute their implementation
 code. This is transport contract evidence; it does not qualify Django
 permissions, production Redis discovery, signed native binaries, production
 load or deployment to staging. Those require their own release gates.
+
+On 2026-10-10, this qualification passed both tests in 0.83 seconds on Linux,
+with the actual CLI and router sources and network-enabled loopback sockets.
+The test exercised six simultaneous streams, including a 128 KiB request,
+half-close, server revocation despite ignored close notifications, and continued
+authorised traffic. The frozen Linux executable also passed the existing real
+HTTP port-forward smoke test. These results retain the scope limits above.

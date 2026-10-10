@@ -11,6 +11,7 @@ Run with network permission and both repositories/dependency sets importable:
 import asyncio
 import hashlib
 import json
+import os
 import socket
 import ssl
 import subprocess
@@ -105,6 +106,22 @@ async def eventually(predicate, timeout=3):
     await asyncio.wait_for(wait(), timeout)
 
 
+async def ready(event, task, timeout=5):
+    """Report a startup exception immediately instead of hiding it in cleanup."""
+    waiter = asyncio.create_task(event.wait())
+    try:
+        done, _ = await asyncio.wait((waiter, task), timeout=timeout,
+                                     return_when=asyncio.FIRST_COMPLETED)
+        if task in done:
+            task.result()
+            raise AssertionError("Tunnel session ended before reporting readiness")
+        if waiter not in done:
+            raise AssertionError(f"Tunnel readiness timed out; session stack: {task.get_stack()!r}")
+    finally:
+        waiter.cancel()
+        await asyncio.gather(waiter, return_exceptions=True)
+
+
 def unused_port():
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
@@ -124,6 +141,10 @@ async def test_router_instruction_codec_matches_cli_binding_and_open():
 
 @pytest.mark.asyncio
 async def test_actual_cli_router_http_multistream_half_close_and_uncooperative_revocation(monkeypatch, tmp_path):
+    # Keep the inherited outbound proxy policy; these two hosts are local fixtures.
+    for variable in ("NO_PROXY", "no_proxy"):
+        inherited = os.environ.get(variable, os.environ.get("NO_PROXY", ""))
+        monkeypatch.setenv(variable, ",".join(filter(None, (inherited, "127.0.0.1", "127.0.0.2"))))
     monkeypatch.setattr(constants, "ROUTER_NAMED_TUNNELS_ENABLED", True)
     monkeypatch.setattr(constants, "ROUTER_NAMED_TUNNELS_INGEST_ENABLED", True)
     monkeypatch.setattr(constants, "ROUTER_NAMED_TUNNELS_RELAY_ENABLED", True)
@@ -200,10 +221,10 @@ async def test_actual_cli_router_http_multistream_half_close_and_uncooperative_r
             publisher = TunnelSession(broker.control("publisher"), "test-api", lambda event: published.set() if event["event"] == "published" else None)
             consumer = TunnelSession(broker.control("consumer"), "test-api", lambda event: listening.set() if event["event"] == "listener_started" else None)
             tasks.append(asyncio.create_task(publisher.publish(target)))
-            await asyncio.wait_for(published.wait(), 5)
+            await ready(published, tasks[-1])
             port = unused_port()
             tasks.append(asyncio.create_task(consumer.connect(port)))
-            await asyncio.wait_for(listening.wait(), 5)
+            await ready(listening, tasks[-1])
             assert consumer.m2m.identity.startswith("router-0~")  # Arrived via router1.
 
             async def request(payload):
