@@ -127,6 +127,7 @@ async def qualify_named_and_legacy(fixture):
     sessions.extend((publisher, consumer))
     publish_task = asyncio.create_task(publisher.publish(target_port)); tasks.append(publish_task)
     legacy = None
+    presence_browser = None
     phase = 'publisher_admission'
     try:
         await _ready(publish_task, ready_pub)
@@ -274,10 +275,16 @@ async def qualify_named_and_legacy(fixture):
         await _legacy_exchange(legacy, b'legacy-survives-reconnect')
         report['cases']['publisher_connection_loss_and_resume'] = True
         phase = 'actual_legacy_agent_restart'
+        presence_browser = await _start_presence_browser(fixture, report)
         await _stop_legacy(legacy)
         legacy = None
+        await _presence_browser_phase(presence_browser, 'agent_stopped', 'offline_observed', report, 125)
         legacy = await _start_legacy(fixture, target_port, report)
         await _legacy_exchange(legacy, b'actual-legacy-agent-reconnect')
+        await _presence_browser_phase(presence_browser, 'agent_restarted', 'reconnected', report, 95)
+        await asyncio.wait_for(presence_browser.wait(), 10)
+        if presence_browser.returncode != 0:
+            raise RuntimeError('Retained live presence browser did not exit successfully')
         report['cases']['actual_legacy_agent_restart_and_mesh_reconnect'] = True
         report['cases']['existing_legacy_stream_survives_named_operations'] = True
         report['actual_legacy_agent_verified'] = True
@@ -286,6 +293,9 @@ async def qualify_named_and_legacy(fixture):
         report['failure_type'] = type(exc).__name__
         report['failed_phase'] = phase
     finally:
+        if presence_browser and presence_browser.returncode is None:
+            presence_browser.kill()
+            await presence_browser.wait()
         if legacy:
             report['legacy_diagnostics'] = _legacy_diagnostics(legacy)
         # Cancel lifecycle loops before closing transports so publishers cannot
@@ -871,6 +881,56 @@ async def _protocol_acceptance(fixture, name, legacy, report):
         for task in list(proxy_tasks):
             task.cancel()
         await asyncio.gather(*proxy_tasks, return_exceptions=True)
+
+
+_PRESENCE_BROWSER_CASES = {
+    'online_ready': {'live_legacy_browser_terminal_connected'},
+    'offline_observed': {'live_legacy_http_offline_snapshot_received',
+        'live_legacy_card_and_badge_offline_without_reload', 'live_legacy_metadata_preserved'},
+    'reconnected': {'live_legacy_browser_reconnect_without_reload',
+        'live_legacy_browser_terminal_echo_after_restart'},
+}
+
+
+async def _presence_browser_phase(process, command, expected, report, timeout):
+    if command:
+        process.stdin.write((json.dumps({'phase': command}) + '\n').encode())
+        await process.stdin.drain()
+    output = await asyncio.wait_for(process.stdout.readline(), timeout)
+    if not output or len(output) > 32768:
+        raise RuntimeError('Retained live presence browser provided no bounded evidence')
+    evidence = json.loads(output)
+    cases = evidence.get('cases', {})
+    allowed = set().union(*_PRESENCE_BROWSER_CASES.values())
+    if (evidence.get('status') != 'passed' or evidence.get('phase') != expected
+            or not isinstance(cases, dict) or not set(cases) <= allowed
+            or not _PRESENCE_BROWSER_CASES[expected] <= set(cases)
+            or not all(value is True for value in cases.values())):
+        raise RuntimeError('Retained live presence browser failed the expected phase')
+    report['cases'].update(cases)
+
+
+async def _start_presence_browser(fixture, report):
+    named_script = os.environ.get('DATAPLICITY_STAGING_BROWSER_SCRIPT', '')
+    script = Path(named_script).with_name('staging-legacy-presence-browser.mjs') if named_script else None
+    if script is None or not script.is_file():
+        raise RuntimeError('Retained live presence browser helper is required')
+    payload = {'base_url': 'https://staging.dpenv.com', 'username': fixture['admin_email'],
+        'password': fixture['admin_password'], 'device_hash': fixture['device_hash'],
+        'output_dir': '/tmp/staging-legacy-presence-' + fixture['run_id']}
+    process = await asyncio.create_subprocess_exec('node', str(script),
+        stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL)
+    try:
+        process.stdin.write((json.dumps(payload) + '\n').encode())
+        await process.stdin.drain()
+        await _presence_browser_phase(process, None, 'online_ready', report, 100)
+        return process
+    except BaseException:
+        if process.returncode is None:
+            process.kill()
+            await process.wait()
+        raise
 
 
 async def _live_browser(fixture, name, phase, report):
