@@ -46,3 +46,32 @@ def test_actual_agent_cannot_be_sent_to_production_relay():
         asyncio.run(qualify_named_and_legacy({
             'api_url': 'https://api.staging.dpenv.com',
             'm2m_url': 'wss://m2m.dataplicity.com/m2m/'}))
+
+
+@pytest.mark.parametrize('stage,status,agent_shutdown,router_open,expected', [
+    (1, 0, False, True, 'LegacyAdmissionTimeout'),
+    (2, 403, False, True, 'LegacyAdmissionRejected'),
+    (2, 201, False, True, 'LegacyNotifyOpenTimeout'),
+    (3, 201, False, True, 'LegacyPayloadTimeout'),
+    (3, 201, True, True, 'LegacyAgentGlobalShutdown'),
+    (3, 201, False, False, 'LegacyRouterSocketClosed'),
+])
+def test_failed_legacy_probe_keeps_failure_and_distinguishes_admission_delivery(
+        monkeypatch, stage, status, agent_shutdown, router_open, expected):
+    from types import SimpleNamespace
+    from qualification import staging_acceptance as acceptance
+    diagnostic = {}
+    calls = []
+    async def timed_out(_port, _payload):
+        calls.append(1)
+        diagnostic.update(admission_stage=stage, http_status=status,
+                          shared_close_event=agent_shutdown)
+        raise asyncio.TimeoutError()
+    monkeypatch.setattr(acceptance, '_exchange', timed_out)
+    legacy = {'diagnostics': diagnostic, 'local_port': 12345,
+              'process': SimpleNamespace(returncode=None),
+              'client': SimpleNamespace(ws=SimpleNamespace(state=SimpleNamespace(
+                  name='OPEN' if router_open else 'CLOSED')))}
+    with pytest.raises(getattr(acceptance, expected)):
+        asyncio.run(acceptance._legacy_exchange(legacy, b'probe'))
+    assert calls == [1], 'Qualification must not conceal a failure with a retry'
