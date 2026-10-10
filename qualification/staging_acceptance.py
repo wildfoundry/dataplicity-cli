@@ -108,18 +108,23 @@ async def qualify_named_and_legacy(fixture):
     sessions.extend((publisher, consumer))
     publish_task = asyncio.create_task(publisher.publish(target_port)); tasks.append(publish_task)
     legacy = None
+    phase = 'publisher_admission'
     try:
         await _ready(publish_task, ready_pub)
         # This is a separate authorised user, never an organisation login.
+        phase = 'consumer_admission'
         consume_task = asyncio.create_task(consumer.connect(local_port)); tasks.append(consume_task)
         await _ready(consume_task, ready_cons)
         owner = publisher.m2m.identity.split('~', 1)[0]
         report['router_node_ids'].append(owner)
+        phase = 'actual_legacy_agent_association_and_mesh'
         legacy = await _start_legacy(fixture, target_port, report)
+        phase = 'simultaneous_named_and_legacy'
         payloads = [os.urandom(131072) for _ in range(6)]
         await asyncio.gather(*(_exchange(local_port, payload) for payload in payloads),
                              _legacy_exchange(legacy, payloads[0]))
         report['cases']['simultaneous_named_and_actual_legacy_mesh'] = True
+        phase = 'permissions_and_cross_organisation'
         await _denied(_api(fixture, 'outsider'), 'bootstrap/', params={'name': name, 'mode': 'consumer'})
         await _denied(_api(fixture, 'admin', fixture['other_organisation_hash']),
                       'bootstrap/', params={'name': name, 'mode': 'consumer'})
@@ -129,6 +134,7 @@ async def qualify_named_and_legacy(fixture):
         report['cases']['permissions_and_cross_organisation'] = True
 
         # Withdraw a user's only consume grant while a live TCP stream exists.
+        phase = 'consumer_permission_revocation'
         pr, pw = await asyncio.open_connection('127.0.0.1', local_port)
         pw.write(b'permission-check'); await pw.drain()
         assert await asyncio.wait_for(pr.readexactly(16), 15) == b'permission-check'
@@ -155,6 +161,7 @@ async def qualify_named_and_legacy(fixture):
 
         # Keep an admitted stream open; revoke via public API and deliberately
         # continue writing directly to the transport after server NotifyClose.
+        phase = 'publisher_replacement'
         old_client, old_channel = consumer.m2m, None
         r, w = await asyncio.open_connection('127.0.0.1', local_port)
         w.write(b'before-revocation'); await w.drain()
@@ -181,6 +188,7 @@ async def qualify_named_and_legacy(fixture):
         await _legacy_exchange(legacy, b'legacy-survives-replacement')
 
         # New consumer proves replacement works and has a fresh authority.
+        phase = 'publisher_credential_revocation'
         fresh_ready = asyncio.Event(); fresh_port = _port()
         fresh = TunnelSession(consumer_api, name, lambda e: fresh_ready.set() if e['event'] == 'listener_started' else None)
         sessions.append(fresh)
@@ -194,6 +202,7 @@ async def qualify_named_and_legacy(fixture):
 
         # Deliberate socket loss triggers actual CLI publisher resume. Consumer
         # reconnect starts a fresh session, because established TCP is not replayed.
+        phase = 'publisher_reconnect'
         reconnect_ready = asyncio.Event()
         reconnect = TunnelSession(pub_api, name, lambda e: reconnect_ready.set() if e['event'] == 'published' else None)
         sessions.append(reconnect)
@@ -204,6 +213,7 @@ async def qualify_named_and_legacy(fixture):
         await _ready(reconnect_task, reconnect_ready, timeout=65)
         await _legacy_exchange(legacy, b'legacy-survives-reconnect')
         report['cases']['publisher_connection_loss_and_resume'] = True
+        phase = 'actual_legacy_agent_restart'
         await _stop_legacy(legacy)
         legacy = None
         legacy = await _start_legacy(fixture, target_port, report)
