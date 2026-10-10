@@ -250,12 +250,14 @@ async def qualify_named_and_legacy(fixture):
         report['failure_type'] = type(exc).__name__
         report['failed_phase'] = phase
     finally:
-        for session in sessions:
-            with suppress(Exception):
-                await session.close()
+        # Cancel lifecycle loops before closing transports so publishers cannot
+        # interpret qualification cleanup as a loss and start reconnecting.
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        for session in sessions:
+            with suppress(Exception):
+                await session.close()
         if legacy:
             await _stop_legacy(legacy)
         service.close(); await service.wait_closed()
@@ -393,12 +395,12 @@ async def _protocol_acceptance(fixture, name, legacy, report):
             await asyncio.gather(asyncio.wait_for(probe(local_port), 45),
                                  _legacy_exchange(legacy, ('legacy-during-' + suffix).encode()))
         finally:
-            await consumer.close()
-            await publisher.close()
             pub_task.cancel()
             if cons_task:
                 cons_task.cancel()
             await asyncio.gather(pub_task, *([cons_task] if cons_task else []), return_exceptions=True)
+            await consumer.close()
+            await publisher.close()
 
     async def websocket_echo(request):
         websocket = web.WebSocketResponse(compress=False)
