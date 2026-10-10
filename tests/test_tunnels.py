@@ -17,6 +17,8 @@ class ControlTests(unittest.TestCase):
                 validate_name(value)
         self.assertEqual(websocket_url("https://relay.test/m2m/?other=1"), "wss://relay.test/m2m/?other=1&features=named-tunnels-v1")
         self.assertEqual(websocket_url("wss://relay.test/m2m/"), "wss://relay.test/m2m/?features=named-tunnels-v1")
+        self.assertEqual(websocket_url("wss://random-ingress.test/m2m/?named_owner=router-a&opaque=a%20b&opaque=c"),
+                         "wss://random-ingress.test/m2m/?named_owner=router-a&opaque=a%20b&opaque=c&features=named-tunnels-v1")
         for url in ["http://relay.test", "wss:///m2m/", "wss://user:password@relay.test"]:
             with self.assertRaises(TunnelError):
                 websocket_url(url)

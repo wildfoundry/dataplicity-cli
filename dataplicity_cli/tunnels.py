@@ -7,7 +7,7 @@ import random
 import threading
 from contextlib import suppress
 from typing import Any, Callable, Optional
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import urlsplit, urlunsplit
 
 from .api import ApiClient
 from .client_identity import identity_headers
@@ -32,9 +32,10 @@ def websocket_url(url: str) -> str:
     parts = urlsplit(url)
     if parts.scheme not in {"https", "wss"} or not parts.hostname or parts.username or parts.password:
         raise TunnelError("The server returned an invalid secure relay URL.")
-    query = dict(parse_qsl(parts.query))
-    query["features"] = "named-tunnels-v1"
-    return urlunsplit(("wss", parts.netloc, parts.path, urlencode(query), ""))
+    # Owner hints are issued by the trusted backend and interpreted by the
+    # existing router mesh. Preserve its query exactly across random ingress.
+    query = parts.query + ("&" if parts.query else "") + "features=named-tunnels-v1"
+    return urlunsplit(("wss", parts.netloc, parts.path, query, ""))
 
 
 class TunnelAPI:
@@ -69,9 +70,15 @@ class TunnelAPI:
                 429: "Tunnel quota or admission limit reached. Retry later or contact your administrator.",
                 503: "Development tunnels are unavailable for this organisation.",
             }
+            reasons = {
+                "session_fenced": "Tunnel was replaced. Start a fresh authorised command to use the current publisher.",
+                "session_expired": "Tunnel authority expired. Start a fresh authorised command.",
+                "publisher_revoked": "Publisher authority was revoked. Ask your administrator to review the credential and name policy.",
+                "paid_plan_required": "Development tunnels require an eligible paid organisation plan.",
+            }
             # Error bodies and transport exceptions are never dumped: they may
             # contain infrastructure details or a reflected credential.
-            raise TunnelError(messages.get(response.status_code, "Dataplicity tunnel request failed."), str(code))
+            raise TunnelError(reasons.get(str(code), messages.get(response.status_code, "Dataplicity tunnel request failed.")), str(code))
         return response.data
 
     async def call(self, method: str, resource: str, **kwargs: Any) -> Any:
