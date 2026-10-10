@@ -220,7 +220,10 @@ async def qualify_named_and_legacy(fixture):
         await _legacy_exchange(legacy, b'actual-legacy-agent-reconnect')
         report['cases']['actual_legacy_agent_restart_and_mesh_reconnect'] = True
         report['actual_legacy_agent_verified'] = True
-        report['status'] = True
+        report['status'] = 'passed'
+    except Exception as exc:
+        report['failure_type'] = type(exc).__name__
+        report['failed_phase'] = phase
     finally:
         for session in sessions:
             with suppress(Exception):
