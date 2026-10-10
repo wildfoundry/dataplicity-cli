@@ -22,7 +22,7 @@ from dataplicity_cli.api import ApiClient
 from dataplicity_cli.config import Config
 from dataplicity_cli.m2m import M2MClient
 from dataplicity_cli.remote_access import run_port_forward
-from dataplicity_cli.tunnels import TunnelAPI, TunnelError, TunnelSession
+from dataplicity_cli.tunnels import TunnelAPI, TunnelSession
 
 
 def _port():

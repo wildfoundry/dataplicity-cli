@@ -15,8 +15,6 @@ import os
 import socket
 import ssl
 import subprocess
-import socketserver
-import threading
 from contextlib import suppress
 from pathlib import Path
 from types import SimpleNamespace

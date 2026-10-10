@@ -1,6 +1,5 @@
 """Qualification must fail closed when actual released-agent evidence is absent."""
 import asyncio
-from pathlib import Path
 
 import pytest
 
