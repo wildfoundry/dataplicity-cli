@@ -60,6 +60,8 @@ user_impact_app = typer.Typer(help="User impact commands")
 heartbeat_monitors_app = typer.Typer(help="Heartbeat monitor commands")
 fleet_jobs_app = typer.Typer(help="Fleet job commands")
 logging_app = typer.Typer(help="Logging commands", no_args_is_help=True)
+tunnel_app = typer.Typer(help="Private named CLI-to-CLI TCP tunnels", no_args_is_help=True)
+tunnel_token_app = typer.Typer(help="Manage scoped publisher credentials", no_args_is_help=True)
 _EMBEDDED_SHELL_DISPATCH = False
 
 LOGGING_MAX_OUTPUT_ITEMS = 1000
@@ -76,6 +78,8 @@ app.add_typer(user_impact_app, name="user-impact")
 app.add_typer(heartbeat_monitors_app, name="heartbeat-monitors")
 app.add_typer(fleet_jobs_app, name="fleet-jobs")
 app.add_typer(logging_app, name="logging")
+app.add_typer(tunnel_app, name="tunnel")
+tunnel_app.add_typer(tunnel_token_app, name="token")
 
 
 @dataclass
@@ -96,6 +100,238 @@ def _ctx(ctx: typer.Context) -> AppContext:
 
 def _m2m_client(state: AppContext, ws_url: str) -> M2MClient:
     return M2MClient(ws_url, extra_headers=identity_headers(state.config.install_id))
+
+
+def _tunnel_control(state: AppContext, organisation: Optional[str], token: Optional[str] = None) -> Any:
+    from .tunnels import TunnelAPI, TunnelError
+
+    if not organisation:
+        if token:
+            raise TunnelError("Use --org <organisation-hash> with a publisher token.")
+        if state.config.auth_method != "jwt" or not state.config.access_token:
+            raise TunnelError("Run dataplicity auth login to use development tunnels.")
+        response = state.api.get("/api/development-tunnels/organisations/")
+        if not response.ok:
+            raise TunnelError("Unable to select an organisation. Sign in again or supply --org.")
+        rows = _extract_orgs(response.data)
+        if len(rows) != 1:
+            raise TunnelError("Select an organisation with --org <organisation-hash>.")
+        organisation = str(rows[0].get("hash_id") or "")
+    api = state.api
+    if token:
+        # Machine credential failure must never refresh or invalidate a human
+        # session saved in the same CLI configuration.
+        api = ApiClient(Config(base_url=state.config.base_url, install_id=state.config.install_id))
+    return TunnelAPI(api, organisation, token=token)
+
+
+def _tunnel_failure(state: AppContext, exc: Exception, json_output: bool = False) -> None:
+    from .tunnels import TunnelError
+
+    message = str(exc) if isinstance(exc, TunnelError) else (
+        "Unable to bind the local port or reach the secure relay. Check connectivity and whether the port is already in use."
+        if isinstance(exc, OSError) else "Tunnel operation failed. Check your session and relay availability."
+    )
+    if state.json_output or json_output:
+        _print_json({"ok": False, "detail": message})
+    else:
+        _show_error(state.console, message)
+    raise typer.Exit(code=1)
+
+
+def _tunnel_progress(state: AppContext, event: dict) -> None:
+    if state.json_output:
+        sys.stdout.write(json.dumps(event) + "\n")
+        sys.stdout.flush()
+    elif event["event"] in {"published", "listener_started", "reconnecting", "connection_rejected"}:
+        state.console.print(escape(f"{event['event']}: {event.get('name', '')} {event.get('detail', '')}"))
+
+
+def _run_tunnel_command(state: AppContext, name: str, operation: Any) -> None:
+    import signal
+
+    async def run() -> None:
+        loop = asyncio.get_running_loop()
+        task = asyncio.current_task()
+        previous = signal.getsignal(signal.SIGTERM)
+        signal.signal(signal.SIGTERM, lambda _signum, _frame: loop.call_soon_threadsafe(task.cancel))
+        try:
+            await operation
+        except asyncio.CancelledError:
+            _tunnel_progress(state, {"event": "stopped", "name": name})
+        finally:
+            signal.signal(signal.SIGTERM, previous)
+
+    asyncio.run(run())
+
+
+@tunnel_app.command("ls")
+def tunnel_list(
+    ctx: typer.Context,
+    organisation: Optional[str] = typer.Option(None, "--org", help="Organisation hash; required for multi-org accounts"),
+    json_output: bool = typer.Option(False, "--json", help="JSON active inventory"),
+    search: Optional[str] = typer.Option(None, "--search", help="Filter active tunnel names"),
+    page: int = typer.Option(1, min=1),
+) -> None:
+    """List active services you are authorised to inspect."""
+    state = _ctx(ctx)
+    try:
+        control = _tunnel_control(state, organisation)
+        payload = control.request("GET", "", params={"search": search or "", "page": page})
+    except Exception as exc:
+        _tunnel_failure(state, exc, json_output)
+    if state.json_output or json_output:
+        _print_json(payload)
+        return
+    rows = payload.get("results", []) if isinstance(payload, dict) else payload
+    table = Table(title="Development Tunnels — Active")
+    for label in ("Name", "Publisher", "Target port", "Connections", "Bytes"):
+        table.add_column(label)
+    for row in rows or []:
+        publisher = row.get("publisher", {})
+        identity = publisher.get("display_name") or publisher.get("label") or publisher.get("type", "") if isinstance(publisher, dict) else publisher
+        table.add_row(escape(str(row.get("name", ""))), escape(str(identity)), str(row.get("target_port", row.get("port", ""))), str(row.get("connection_count", row.get("active_consumers", 0))), str(row.get("bytes_transferred", 0)))
+    state.console.print(table)
+    if not rows:
+        state.console.print("No active tunnels. Publish a service with dataplicity tunnel publish test-api --port 3000.")
+
+
+@tunnel_app.command("publish")
+def tunnel_publish(
+    ctx: typer.Context,
+    name: str = typer.Argument(..., help="Organisation-scoped service name"),
+    port: int = typer.Option(..., "--port", min=1, max=65535, help="Local loopback TCP service port"),
+    organisation: Optional[str] = typer.Option(None, "--org", help="Organisation hash"),
+    token_env: Optional[str] = typer.Option(None, "--token-env", help="Environment VARIABLE containing a scoped publisher token"),
+    token_stdin: bool = typer.Option(False, "--token-stdin", help="Read a scoped publisher token from standard input"),
+) -> None:
+    """Publish localhost TCP privately; Ctrl+C stops the current registration.
+
+    dataplicity tunnel publish test-api --port 3000
+    dataplicity tunnel publish test-api --port 3000 --org ORG --token-env DATAPLICITY_TUNNEL_TOKEN
+    """
+    from .tunnels import TunnelError, TunnelSession
+
+    state = _ctx(ctx)
+    try:
+        if token_env and token_stdin:
+            raise TunnelError("Choose either --token-env or --token-stdin.")
+        token = None
+        if token_env:
+            token = os.environ.get(token_env, "").strip()
+        elif token_stdin:
+            if sys.stdin.isatty():
+                raise TunnelError("Pipe the publisher token into stdin; use auth login for interactive publishing.")
+            token = sys.stdin.readline(4097).strip()
+        if (token_env or token_stdin) and (not token or len(token) > 4096 or any(c.isspace() for c in token)):
+            raise TunnelError("The publisher token input is empty or invalid.")
+        control = _tunnel_control(state, organisation, token)
+        session = TunnelSession(control, name, lambda event: _tunnel_progress(state, event))
+        _run_tunnel_command(state, name, session.publish(port))
+    except KeyboardInterrupt:
+        _tunnel_progress(state, {"event": "stopped", "name": name})
+    except Exception as exc:
+        _tunnel_failure(state, exc)
+
+
+@tunnel_app.command("connect")
+def tunnel_connect(
+    ctx: typer.Context,
+    name: str = typer.Argument(..., help="Named private service"),
+    local_port: int = typer.Option(..., "--local-port", min=1, max=65535, help="Consumer loopback port (127.0.0.1 only)"),
+    organisation: Optional[str] = typer.Option(None, "--org", help="Organisation hash"),
+) -> None:
+    """Forward 127.0.0.1:<local-port> to an authorised named service."""
+    from .tunnels import TunnelSession
+
+    state = _ctx(ctx)
+    try:
+        session = TunnelSession(_tunnel_control(state, organisation), name, lambda event: _tunnel_progress(state, event))
+        _run_tunnel_command(state, name, session.connect(local_port))
+    except KeyboardInterrupt:
+        _tunnel_progress(state, {"event": "stopped", "name": name})
+    except Exception as exc:
+        _tunnel_failure(state, exc)
+
+
+@tunnel_token_app.command("create")
+def tunnel_token_create(
+    ctx: typer.Context,
+    name: str = typer.Argument(..., help="Exact publisher name scope"),
+    port: List[int] = typer.Option(..., "--port", min=1, max=65535, help="Allowed target port; repeat for multiple allowed ports"),
+    organisation: Optional[str] = typer.Option(None, "--org"),
+    label: Optional[str] = typer.Option(None, "--label"),
+    replace: bool = typer.Option(False, "--allow-replace", help="Permit replacing this exact name's current publisher"),
+    expires_at: Optional[str] = typer.Option(None, "--expires-at", help="Optional ISO-8601 expiry"),
+) -> None:
+    """Issue a scoped credential. Its secret is written to stdout exactly once."""
+    from .tunnels import validate_name
+
+    state = _ctx(ctx)
+    try:
+        control = _tunnel_control(state, organisation)
+        payload = {"name": validate_name(name), "ports": port, "label": label or name, "can_replace": replace}
+        if expires_at:
+            payload["expires_at"] = expires_at
+        issued = control.request("POST", "credentials/", payload=payload)
+    except Exception as exc:
+        _tunnel_failure(state, exc)
+    # Intentionally bypass general API redaction solely for one-time issuance.
+    if state.json_output:
+        sys.stdout.write(json.dumps(issued) + "\n")
+    else:
+        sys.stdout.write(str(issued["secret"]) + "\n")
+
+
+@tunnel_token_app.command("ls")
+def tunnel_token_list(
+    ctx: typer.Context,
+    organisation: Optional[str] = typer.Option(None, "--org"),
+) -> None:
+    """List publisher credential metadata; stored secrets are never available."""
+    state = _ctx(ctx)
+    try:
+        payload = _tunnel_control(state, organisation).request("GET", "credentials/")
+    except Exception as exc:
+        _tunnel_failure(state, exc)
+    _print_json(payload)
+
+
+@tunnel_token_app.command("rotate")
+def tunnel_token_rotate(
+    ctx: typer.Context,
+    credential: str = typer.Argument(..., help="Credential UUID"),
+    organisation: Optional[str] = typer.Option(None, "--org"),
+) -> None:
+    """Revoke the old secret and print its replacement exactly once."""
+    import uuid
+    state = _ctx(ctx)
+    try:
+        identifier = str(uuid.UUID(credential))
+        issued = _tunnel_control(state, organisation).request("POST", f"credentials/{identifier}/rotate/")
+    except Exception as exc:
+        _tunnel_failure(state, exc)
+    sys.stdout.write(json.dumps(issued) + "\n" if state.json_output else str(issued["secret"]) + "\n")
+
+
+@tunnel_token_app.command("revoke")
+def tunnel_token_revoke(
+    ctx: typer.Context,
+    credential: str = typer.Argument(..., help="Credential UUID"),
+    organisation: Optional[str] = typer.Option(None, "--org"),
+) -> None:
+    """Revoke this publisher credential and its live server routing authority."""
+    import uuid
+    state = _ctx(ctx)
+    try:
+        identifier = str(uuid.UUID(credential))
+        _tunnel_control(state, organisation).request("DELETE", f"credentials/{identifier}/")
+    except Exception as exc:
+        _tunnel_failure(state, exc)
+    if state.json_output:
+        _print_json({"ok": True, "revoked": identifier})
+    else:
+        state.console.print("Publisher credential revoked.")
 
 
 def _embedded_shell_command_tree() -> Dict[str, List[str]]:

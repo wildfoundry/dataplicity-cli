@@ -45,11 +45,18 @@ jobs:
       - name: Install
         run: |
           python -m pip install --upgrade pip
-          pip install .
+          pip install ".[test]"
       - name: Compile
         run: python -m compileall -q dataplicity_cli
       - name: Help smoke
-        run: python -m dataplicity_cli --help
+        run: |
+          python -m dataplicity_cli --help
+          python -m dataplicity_cli tunnel --help
+          python -m dataplicity_cli tunnel publish --help
+          python -m dataplicity_cli tunnel connect --help
+          python -m dataplicity_cli tunnel token --help
+      - name: Native named tunnel TCP and protocol tests
+        run: pytest -q tests/test_tunnel_transport.py tests/test_tunnel_tcp.py tests/test_tunnels.py tests/test_tunnel_cli.py
 
   windows-unit-tests:
     name: Windows unit tests
@@ -88,6 +95,8 @@ jobs:
             dataplicity_cli/__main__.py
           ./pyinstaller-dist/dataplicity.exe --version
           ./pyinstaller-dist/dataplicity.exe --help
+          ./pyinstaller-dist/dataplicity.exe tunnel publish --help
+          ./pyinstaller-dist/dataplicity.exe tunnel connect --help
           ./build/windows/build_msi.ps1 -Version $env:VERSION
           "MSI_PATH=$((Resolve-Path "dist/dataplicity-cli-$env:VERSION-windows-x64.msi").Path)" >> $env:GITHUB_ENV
       - name: Install, verify, and uninstall MSI
@@ -115,6 +124,14 @@ jobs:
             & $installedExe --help
             if ($LASTEXITCODE -ne 0) {
               throw "Installed executable --help failed."
+            }
+            & $installedExe tunnel publish --help
+            if ($LASTEXITCODE -ne 0) {
+              throw "Installed executable tunnel publish --help failed."
+            }
+            & $installedExe tunnel connect --help
+            if ($LASTEXITCODE -ne 0) {
+              throw "Installed executable tunnel connect --help failed."
             }
             $machinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
             $expectedPathEntry = $installDir -replace '[\\/]+$', ''

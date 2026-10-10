@@ -68,6 +68,20 @@ jobs:
         if: runner.os == 'Windows'
         run: pyinstaller --noconfirm --clean --onefile --name dataplicity --workpath pyinstaller-build --distpath pyinstaller-dist dataplicity_cli/__main__.py
 
+      - name: Verify native tunnel commands (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          ./pyinstaller-dist/dataplicity tunnel publish --help
+          ./pyinstaller-dist/dataplicity tunnel connect --help
+          ./pyinstaller-dist/dataplicity tunnel token create --help
+
+      - name: Verify native tunnel commands (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          ./pyinstaller-dist/dataplicity.exe tunnel publish --help
+          ./pyinstaller-dist/dataplicity.exe tunnel connect --help
+          ./pyinstaller-dist/dataplicity.exe tunnel token create --help
+
       - name: Install Linux packaging tools
         if: runner.os == 'Linux'
         run: |
@@ -85,6 +99,9 @@ jobs:
             dataplicity_cli/__main__.py
           ./pyinstaller-dist/dataplicity --version
           ./pyinstaller-dist/dataplicity --help
+          ./pyinstaller-dist/dataplicity tunnel publish --help
+          ./pyinstaller-dist/dataplicity tunnel connect --help
+          ./pyinstaller-dist/dataplicity tunnel token create --help
 
       - name: Setup .NET for Artifact Signing
         if: runner.os == 'Windows'
