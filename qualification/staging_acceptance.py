@@ -128,6 +128,10 @@ async def qualify_named_and_legacy(fixture):
         await asyncio.gather(*(_exchange(local_port, payload) for payload in payloads),
                              _legacy_exchange(legacy, payloads[0]))
         report['cases']['simultaneous_named_and_actual_legacy_mesh'] = True
+        phase = 'actual_http_websocket_ssh_postgresql_protocols'
+        await _protocol_acceptance(fixture, name, legacy, report)
+        phase = 'live_frontend_active'
+        await _live_browser(fixture, name, 'active', report)
         phase = 'permissions_and_cross_organisation'
         await _denied(_api(fixture, 'outsider'), 'bootstrap/', params={'name': name, 'mode': 'consumer'})
         await _denied(_api(fixture, 'admin', fixture['other_organisation_hash']),
@@ -157,6 +161,9 @@ async def qualify_named_and_legacy(fixture):
         report['cases']['server_side_consumer_permission_revocation'] = True
         await admin_api.call('POST', 'permissions/', payload={
             'name': '*', 'action': 'consume', 'user_id': fixture['consumer_user_id'], 'ports': [-1]})
+        await consumer.close()
+        consume_task.cancel()
+        await asyncio.gather(consume_task, return_exceptions=True)
         ready_cons = asyncio.Event()
         consumer = TunnelSession(consumer_api, name, lambda e: ready_cons.set() if e['event'] == 'listener_started' else None)
         sessions.append(consumer)
@@ -199,10 +206,24 @@ async def qualify_named_and_legacy(fixture):
         fresh_task = asyncio.create_task(fresh.connect(fresh_port)); tasks.append(fresh_task)
         await _ready(fresh_task, fresh_ready)
         await _exchange(fresh_port, b'replacement-works')
+        credential_reader, credential_writer = await asyncio.open_connection('127.0.0.1', fresh_port)
+        credential_writer.write(b'credential-active'); await credential_writer.drain()
+        assert await asyncio.wait_for(credential_reader.readexactly(17), 15) == b'credential-active'
+        credential_client = fresh.m2m
+        credential_channel = next(iter(credential_client._channel_queues))
         await admin_api.call('DELETE', 'credentials/' + credential['id'] + '/')
+        assert await asyncio.wait_for(credential_reader.read(1), 15) == b''
+        if credential_client.ws and credential_client.ws.state.name == 'OPEN':
+            await credential_client.send_route(credential_channel, b'malicious-revoked-credential-write')
+        await asyncio.sleep(0.5)
+        if b'malicious-revoked-credential-write' in observed:
+            raise RuntimeError('Revoked credential forwarded bytes')
+        credential_writer.close(); await credential_writer.wait_closed()
         await _denied(machine_control, 'bootstrap/', params={'name': name, 'mode': 'publisher', 'port': target_port})
         await _legacy_exchange(legacy, b'legacy-survives-credential-revoke')
         report['cases']['publisher_credential_revocation'] = True
+        phase = 'live_frontend_revoked'
+        await _live_browser(fixture, name, 'revoked', report)
 
         # Deliberate socket loss triggers actual CLI publisher resume. Consumer
         # reconnect starts a fresh session, because established TCP is not replayed.
@@ -349,3 +370,154 @@ async def _stop_legacy(legacy):
             legacy['process'].kill()
             await legacy['process'].wait()
     legacy['directory'].cleanup()
+
+
+async def _protocol_acceptance(fixture, name, legacy, report):
+    """Real protocol stacks through public staging admission and CLI forwarding."""
+    from aiohttp import ClientSession, WSMsgType, web
+    from qualification.protocols import SSHFixture
+
+    async def through(target_port, suffix, probe):
+        ready_pub, ready_cons = asyncio.Event(), asyncio.Event()
+        publisher = TunnelSession(_api(fixture, 'publisher'), name + suffix,
+            lambda event: ready_pub.set() if event['event'] == 'published' else None)
+        consumer = TunnelSession(_api(fixture, 'consumer'), name + suffix,
+            lambda event: ready_cons.set() if event['event'] == 'listener_started' else None)
+        pub_task = asyncio.create_task(publisher.publish(target_port))
+        cons_task = None
+        try:
+            await _ready(pub_task, ready_pub)
+            local_port = _port()
+            cons_task = asyncio.create_task(consumer.connect(local_port))
+            await _ready(cons_task, ready_cons)
+            await asyncio.gather(asyncio.wait_for(probe(local_port), 45),
+                                 _legacy_exchange(legacy, ('legacy-during-' + suffix).encode()))
+        finally:
+            await consumer.close()
+            await publisher.close()
+            pub_task.cancel()
+            if cons_task:
+                cons_task.cancel()
+            await asyncio.gather(pub_task, *([cons_task] if cons_task else []), return_exceptions=True)
+
+    async def websocket_echo(request):
+        websocket = web.WebSocketResponse(compress=False)
+        await websocket.prepare(request)
+        async for message in websocket:
+            if message.type == WSMsgType.TEXT:
+                await websocket.send_str(message.data)
+            elif message.type == WSMsgType.BINARY:
+                await websocket.send_bytes(message.data)
+        return websocket
+
+    app = web.Application()
+    app.router.add_get('/health', lambda request: web.json_response({'service': 'live-staging-tunnel'}))
+    app.router.add_get('/echo', websocket_echo)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '127.0.0.1', 0)
+    await site.start()
+    try:
+        async def http_and_websocket(port):
+            async with ClientSession() as http:
+                async with http.get(f'http://127.0.0.1:{port}/health') as response:
+                    assert response.status == 200
+                    assert await response.json() == {'service': 'live-staging-tunnel'}
+                async with http.ws_connect(f'http://127.0.0.1:{port}/echo', compress=0) as websocket:
+                    await websocket.send_json({'protocol': 'websocket', 'live_staging': True})
+                    assert await websocket.receive_json() == {'protocol': 'websocket', 'live_staging': True}
+                    payload = os.urandom(65536)
+                    await websocket.send_bytes(payload)
+                    assert (await websocket.receive()).data == payload
+                    await websocket.send_str('still-open')
+                    assert (await websocket.receive()).data == 'still-open'
+        await through(site._server.sockets[0].getsockname()[1], '-http', http_and_websocket)
+        report['cases']['actual_http_and_websocket_through_staging'] = True
+    finally:
+        await runner.cleanup()
+
+    ssh = SSHFixture()
+    try:
+        await through(ssh.server.server_address[1], '-ssh', lambda port: asyncio.to_thread(ssh.probe, port))
+        report['cases']['actual_pinned_key_ssh_through_staging'] = True
+    finally:
+        await asyncio.to_thread(ssh.close)
+
+    # PostgreSQL's actual wire protocol is forwarded to the staging database.
+    # The first query begins a READ ONLY transaction, compatible with RDS Proxy.
+    db_host = os.environ.get('SQL_HOST')
+    db_password = os.environ.get('SQL_PASSWORD')
+    if not db_host or not db_password:
+        raise RuntimeError('Staging readonly PostgreSQL qualification credentials are missing')
+    proxy_tasks, proxy_writers = set(), set()
+
+    async def pg_proxy(reader, writer):
+        task = asyncio.current_task(); proxy_tasks.add(task)
+        remote_writer = None
+        proxy_writers.add(writer)
+        try:
+            remote_reader, remote_writer = await asyncio.wait_for(
+                asyncio.open_connection(db_host, int(os.environ.get('SQL_PORT', '5432'))), 10)
+            proxy_writers.add(remote_writer)
+            async def copy(source, destination):
+                while data := await source.read(65536):
+                    destination.write(data)
+                    await destination.drain()
+                if destination.can_write_eof():
+                    destination.write_eof()
+            await asyncio.gather(copy(reader, remote_writer), copy(remote_reader, writer))
+        except (OSError, asyncio.CancelledError):
+            return
+        finally:
+            writer.close()
+            if remote_writer:
+                remote_writer.close()
+                proxy_writers.discard(remote_writer)
+            proxy_writers.discard(writer)
+            proxy_tasks.discard(task)
+
+    pg_server = await asyncio.start_server(pg_proxy, '127.0.0.1', 0)
+    try:
+        def pg_probe(port):
+            import psycopg
+            with psycopg.connect(host=db_host, hostaddr='127.0.0.1', port=port,
+                    user=os.environ.get('SQL_USER', 'iotuser'), password=db_password,
+                    dbname=os.environ.get('SQL_DATABASE', 'iot'), connect_timeout=10,
+                    sslmode=os.environ.get('SQL_SSLMODE', 'require')) as connection:
+                connection.read_only = True
+                with connection.cursor() as cursor:
+                    cursor.execute("SELECT current_setting('transaction_read_only'), 749, repeat('named-tunnel-', 1000)")
+                    assert cursor.fetchone() == ('on', 749, 'named-tunnel-' * 1000)
+        await through(pg_server.sockets[0].getsockname()[1], '-pg', lambda port: asyncio.to_thread(pg_probe, port))
+        report['cases']['actual_readonly_postgresql_through_staging'] = True
+    finally:
+        pg_server.close(); await pg_server.wait_closed()
+        for writer in list(proxy_writers):
+            writer.close()
+        for task in list(proxy_tasks):
+            task.cancel()
+        await asyncio.gather(*proxy_tasks, return_exceptions=True)
+
+
+async def _live_browser(fixture, name, phase, report):
+    script = os.environ.get('DATAPLICITY_STAGING_BROWSER_SCRIPT', '')
+    if not script or not Path(script).is_file():
+        raise RuntimeError('Actual live browser qualification helper is missing')
+    process = await asyncio.create_subprocess_exec('node', script,
+        stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+    payload = {'base_url': 'https://staging.dpenv.com', 'username': fixture['admin_email'],
+               'password': fixture['admin_password'], 'org_hash': fixture['organisation_hash'],
+               'name': name, 'phase': phase, 'output_dir': '/tmp/staging-tunnels-browser-' + fixture['run_id']}
+    try:
+        output, _ = await asyncio.wait_for(process.communicate(json.dumps(payload).encode()), 180)
+        if process.returncode != 0 or len(output) > 32768:
+            raise RuntimeError('Actual staging browser qualification failed')
+        evidence = json.loads(output)
+        cases = evidence.get('cases', {})
+        if evidence.get('status') != 'passed' or not cases or not all(value is True for value in cases.values()):
+            raise RuntimeError('Actual staging browser did not provide successful evidence')
+        report['cases'].update(cases)
+    finally:
+        if process.returncode is None:
+            process.kill()
+            await process.wait()
