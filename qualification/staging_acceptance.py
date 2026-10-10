@@ -388,6 +388,8 @@ client.run_forever()
         else:
             raise RuntimeError('Unable to place actual agent and consumer on distinct staging router nodes')
         async def open_channel():
+            legacy['diagnostics'].pop('expected_channel_match', None)
+            legacy['diagnostics'].pop('admission_failure', None)
             legacy['diagnostics']['admission_stage'] = 1
             def admit():
                 with admin_control._request_lock:

@@ -113,10 +113,12 @@ def test_continuity_probe_keeps_same_stream_and_still_admits_new_connections(mon
     from qualification import staging_acceptance as acceptance
     async def exercise():
         reader = asyncio.StreamReader()
+        persistent = []
         class Writer:
             def is_closing(self):
                 return False
             def write(self, data):
+                persistent.append(data)
                 reader.feed_data(data)
             async def drain(self):
                 return
@@ -132,6 +134,7 @@ def test_continuity_probe_keeps_same_stream_and_still_admits_new_connections(mon
         await acceptance._legacy_exchange(legacy, b'after-replacement')
         assert legacy['persistent_writer'] is writer
         assert fresh == [b'fresh:before-replacement', b'fresh:after-replacement']
+        assert persistent == [b'persistent:before-replacement', b'persistent:after-replacement']
         assert legacy['diagnostics']['probe_count'] == 2
         assert legacy['diagnostics']['persistent_probe_count'] == 2
     asyncio.run(exercise())
