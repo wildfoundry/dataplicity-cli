@@ -977,7 +977,7 @@ async def _presence_browser_phase(process, command, expected, report, timeout):
                 network = evidence.get('network', {})
                 if isinstance(network, dict):
                     for key in ('host_lookup_http_status', 'terminal_http_status',
-                                'task_host_lookup_http_status'):
+                                'task_host_lookup_http_status', 'host_lookup_preflight_http_status'):
                         value = network.get(key)
                         if type(value) is int and 100 <= value <= 599:
                             diagnostic[key] = value
@@ -985,7 +985,11 @@ async def _presence_browser_phase(process, command, expected, report, timeout):
                     'host_lookup_requested', 'host_lookup_failed', 'terminal_requested',
                     'terminal_request_failed', 'page_error_observed',
                     'task_host_lookup_requested', 'task_host_lookup_allow_origin_matches_stage',
-                    'task_host_lookup_allow_authorization'):
+                    'task_host_lookup_allow_authorization', 'host_lookup_cdp_observation_available',
+                    'host_lookup_origin_matches_stage', 'host_lookup_uses_authorization',
+                    'host_lookup_uses_client_app', 'host_lookup_allow_origin_matches_stage',
+                    'host_lookup_allow_authorization', 'host_lookup_preflight_allow_origin_matches_stage',
+                    'host_lookup_preflight_allow_authorization'):
                         if type(network.get(key)) is bool:
                             diagnostic[key] = network[key]
                     for key, allowed in (
@@ -993,9 +997,20 @@ async def _presence_browser_phase(process, command, expected, report, timeout):
                             'connection', 'cancelled', 'other'}),
                         ('task_host_lookup_failure', {'dns', 'tls', 'timeout',
                             'connection', 'other'}),
+                        ('host_lookup_cors_reason', {'origin', 'headers', 'method', 'credentials',
+                            'preflight_status', 'redirect', 'private_network', 'other'}),
+                        ('host_lookup_blocked_reason', {'csp', 'mixed_content', 'corp', 'coep',
+                            'inspector', 'other'}),
+                        ('host_lookup_denied_header', {'authorization', 'content_type', 'csrf',
+                            'client_app', 'requested_with', 'other'}),
                     ):
                         value = network.get(key)
                         if type(value) is str and value in allowed:
+                            diagnostic[key] = value
+                    for key, maximum in (('host_lookup_header_mask', 31),
+                                         ('host_lookup_preflight_header_mask', 63)):
+                        value = network.get(key)
+                        if type(value) is int and 0 <= value <= maximum:
                             diagnostic[key] = value
                     overlay = network.get('terminal_overlay_state')
                     if isinstance(overlay, str) and overlay in {'absent', 'connecting', 'error', 'waiting', 'unknown'}:

@@ -208,3 +208,58 @@ def test_untrusted_task_lookup_values_are_not_reflected(network):
         assert report == {'cases': {}, 'presence_browser_diagnostics': {
             'stage': 'terminal_admission', 'failure': 'check_failed'}}
     asyncio.run(exercise())
+
+
+_CDP_BOOLEANS = (
+    'host_lookup_cdp_observation_available', 'host_lookup_origin_matches_stage',
+    'host_lookup_uses_authorization', 'host_lookup_uses_client_app',
+    'host_lookup_allow_origin_matches_stage', 'host_lookup_allow_authorization',
+    'host_lookup_preflight_allow_origin_matches_stage', 'host_lookup_preflight_allow_authorization',
+)
+_CDP_ENUMS = {
+    'host_lookup_cors_reason': ('origin', 'headers', 'method', 'credentials',
+        'preflight_status', 'redirect', 'private_network', 'other'),
+    'host_lookup_blocked_reason': ('csp', 'mixed_content', 'corp', 'coep', 'inspector', 'other'),
+    'host_lookup_denied_header': ('authorization', 'content_type', 'csrf',
+        'client_app', 'requested_with', 'other'),
+}
+
+
+@pytest.mark.parametrize('key,value', [
+    *[(key, value) for key in _CDP_BOOLEANS for value in (True, False)],
+    *[(key, value) for key, values in _CDP_ENUMS.items() for value in values],
+    ('host_lookup_preflight_http_status', 100), ('host_lookup_preflight_http_status', 599),
+    ('host_lookup_header_mask', 0), ('host_lookup_header_mask', 31),
+    ('host_lookup_preflight_header_mask', 0), ('host_lookup_preflight_header_mask', 63),
+])
+def test_cdp_observation_is_bounded_and_never_satisfies_acceptance(key, value):
+    async def exercise():
+        report = {'cases': {}}
+        with pytest.raises(RuntimeError, match='expected phase'):
+            await acceptance._presence_browser_phase(sequence_process([{
+                'status': 'failed', 'stage': 'terminal_admission', 'network': {
+                    key: value, 'request_headers': 'Bearer private', 'url': 'private'}}]),
+                None, 'online_ready', report, 1)
+        assert report == {'cases': {}, 'presence_browser_diagnostics': {
+            'stage': 'terminal_admission', 'failure': 'check_failed', key: value}}
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize('key,value', [
+    *[(key, value) for key in _CDP_BOOLEANS for value in (0, 1, 'true', None)],
+    *[(key, value) for key in _CDP_ENUMS for value in ('Bearer private', [], {}, True, None)],
+    *[('host_lookup_preflight_http_status', value) for value in (99, 600, True, 200.0, '200')],
+    *[(key, value) for key, maximum in (('host_lookup_header_mask', 31),
+        ('host_lookup_preflight_header_mask', 63))
+        for value in (-1, maximum + 1, True, 0.0, '0', None)],
+])
+def test_cdp_untrusted_values_are_dropped_without_reflection(key, value):
+    async def exercise():
+        report = {'cases': {}}
+        with pytest.raises(RuntimeError, match='expected phase'):
+            await acceptance._presence_browser_phase(sequence_process([{
+                'status': 'failed', 'stage': 'terminal_admission', 'network': {key: value}}]),
+                None, 'online_ready', report, 1)
+        assert report == {'cases': {}, 'presence_browser_diagnostics': {
+            'stage': 'terminal_admission', 'failure': 'check_failed'}}
+    asyncio.run(exercise())
