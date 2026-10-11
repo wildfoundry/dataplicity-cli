@@ -65,3 +65,64 @@ def test_startup_failure_cleans_up_browser_process(monkeypatch, tmp_path):
     with pytest.raises(RuntimeError, match='expected phase'):
         asyncio.run(acceptance._start_presence_browser(fixture, {'cases': {}}))
     assert process.killed
+
+
+def sequence_process(rows):
+    process = process_for({})
+    outputs = iter(rows)
+    async def readline():
+        row = next(outputs, None)
+        if row is None:
+            await asyncio.Event().wait()
+        return json.dumps(row).encode() + b'\n'
+    process.stdout.readline = readline
+    return process
+
+
+def test_browser_progress_is_consumed_before_real_success_evidence():
+    async def exercise():
+        cases = {'live_legacy_browser_terminal_connected': True}
+        process = sequence_process([
+            {'status': 'progress', 'stage': 'navigation'},
+            {'status': 'progress', 'stage': 'terminal_admission'},
+            {'status': 'passed', 'phase': 'online_ready', 'cases': cases},
+        ])
+        report = {'cases': {}}
+        await acceptance._presence_browser_phase(process, None, 'online_ready', report, 1)
+        assert report['cases'] == cases
+        assert report['presence_browser_diagnostics'] == {'stage': 'terminal_admission'}
+    asyncio.run(exercise())
+
+
+def test_browser_check_failure_exposes_only_fixed_stage_and_remains_fatal():
+    async def exercise():
+        process = sequence_process([{'status': 'failed', 'stage': 'xterm',
+            'failure': 'Bearer secret', 'exception': 'private details'}])
+        report = {'cases': {}}
+        with pytest.raises(RuntimeError, match='expected phase'):
+            await acceptance._presence_browser_phase(process, None, 'online_ready', report, 1)
+        assert report == {'cases': {}, 'presence_browser_diagnostics': {
+            'stage': 'xterm', 'failure': 'check_failed'}}
+    asyncio.run(exercise())
+
+
+def test_browser_timeout_retains_last_stage_without_extending_deadline():
+    async def exercise():
+        process = sequence_process([{'status': 'progress', 'stage': 'online_card'}])
+        report = {'cases': {}}
+        with pytest.raises(asyncio.TimeoutError):
+            await acceptance._presence_browser_phase(process, None, 'online_ready', report, 0.01)
+        assert report['presence_browser_diagnostics'] == {'stage': 'online_card', 'failure': 'timeout'}
+        assert report['cases'] == {}
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize('stage', ['Bearer_secret', ['xterm'], None])
+def test_browser_untrusted_progress_stage_is_rejected_and_not_reflected(stage):
+    async def exercise():
+        report = {'cases': {}}
+        with pytest.raises(RuntimeError, match='expected phase'):
+            await acceptance._presence_browser_phase(sequence_process([
+                {'status': 'progress', 'stage': stage}]), None, 'online_ready', report, 1)
+        assert report['presence_browser_diagnostics'] == {}
+    asyncio.run(exercise())

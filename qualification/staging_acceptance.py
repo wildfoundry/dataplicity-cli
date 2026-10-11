@@ -942,14 +942,44 @@ _PRESENCE_BROWSER_CASES = {
 }
 
 
+_PRESENCE_BROWSER_STAGES = {
+    'input', 'launch', 'login', 'metadata', 'navigation', 'identity',
+    'online_badge', 'online_card', 'xterm', 'terminal_admission',
+    'online_screenshot', 'stop_handshake', 'offline_wait',
+    'restart_handshake', 'restart_wait', 'terminal_echo',
+}
+
+
 async def _presence_browser_phase(process, command, expected, report, timeout):
     if command:
         process.stdin.write((json.dumps({'phase': command}) + '\n').encode())
         await process.stdin.drain()
-    output = await asyncio.wait_for(process.stdout.readline(), timeout)
-    if not output or len(output) > 32768:
-        raise RuntimeError('Retained live presence browser provided no bounded evidence')
-    evidence = json.loads(output)
+    deadline = asyncio.get_running_loop().time() + timeout
+    diagnostic = report.setdefault('presence_browser_diagnostics', {})
+    for _ in range(64):
+        try:
+            output = await asyncio.wait_for(
+                process.stdout.readline(), max(0, deadline - asyncio.get_running_loop().time()))
+        except asyncio.TimeoutError:
+            diagnostic['failure'] = 'timeout'
+            raise
+        if not output or len(output) > 32768:
+            raise RuntimeError('Retained live presence browser provided no bounded evidence')
+        evidence = json.loads(output)
+        if not isinstance(evidence, dict):
+            raise RuntimeError('Retained live presence browser failed the expected phase')
+        if evidence.get('status') in {'progress', 'failed'}:
+            stage = evidence.get('stage')
+            if not isinstance(stage, str) or stage not in _PRESENCE_BROWSER_STAGES:
+                raise RuntimeError('Retained live presence browser failed the expected phase')
+            diagnostic['stage'] = stage
+            if evidence['status'] == 'failed':
+                diagnostic['failure'] = 'check_failed'
+                raise RuntimeError('Retained live presence browser failed the expected phase')
+            continue
+        break
+    else:
+        raise RuntimeError('Retained live presence browser exceeded bounded evidence count')
     cases = evidence.get('cases', {})
     allowed = set().union(*_PRESENCE_BROWSER_CASES.values())
     if (evidence.get('status') != 'passed' or evidence.get('phase') != expected
