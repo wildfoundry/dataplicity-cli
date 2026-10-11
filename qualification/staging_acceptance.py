@@ -9,6 +9,7 @@ import asyncio
 from contextlib import suppress
 from datetime import datetime, timedelta, timezone
 import ast
+from email.parser import Parser
 import json
 import os
 import re
@@ -127,6 +128,7 @@ async def qualify_named_and_legacy(fixture):
     sessions.extend((publisher, consumer))
     publish_task = asyncio.create_task(publisher.publish(target_port)); tasks.append(publish_task)
     legacy = None
+    prelude_rescue = None
     presence_browser = None
     phase = 'publisher_admission'
     try:
@@ -139,6 +141,20 @@ async def qualify_named_and_legacy(fixture):
         report['router_node_ids'].append(owner)
         phase = 'actual_legacy_agent_association_and_mesh'
         legacy = await _start_legacy(fixture, target_port, report)
+        phase = 'actual_published_prelude_rescue_association_and_mesh'
+        rescue_fixture = dict(fixture)
+        rescue_fixture.update(fixture['prelude_rescue'])
+        rescue_report = {'cases': {}, 'router_node_ids': []}
+        prelude_rescue = await _start_legacy(rescue_fixture, target_port, rescue_report,
+            agent_root=os.environ.get('DATAPLICITY_PRELUDE_RESCUE_ROOT', ''),
+            expected_sha=os.environ.get('DATAPLICITY_PRELUDE_RESCUE_SHA', ''),
+            published_version='0.1.68')
+        report['prelude_rescue_agent'] = rescue_report['legacy_agent']
+        report['prelude_rescue_agent'].update(internal_version='0.5.13a3',
+            artifact_sha256='56a9fdc079c8f0b6065abb7b942f945bbb79634c2bb0ca22f9e7fed30588f7e3')
+        report['router_node_ids'].extend(rescue_report['router_node_ids'])
+        legacy['companion'] = prelude_rescue
+        report['cases']['actual_published_prelude_rescue_distinct_router_nodes'] = True
         phase = 'simultaneous_named_and_legacy'
         # Stay within the fixture's measured protective one-MiB/s bidirectional
         # budget; quota-exhaustion tests must be a separate acceptance case.
@@ -293,6 +309,7 @@ async def qualify_named_and_legacy(fixture):
         legacy = None
         await _presence_browser_phase(presence_browser, 'agent_stopped', 'offline_observed', report, 125)
         legacy = await _start_legacy(fixture, target_port, report)
+        legacy['companion'] = prelude_rescue
         await _legacy_exchange(legacy, b'actual-legacy-agent-reconnect')
         await _presence_browser_phase(presence_browser, 'agent_restarted', 'reconnected', report, 95)
         await asyncio.wait_for(presence_browser.wait(), 10)
@@ -301,6 +318,8 @@ async def qualify_named_and_legacy(fixture):
         report['cases']['actual_legacy_agent_restart_and_mesh_reconnect'] = True
         report['cases']['existing_legacy_stream_survives_named_operations'] = True
         report['actual_legacy_agent_verified'] = True
+        report['actual_prelude_rescue_agent_verified'] = True
+        report['cases']['published_prelude_rescue_stream_survives_named_operations_and_legacy_restart'] = True
         report['status'] = 'passed'
     except Exception as exc:
         report['failure_type'] = type(exc).__name__
@@ -319,17 +338,16 @@ async def qualify_named_and_legacy(fixture):
         for session in sessions:
             with suppress(Exception):
                 await session.close()
-        if legacy:
-            await _stop_legacy(legacy)
+        await _stop_agent_pair(legacy, prelude_rescue)
         service.close(); await service.wait_closed()
         for writer in list(writers):
             writer.close()
     return report
 
 
-async def _start_legacy(fixture, target_port, report):
-    source = Path(os.environ.get('DATAPLICITY_LEGACY_AGENT_ROOT', '/opt/legacy-agent'))
-    expected = os.environ.get('DATAPLICITY_LEGACY_AGENT_SHA', '')
+async def _start_legacy(fixture, target_port, report, *, agent_root=None, expected_sha=None, published_version=None):
+    source = Path(agent_root if agent_root is not None else os.environ.get('DATAPLICITY_LEGACY_AGENT_ROOT', '/opt/legacy-agent'))
+    expected = expected_sha if expected_sha is not None else os.environ.get('DATAPLICITY_LEGACY_AGENT_SHA', '')
     if len(expected) != 40 or not source.joinpath('dataplicity/client.py').is_file():
         raise RuntimeError('Pinned actual older agent source is missing')
     revision_file = source / 'REVISION'
@@ -340,7 +358,20 @@ async def _start_legacy(fixture, target_port, report):
     assignments = ast.parse(source.joinpath('dataplicity/_version.py').read_text()).body
     version = next(ast.literal_eval(row.value) for row in assignments
                    if isinstance(row, ast.Assign) and any(isinstance(t, ast.Name) and t.id == '__version__' for t in row.targets))
-    if any(marker in version for marker in ('a', 'b', 'rc')):
+    if published_version is not None:
+        if (published_version != '0.1.68' or expected != '3bc380b0271af6c5af11c7b65e2b06467b627bef'
+                or not source.joinpath('ARTIFACT_SHA256').is_file()
+                or source.joinpath('ARTIFACT_SHA256').read_text().strip()
+                != '56a9fdc079c8f0b6065abb7b942f945bbb79634c2bb0ca22f9e7fed30588f7e3'):
+            raise RuntimeError('Published rescue artifact provenance does not match the pin')
+        metadata_path = source / 'dataplicity-0.5.13a3.dist-info' / 'METADATA'
+        if not metadata_path.is_file() or metadata_path.stat().st_size > 65536:
+            raise RuntimeError('Published rescue release metadata is missing')
+        metadata = Parser().parsestr(metadata_path.read_text())
+        if metadata.get_all('Name') != ['dataplicity'] or metadata.get_all('Version') != ['0.5.13a3'] or version != '0.5.13a3':
+            raise RuntimeError('Published rescue release metadata does not match the pin')
+        version = published_version
+    elif any(marker in version for marker in ('a', 'b', 'rc')):
         raise RuntimeError('Older-agent qualification requires a stable released version')
     remote = tempfile.TemporaryDirectory(prefix='legacy-agent-qualification-')
     # Execute the released Client unchanged. Credentials enter over stdin;
@@ -365,14 +396,7 @@ def report_state():
 threading.Thread(target=report_state, daemon=True).start()
 client.run_forever()
 """
-    previous_identity = await asyncio.to_thread(fixture['device_identity'])
-    process = await asyncio.create_subprocess_exec(sys.executable, '-c', script, str(source),
-        stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
-    process.stdin.write((json.dumps({key: fixture[key] for key in
-        ('api_url', 'm2m_url', 'device_serial', 'device_auth_token')} |
-        {'remote_directory': remote.name}) + '\n').encode())
-    await process.stdin.drain(); process.stdin.close()
-    legacy = {'process': process, 'directory': remote, 'tasks': [], 'client': None,
+    legacy = {'process': None, 'directory': remote, 'tasks': [], 'client': None,
               'diagnostics': {'admission_stage': 0, 'http_status': 0, 'bytes_up': 0, 'bytes_down': 0,
                               'probe_count': 0, 'persistent_probe_count': 0}}
     async def collect_state():
@@ -388,8 +412,16 @@ client.run_forever()
                     legacy['diagnostics'][key] = state[key]
             if type(state.get('agent_channel_count')) is int and 0 <= state['agent_channel_count'] <= 4096:
                 legacy['diagnostics']['agent_channel_count'] = state['agent_channel_count']
-    legacy['tasks'].append(asyncio.create_task(collect_state()))
     try:
+        previous_identity = await asyncio.to_thread(fixture['device_identity'])
+        process = await asyncio.create_subprocess_exec(sys.executable, '-c', script, str(source),
+            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+        legacy['process'] = process
+        process.stdin.write((json.dumps({key: fixture[key] for key in
+            ('api_url', 'm2m_url', 'device_serial', 'device_auth_token')} |
+            {'remote_directory': remote.name}) + '\n').encode())
+        await process.stdin.drain(); process.stdin.close()
+        legacy['tasks'].append(asyncio.create_task(collect_state()))
         identity = ''
         for _ in range(90):
             if process.returncode is not None:
@@ -451,7 +483,8 @@ client.run_forever()
         report['router_node_ids'] = sorted(set(report['router_node_ids']))
         return legacy
     except BaseException:
-        report['legacy_diagnostics'] = _legacy_diagnostics(legacy)
+        if legacy['process'] is not None:
+            report['legacy_diagnostics'] = _legacy_diagnostics(legacy)
         await _stop_legacy(legacy)
         raise
 
@@ -556,6 +589,8 @@ async def _legacy_exchange(legacy, payload):
     diagnostic.pop('admission_failure', None)
     diagnostic['probe_count'] = diagnostic.get('probe_count', 0) + 1
     probes = [asyncio.create_task(_exchange(legacy['local_port'], b'fresh:' + payload))]
+    if legacy.get('companion'):
+        probes.append(asyncio.create_task(_legacy_exchange(legacy['companion'], payload)))
     if legacy.get('persistent_writer'):
         # Keep testing freshly admitted connections as well as the old stream;
         # establishing a new stream never substitutes for continuity evidence.
@@ -619,7 +654,7 @@ async def _stop_legacy(legacy):
     await asyncio.gather(*legacy.get('tasks', []), return_exceptions=True)
     if legacy.get('client'):
         await legacy['client'].close()
-    if legacy['process'].returncode is None:
+    if legacy['process'] is not None and legacy['process'].returncode is None:
         legacy['process'].terminate()
         try:
             await asyncio.wait_for(legacy['process'].wait(), 10)
@@ -627,6 +662,15 @@ async def _stop_legacy(legacy):
             legacy['process'].kill()
             await legacy['process'].wait()
     legacy['directory'].cleanup()
+
+
+async def _stop_agent_pair(legacy, prelude_rescue):
+    try:
+        if legacy:
+            await _stop_legacy(legacy)
+    finally:
+        if prelude_rescue:
+            await _stop_legacy(prelude_rescue)
 
 
 async def _mobile_device(fixture, method, payload=None):
