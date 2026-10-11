@@ -976,15 +976,27 @@ async def _presence_browser_phase(process, command, expected, report, timeout):
             if evidence['status'] == 'failed':
                 network = evidence.get('network', {})
                 if isinstance(network, dict):
-                    for key in ('host_lookup_http_status', 'terminal_http_status'):
+                    for key in ('host_lookup_http_status', 'terminal_http_status',
+                                'task_host_lookup_http_status'):
                         value = network.get(key)
                         if type(value) is int and 100 <= value <= 599:
                             diagnostic[key] = value
                     for key in ('m2m_websocket_opened', 'm2m_websocket_closed',
                     'host_lookup_requested', 'host_lookup_failed', 'terminal_requested',
-                    'terminal_request_failed', 'page_error_observed'):
+                    'terminal_request_failed', 'page_error_observed',
+                    'task_host_lookup_requested', 'task_host_lookup_allow_origin_matches_stage',
+                    'task_host_lookup_allow_authorization'):
                         if type(network.get(key)) is bool:
                             diagnostic[key] = network[key]
+                    for key, allowed in (
+                        ('host_lookup_failure_reason', {'dns', 'tls', 'timeout',
+                            'connection', 'cancelled', 'other'}),
+                        ('task_host_lookup_failure', {'dns', 'tls', 'timeout',
+                            'connection', 'other'}),
+                    ):
+                        value = network.get(key)
+                        if type(value) is str and value in allowed:
+                            diagnostic[key] = value
                     overlay = network.get('terminal_overlay_state')
                     if isinstance(overlay, str) and overlay in {'absent', 'connecting', 'error', 'waiting', 'unknown'}:
                         diagnostic['terminal_overlay_state'] = overlay
