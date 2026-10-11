@@ -61,10 +61,59 @@ def test_startup_failure_cleans_up_browser_process(monkeypatch, tmp_path):
     async def spawn(*args, **kwargs): return process
     monkeypatch.setattr(asyncio, 'create_subprocess_exec', spawn)
     fixture = {'admin_email': 'fixture@example.test', 'admin_password': 'test-only',
-        'device_hash': 'a' * 64, 'run_id': 'test'}
+        'device_hash': 'a' * 64, 'run_id': 'test', 'presence_offline_timeout_seconds': 190}
     with pytest.raises(RuntimeError, match='expected phase'):
         asyncio.run(acceptance._start_presence_browser(fixture, {'cases': {}}))
     assert process.killed
+
+
+@pytest.mark.parametrize('value', [30, 190, 300])
+def test_offline_budget_is_carried_to_browser_and_bounds_parent_phase(monkeypatch, tmp_path, value):
+    (tmp_path / 'staging-legacy-presence-browser.mjs').write_text('// test contract')
+    monkeypatch.setenv('DATAPLICITY_STAGING_BROWSER_SCRIPT', str(tmp_path / 'staging-tunnels-browser.mjs'))
+    process = process_for({})
+    process.returncode = None
+    async def spawn(*args, **kwargs): return process
+    monkeypatch.setattr(asyncio, 'create_subprocess_exec', spawn)
+    phases = []
+    async def phase(actual, command, expected, report, timeout):
+        assert actual is process
+        phases.append((command, expected, timeout))
+    monkeypatch.setattr(acceptance, '_presence_browser_phase', phase)
+    fixture = {'admin_email': 'fixture@example.test', 'admin_password': 'test-only',
+        'device_hash': 'a' * 64, 'run_id': 'test', 'presence_offline_timeout_seconds': value}
+    async def exercise():
+        assert await acceptance._start_presence_browser(fixture, {'cases': {}}) is process
+        payload = json.loads(process.stdin.writes[0])
+        assert payload['presence_offline_timeout_seconds'] == value
+        await acceptance._presence_browser_offline(process, fixture, {'cases': {}})
+    asyncio.run(exercise())
+    assert phases == [(None, 'online_ready', 100), ('agent_stopped', 'offline_observed', value + 5)]
+
+
+@pytest.mark.parametrize('fixture', [
+    {}, *[{'presence_offline_timeout_seconds': value}
+        for value in (None, True, False, 29, 301, 30.0, '190', [], {})],
+])
+def test_missing_or_untrusted_offline_budget_fails_before_browser_spawn(monkeypatch, tmp_path, fixture):
+    (tmp_path / 'staging-legacy-presence-browser.mjs').write_text('// test contract')
+    monkeypatch.setenv('DATAPLICITY_STAGING_BROWSER_SCRIPT', str(tmp_path / 'staging-tunnels-browser.mjs'))
+    async def forbidden(*args, **kwargs): raise AssertionError('Browser must not start with an invalid budget')
+    monkeypatch.setattr(asyncio, 'create_subprocess_exec', forbidden)
+    with pytest.raises(RuntimeError, match='bounded fixture integer'):
+        asyncio.run(acceptance._start_presence_browser(fixture, {'cases': {}}))
+
+
+def test_api_and_dom_offline_without_router_offline_proof_is_incomplete():
+    cases = {key: True for key in acceptance._PRESENCE_BROWSER_CASES['offline_observed']
+        if key != 'live_legacy_router_offline_after_agent_stop'}
+    assert len(cases) == 3
+    report = {'cases': {}}
+    with pytest.raises(RuntimeError, match='expected phase'):
+        asyncio.run(acceptance._presence_browser_phase(process_for({
+            'status': 'passed', 'phase': 'offline_observed', 'cases': cases}),
+            'agent_stopped', 'offline_observed', report, 1))
+    assert report['cases'] == {}
 
 
 def sequence_process(rows):

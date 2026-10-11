@@ -307,7 +307,7 @@ async def qualify_named_and_legacy(fixture):
         presence_browser = await _start_presence_browser(fixture, report)
         await _stop_legacy(legacy)
         legacy = None
-        await _presence_browser_phase(presence_browser, 'agent_stopped', 'offline_observed', report, 125)
+        await _presence_browser_offline(presence_browser, fixture, report)
         legacy = await _start_legacy(fixture, target_port, report)
         legacy['companion'] = prelude_rescue
         await _legacy_exchange(legacy, b'actual-legacy-agent-reconnect')
@@ -979,7 +979,8 @@ async def _protocol_acceptance(fixture, name, legacy, report):
 
 _PRESENCE_BROWSER_CASES = {
     'online_ready': {'live_legacy_browser_terminal_connected'},
-    'offline_observed': {'live_legacy_http_offline_snapshot_received',
+    'offline_observed': {'live_legacy_router_offline_after_agent_stop',
+        'live_legacy_http_offline_snapshot_received',
         'live_legacy_card_and_badge_offline_without_reload', 'live_legacy_metadata_preserved'},
     'reconnected': {'live_legacy_browser_reconnect_without_reload',
         'live_legacy_browser_terminal_echo_after_restart'},
@@ -1091,13 +1092,27 @@ async def _presence_browser_phase(process, command, expected, report, timeout):
     report['cases'].update(cases)
 
 
+def _presence_offline_timeout(fixture):
+    value = fixture.get('presence_offline_timeout_seconds')
+    if type(value) is not int or not 30 <= value <= 300:
+        raise RuntimeError('Retained presence offline timeout must be a bounded fixture integer')
+    return value
+
+
+async def _presence_browser_offline(process, fixture, report):
+    await _presence_browser_phase(process, 'agent_stopped', 'offline_observed', report,
+        _presence_offline_timeout(fixture) + 5)
+
+
 async def _start_presence_browser(fixture, report):
     named_script = os.environ.get('DATAPLICITY_STAGING_BROWSER_SCRIPT', '')
     script = Path(named_script).with_name('staging-legacy-presence-browser.mjs') if named_script else None
     if script is None or not script.is_file():
         raise RuntimeError('Retained live presence browser helper is required')
+    offline_timeout = _presence_offline_timeout(fixture)
     payload = {'base_url': 'https://staging.dpenv.com', 'username': fixture['admin_email'],
         'password': fixture['admin_password'], 'device_hash': fixture['device_hash'],
+        'presence_offline_timeout_seconds': offline_timeout,
         'output_dir': '/tmp/staging-legacy-presence-' + fixture['run_id']}
     process = await asyncio.create_subprocess_exec('node', str(script),
         stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
