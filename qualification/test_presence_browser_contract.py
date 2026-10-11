@@ -164,3 +164,47 @@ def test_browser_untrusted_progress_stage_is_rejected_and_not_reflected(stage):
                 {'status': 'progress', 'stage': stage}]), None, 'online_ready', report, 1)
         assert report['presence_browser_diagnostics'] == {}
     asyncio.run(exercise())
+
+
+@pytest.mark.parametrize('key,value', [
+    *[('host_lookup_failure_reason', value) for value in
+        ('dns', 'tls', 'timeout', 'connection', 'cancelled', 'other')],
+    *[('task_host_lookup_failure', value) for value in
+        ('dns', 'tls', 'timeout', 'connection', 'other')],
+    *[(key, value) for key in ('task_host_lookup_requested',
+        'task_host_lookup_allow_origin_matches_stage', 'task_host_lookup_allow_authorization')
+        for value in (True, False)],
+    ('task_host_lookup_http_status', 100), ('task_host_lookup_http_status', 599),
+])
+def test_task_lookup_diagnostics_are_bounded_and_remain_fatal(key, value):
+    async def exercise():
+        report = {'cases': {}}
+        with pytest.raises(RuntimeError, match='expected phase'):
+            await acceptance._presence_browser_phase(sequence_process([{
+                'status': 'failed', 'stage': 'terminal_admission',
+                'network': {key: value, 'errorText': 'Bearer private', 'url': 'private'}}]),
+                None, 'online_ready', report, 1)
+        assert report == {'cases': {}, 'presence_browser_diagnostics': {
+            'stage': 'terminal_admission', 'failure': 'check_failed', key: value}}
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize('network', [
+    *[{key: value} for key in ('host_lookup_failure_reason', 'task_host_lookup_failure')
+        for value in ('Bearer private', [], {}, True, None)],
+    {'task_host_lookup_failure': 'cancelled'},
+    *[{key: value} for key in ('task_host_lookup_requested',
+        'task_host_lookup_allow_origin_matches_stage', 'task_host_lookup_allow_authorization')
+        for value in (1, 0, 'false', None)],
+    *[{'task_host_lookup_http_status': value} for value in (True, False, 99, 600, 200.0, '200')],
+])
+def test_untrusted_task_lookup_values_are_not_reflected(network):
+    async def exercise():
+        report = {'cases': {}}
+        with pytest.raises(RuntimeError, match='expected phase'):
+            await acceptance._presence_browser_phase(sequence_process([{
+                'status': 'failed', 'stage': 'terminal_admission', 'network': network}]),
+                None, 'online_ready', report, 1)
+        assert report == {'cases': {}, 'presence_browser_diagnostics': {
+            'stage': 'terminal_admission', 'failure': 'check_failed'}}
+    asyncio.run(exercise())
