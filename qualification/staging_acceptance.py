@@ -1033,7 +1033,7 @@ async def _presence_browser_phase(process, command, expected, report, timeout):
                     'host_lookup_origin_matches_stage', 'host_lookup_uses_authorization',
                     'host_lookup_uses_client_app', 'host_lookup_allow_origin_matches_stage',
                     'host_lookup_allow_authorization', 'host_lookup_preflight_allow_origin_matches_stage',
-                    'host_lookup_preflight_allow_authorization'):
+                    'host_lookup_preflight_allow_authorization', 'browser_origin_matches_stage'):
                         if type(network.get(key)) is bool:
                             diagnostic[key] = network[key]
                     for key, allowed in (
@@ -1047,6 +1047,16 @@ async def _presence_browser_phase(process, command, expected, report, timeout):
                             'inspector', 'other'}),
                         ('host_lookup_denied_header', {'authorization', 'content_type', 'csrf',
                             'client_app', 'requested_with', 'other'}),
+                        ('host_lookup_private_network_reason', {
+                            'InsecureLocalNetwork', 'InvalidLocalNetworkAccess',
+                            'LocalNetworkAccessPermissionDenied', 'InsecurePrivateNetwork',
+                            'InvalidPrivateNetworkAccess', 'UnexpectedPrivateNetworkAccess',
+                            'PreflightMissingAllowPrivateNetwork', 'PreflightInvalidAllowPrivateNetwork',
+                            'PreflightMissingPrivateNetworkAccessId', 'PreflightMissingPrivateNetworkAccessName',
+                            'PrivateNetworkAccessPermissionUnavailable', 'PrivateNetworkAccessPermissionDenied',
+                            'other'}),
+                        ('host_lookup_resource_address_space', {'local', 'private', 'public', 'loopback', 'unknown'}),
+                        ('host_lookup_initiator_address_space', {'local', 'private', 'public', 'loopback', 'unknown'}),
                     ):
                         value = network.get(key)
                         if type(value) is str and value in allowed:
@@ -1056,6 +1066,9 @@ async def _presence_browser_phase(process, command, expected, report, timeout):
                         value = network.get(key)
                         if type(value) is int and 0 <= value <= maximum:
                             diagnostic[key] = value
+                    major = network.get('chromium_major')
+                    if type(major) is int and 1 <= major <= 1000:
+                        diagnostic['chromium_major'] = major
                     overlay = network.get('terminal_overlay_state')
                     if isinstance(overlay, str) and overlay in {'absent', 'connecting', 'error', 'waiting', 'unknown'}:
                         diagnostic['terminal_overlay_state'] = overlay
