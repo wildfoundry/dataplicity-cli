@@ -110,7 +110,9 @@ def test_browser_network_failure_stays_fatal_and_reflects_only_bounded_fields():
     async def exercise():
         network = {'host_lookup_http_status': 200, 'terminal_http_status': 403,
             'm2m_websocket_opened': True, 'm2m_websocket_closed': False,
-            'm2m_frames_received': 2}
+            'm2m_frames_received': 2, 'host_lookup_requested': False, 'host_lookup_failed': False,
+            'terminal_requested': True, 'terminal_request_failed': True, 'page_error_observed': True,
+            'terminal_overlay_state': 'error'}
         report = {'cases': {}}
         with pytest.raises(RuntimeError, match='expected phase'):
             await acceptance._presence_browser_phase(sequence_process([{
@@ -125,7 +127,10 @@ def test_browser_network_failure_stays_fatal_and_reflects_only_bounded_fields():
 
 @pytest.mark.parametrize('network', [[], None, {'host_lookup_http_status': True},
     {'terminal_http_status': 600}, {'m2m_frames_received': -1},
-    {'m2m_websocket_opened': 1}, {'m2m_websocket_closed': 'false'}])
+    {'m2m_websocket_opened': 1}, {'m2m_websocket_closed': 'false'},
+    *[{key: 1} for key in ('host_lookup_requested', 'host_lookup_failed', 'terminal_requested',
+        'terminal_request_failed', 'page_error_observed')],
+    {'terminal_overlay_state': 'private'}, {'terminal_overlay_state': []}])
 def test_malformed_browser_network_values_never_become_evidence(network):
     async def exercise():
         report = {'cases': {}}

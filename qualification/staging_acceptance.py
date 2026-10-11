@@ -980,9 +980,14 @@ async def _presence_browser_phase(process, command, expected, report, timeout):
                         value = network.get(key)
                         if type(value) is int and 100 <= value <= 599:
                             diagnostic[key] = value
-                    for key in ('m2m_websocket_opened', 'm2m_websocket_closed'):
+                    for key in ('m2m_websocket_opened', 'm2m_websocket_closed',
+                    'host_lookup_requested', 'host_lookup_failed', 'terminal_requested',
+                    'terminal_request_failed', 'page_error_observed'):
                         if type(network.get(key)) is bool:
                             diagnostic[key] = network[key]
+                    overlay = network.get('terminal_overlay_state')
+                    if isinstance(overlay, str) and overlay in {'absent', 'connecting', 'error', 'waiting', 'unknown'}:
+                        diagnostic['terminal_overlay_state'] = overlay
                     frames = network.get('m2m_frames_received')
                     if type(frames) is int and 0 <= frames <= 4096:
                         diagnostic['m2m_frames_received'] = frames
