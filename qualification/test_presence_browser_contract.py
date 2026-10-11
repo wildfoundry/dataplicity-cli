@@ -106,6 +106,39 @@ def test_browser_check_failure_exposes_only_fixed_stage_and_remains_fatal():
     asyncio.run(exercise())
 
 
+def test_browser_network_failure_stays_fatal_and_reflects_only_bounded_fields():
+    async def exercise():
+        network = {'host_lookup_http_status': 200, 'terminal_http_status': 403,
+            'm2m_websocket_opened': True, 'm2m_websocket_closed': False,
+            'm2m_frames_received': 2}
+        report = {'cases': {}}
+        with pytest.raises(RuntimeError, match='expected phase'):
+            await acceptance._presence_browser_phase(sequence_process([{
+                'status': 'failed', 'stage': 'terminal_admission',
+                'network': {**network, 'url': 'private', 'identity': 'secret'}}]),
+                None, 'online_ready', report, 1)
+        assert report['presence_browser_diagnostics'] == {
+            'stage': 'terminal_admission', 'failure': 'check_failed', **network}
+        assert report['cases'] == {}
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize('network', [[], None, {'host_lookup_http_status': True},
+    {'terminal_http_status': 600}, {'m2m_frames_received': -1},
+    {'m2m_websocket_opened': 1}, {'m2m_websocket_closed': 'false'}])
+def test_malformed_browser_network_values_never_become_evidence(network):
+    async def exercise():
+        report = {'cases': {}}
+        with pytest.raises(RuntimeError, match='expected phase'):
+            await acceptance._presence_browser_phase(sequence_process([{
+                'status': 'failed', 'stage': 'terminal_admission', 'network': network}]),
+                None, 'online_ready', report, 1)
+        assert report['presence_browser_diagnostics'] == {
+            'stage': 'terminal_admission', 'failure': 'check_failed'}
+        assert report['cases'] == {}
+    asyncio.run(exercise())
+
+
 def test_browser_timeout_retains_last_stage_without_extending_deadline():
     async def exercise():
         process = sequence_process([{'status': 'progress', 'stage': 'online_card'}])

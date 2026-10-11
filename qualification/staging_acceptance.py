@@ -974,6 +974,18 @@ async def _presence_browser_phase(process, command, expected, report, timeout):
                 raise RuntimeError('Retained live presence browser failed the expected phase')
             diagnostic['stage'] = stage
             if evidence['status'] == 'failed':
+                network = evidence.get('network', {})
+                if isinstance(network, dict):
+                    for key in ('host_lookup_http_status', 'terminal_http_status'):
+                        value = network.get(key)
+                        if type(value) is int and 100 <= value <= 599:
+                            diagnostic[key] = value
+                    for key in ('m2m_websocket_opened', 'm2m_websocket_closed'):
+                        if type(network.get(key)) is bool:
+                            diagnostic[key] = network[key]
+                    frames = network.get('m2m_frames_received')
+                    if type(frames) is int and 0 <= frames <= 4096:
+                        diagnostic['m2m_frames_received'] = frames
                 diagnostic['failure'] = 'check_failed'
                 raise RuntimeError('Retained live presence browser failed the expected phase')
             continue
