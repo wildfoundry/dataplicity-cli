@@ -211,12 +211,21 @@ def test_untrusted_task_lookup_values_are_not_reflected(network):
 
 
 _CDP_BOOLEANS = (
+    'browser_origin_matches_stage',
     'host_lookup_cdp_observation_available', 'host_lookup_origin_matches_stage',
     'host_lookup_uses_authorization', 'host_lookup_uses_client_app',
     'host_lookup_allow_origin_matches_stage', 'host_lookup_allow_authorization',
     'host_lookup_preflight_allow_origin_matches_stage', 'host_lookup_preflight_allow_authorization',
 )
 _CDP_ENUMS = {
+    'host_lookup_private_network_reason': ('InsecureLocalNetwork', 'InvalidLocalNetworkAccess',
+        'LocalNetworkAccessPermissionDenied', 'InsecurePrivateNetwork', 'InvalidPrivateNetworkAccess',
+        'UnexpectedPrivateNetworkAccess', 'PreflightMissingAllowPrivateNetwork',
+        'PreflightInvalidAllowPrivateNetwork', 'PreflightMissingPrivateNetworkAccessId',
+        'PreflightMissingPrivateNetworkAccessName', 'PrivateNetworkAccessPermissionUnavailable',
+        'PrivateNetworkAccessPermissionDenied', 'other'),
+    'host_lookup_resource_address_space': ('local', 'private', 'public', 'loopback', 'unknown'),
+    'host_lookup_initiator_address_space': ('local', 'private', 'public', 'loopback', 'unknown'),
     'host_lookup_cors_reason': ('origin', 'headers', 'method', 'credentials',
         'preflight_status', 'redirect', 'private_network', 'other'),
     'host_lookup_blocked_reason': ('csp', 'mixed_content', 'corp', 'coep', 'inspector', 'other'),
@@ -229,6 +238,7 @@ _CDP_ENUMS = {
     *[(key, value) for key in _CDP_BOOLEANS for value in (True, False)],
     *[(key, value) for key, values in _CDP_ENUMS.items() for value in values],
     ('host_lookup_preflight_http_status', 100), ('host_lookup_preflight_http_status', 599),
+    ('chromium_major', 1), ('chromium_major', 1000),
     ('host_lookup_header_mask', 0), ('host_lookup_header_mask', 31),
     ('host_lookup_preflight_header_mask', 0), ('host_lookup_preflight_header_mask', 63),
 ])
@@ -249,6 +259,7 @@ def test_cdp_observation_is_bounded_and_never_satisfies_acceptance(key, value):
     *[(key, value) for key in _CDP_BOOLEANS for value in (0, 1, 'true', None)],
     *[(key, value) for key in _CDP_ENUMS for value in ('Bearer private', [], {}, True, None)],
     *[('host_lookup_preflight_http_status', value) for value in (99, 600, True, 200.0, '200')],
+    *[('chromium_major', value) for value in (0, 1001, True, False, 1.0, '1', None, [], {})],
     *[(key, value) for key, maximum in (('host_lookup_header_mask', 31),
         ('host_lookup_preflight_header_mask', 63))
         for value in (-1, maximum + 1, True, 0.0, '0', None)],
