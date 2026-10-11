@@ -140,6 +140,14 @@ def test_orchestration_revokes_exact_grant_and_token_with_cleanup_and_no_pass_on
                                                   'user_id': 10, 'ports': [3000]}
                     return {'id': 2}
                 if method == 'POST' and resource == 'credentials/':
+                    from datetime import datetime, timezone
+                    payload = kwargs['payload']
+                    # Match the real credential API: expiry is mandatory,
+                    # timezone-aware, and this fixture must be short-lived.
+                    expiry = datetime.fromisoformat(payload['expires_at'])
+                    remaining = (expiry - datetime.now(timezone.utc)).total_seconds()
+                    assert expiry.utcoffset().total_seconds() == 0
+                    assert 0 < remaining <= 600
                     return {'id': 'owned', 'secret': 'private'}
                 if method == 'DELETE':
                     deletes.append(resource)
@@ -262,6 +270,7 @@ def test_withdrawal_rechecks_leaks_delivered_during_server_close_wait(direction)
 
 
 @pytest.mark.parametrize('code,expected', [('permission_denied', 'permission_denied'),
+                                         ('invalid_expiry', 'invalid_expiry'),
                                          ('session_fenced', 'session_fenced'),
                                          ('private-bearer-token', None)])
 def test_independent_diagnostics_identify_failed_operation_without_reflecting_errors(code, expected):

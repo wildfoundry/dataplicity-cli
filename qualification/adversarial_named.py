@@ -1,6 +1,7 @@
 """Independent, bounded staging peer that never acts on logical close notifications."""
 import asyncio
 from contextlib import suppress
+from datetime import datetime, timedelta, timezone
 
 import websockets
 from websockets.exceptions import ConnectionClosed
@@ -10,7 +11,7 @@ from dataplicity_cli.m2m import PACKETS, bencode_decode, bencode_encode
 from dataplicity_cli.tunnels import websocket_url
 
 
-NAMED_ERROR_CODES = frozenset(('tunnel_error', 'authentication_unavailable', 'publisher_authentication_denied', 'invalid_publisher_credential', 'human_authentication_required', 'invalid_name', 'invalid_ports', 'invalid_principal', 'invalid_transport_proof', 'invalid_identity', 'unknown_router_owner', 'wrong_router_owner', 'router_unavailable', 'router_rejected', 'session_denied', 'session_fenced', 'session_expired', 'publisher_cannot_consume', 'publisher_scope_denied', 'permission_denied', 'paid_plan_required', 'tunnels_unavailable', 'publishing_disabled', 'relay_disabled', 'name_disabled', 'credential_rotated', 'credential_expired', 'replacement_denied', 'tunnel_offline', 'publisher_revoked', 'credential_limit', 'permission_limit', 'publisher_limit', 'stream_limit', 'admission_limit', 'transport_lost'))
+NAMED_ERROR_CODES = frozenset(('tunnel_error', 'authentication_unavailable', 'publisher_authentication_denied', 'invalid_publisher_credential', 'invalid_expiry', 'human_authentication_required', 'invalid_name', 'invalid_ports', 'invalid_principal', 'invalid_transport_proof', 'invalid_identity', 'unknown_router_owner', 'wrong_router_owner', 'router_unavailable', 'router_rejected', 'session_denied', 'session_fenced', 'session_expired', 'publisher_cannot_consume', 'publisher_scope_denied', 'permission_denied', 'paid_plan_required', 'tunnels_unavailable', 'publishing_disabled', 'relay_disabled', 'name_disabled', 'credential_rotated', 'credential_expired', 'replacement_denied', 'tunnel_offline', 'publisher_revoked', 'credential_limit', 'permission_limit', 'publisher_limit', 'stream_limit', 'admission_limit', 'transport_lost'))
 
 
 class RawNamedPeer:
@@ -272,7 +273,8 @@ async def qualify_adversarial(admin, publisher_user, machine_factory, name, targ
             'name': name, 'action': 'consume', 'user_id': users.pop(), 'ports': [target_port]})
         diagnostics['stage'] = 'credential_create'
         credential = await admin.call('POST', 'credentials/', payload={
-            'name': name, 'ports': [target_port], 'can_replace': False, 'label': 'Staging independent peer'})
+            'name': name, 'ports': [target_port], 'can_replace': False, 'label': 'Staging independent peer',
+            'expires_at': (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat()})
         machine = machine_factory(credential['secret'])
         publisher, p_session = await bind_peer(machine, name, 'publisher', target_port, diagnostics, 'publisher')
         peers.append(publisher)
