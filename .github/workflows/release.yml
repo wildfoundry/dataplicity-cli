@@ -5,6 +5,12 @@ on:
     tags:
       - "v*"
   workflow_dispatch:
+    inputs:
+      qualification_only:
+        description: Build and sign artifacts without publishing or updating distribution
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: write
@@ -257,6 +263,7 @@ jobs:
 
   release:
     name: Publish GitHub Release
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.qualification_only != true }}
     runs-on: ubuntu-latest
     needs: build
     permissions:
