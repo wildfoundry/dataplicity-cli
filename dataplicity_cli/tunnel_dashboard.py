@@ -184,7 +184,8 @@ class TunnelStats:
                     values[slot] = max(value, values[slot] or 0)
             valid = [value for value in values if value is not None]
             maximum = max(valid, default=0)
-            caption = f"Peak {unit(peak)}" if peak is not None else f"Window max {unit(maximum)}"
+            window_max = unit(maximum) if valid else "—"
+            caption = f"Peak {unit(peak)}" if peak is not None else f"Window max {window_max}"
             text = Text(f"{current}  ·  {caption}\n", style=f"bold {colour}", no_wrap=True, overflow="ellipsis")
             text.append_text(plot(values, graph_width, rows, colour))
             text.append(f"\n−{span_label}" + " " * max(1, graph_width - len(span_label) - 5) + "now", style="dim")

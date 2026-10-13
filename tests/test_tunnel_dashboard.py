@@ -166,6 +166,8 @@ def test_full_dashboard_sections_safe_text_and_policy():
         assert "[red]literal" in text
         assert "Peak" in text and "Connectivity" in text
         assert "Concurrent TCP streams" in text and "CLI–relay RTT" in text
+        if status in {"Starting", "Reconnecting", "Error"}:
+            assert "Awaiting heartbeat" in text
         assert "32 streams" in text and "1.0 MB/s" in text
         assert "8080" in text and "unknown" in text
     stats.mode, stats.target_port = "publisher", 3000
