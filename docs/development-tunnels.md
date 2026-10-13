@@ -94,11 +94,13 @@ dashboard.
 
 The screen refreshes about once a second. Larger terminals show separate coloured
 charts for sending, receiving, heartbeat RTT and concurrent TCP streams.
-The time window expands from 60 seconds to 5 minutes, 15 minutes and one hour
-as the command runs; history is bounded to the latest hour.
+The time window expands from 60 seconds to 5 minutes, 15 minutes and 20 minutes
+as the command runs; history is bounded to the latest 20 minutes.
 Each chart scales to its own observed maximum; numeric labels show the actual
 values. Empty history and missing RTT readings remain gaps. Columns preserve
-peaks when several observations share a column. Small terminals use a compact
+peaks when several observations share a column; the number of columns follows
+the terminal width and stays bounded. Connectivity cells preserve any observed
+outage within their interval, so brief drops survive compression. Small terminals use a compact
 view. Cyan indicates sending, magenta receiving, and yellow heartbeat RTT.
 
 Session totals, peak sampled send/receive rates, peak simultaneous streams and

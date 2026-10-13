@@ -150,7 +150,7 @@ def test_observed_availability_reconnects_peaks_and_missing_rtt():
     for _ in range(3700):
         now[0] += 1
         stats.sample()
-    assert len(stats.history) == 3600
+    assert len(stats.history) == 1200
 
 
 def test_full_dashboard_sections_safe_text_and_policy():
@@ -194,11 +194,38 @@ def test_semantic_colours_and_peak_preserving_gap_chart():
     assert "\x1b[32m" not in plain.file.getvalue()
 
 
-def test_chart_window_expands_with_session_and_caps_at_one_hour():
+def test_chart_window_expands_with_session_and_caps_at_twenty_minutes():
     now = [0.0]
     stats = TunnelStats("api", lambda: now[0])
-    for elapsed, label in ((60, "60s"), (61, "5m"), (301, "15m"), (901, "60m"), (8000, "60m")):
+    for elapsed, label in ((60, "60s"), (61, "5m"), (301, "15m"), (901, "20m"), (8000, "20m")):
         now[0] = elapsed
         console = Console(file=io.StringIO(), width=120, height=30)
         console.print(stats.render("org", 120, 30))
         assert f"−{label}" in console.file.getvalue()
+
+
+def test_twenty_minute_history_is_bounded_and_outages_survive_compression():
+    now = [0.0]
+    stats = TunnelStats("api", lambda: now[0])
+    stats.record({"event": "published"})
+    for i in range(1, 2401):
+        now[0] = i
+        if i == 1400:
+            stats.record({"event": "reconnecting"})
+        if i == 1401:
+            stats.record({"event": "published"})
+        stats.record({"event": "bytes_up", "bytes": 100})
+        stats.sample(.024)
+    assert len(stats.history) == 1200
+    for width, height in ((80, 24), (120, 30), (300, 40)):
+        console = Console(file=io.StringIO(), width=width, height=height)
+        lines = console.render_lines(stats.render("org", width, height))
+        assert len(lines) == height
+        assert all(sum(part.cell_length for part in line) == width for line in lines)
+        text = "\n".join("".join(part.text for part in line) for line in lines)
+        assert "20m" in text and "×" in text
+    # A long unsampled pause must expire old readings by age too.
+    now[0] += 2000
+    stats.sample()
+    assert len(stats.history) == 1
+    assert not stats.events

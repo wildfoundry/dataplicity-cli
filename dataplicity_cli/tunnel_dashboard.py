@@ -47,7 +47,7 @@ class TunnelStats:
         self.send_history: deque = deque(maxlen=60)
         self.receive_history: deque = deque(maxlen=60)
         self.events: deque = deque(maxlen=24)
-        self.history: deque = deque(maxlen=3600)
+        self.history: deque = deque(maxlen=1200)
         self.reconnects = self.peak_active = 0
         self.peak_sent = self.peak_received = 0.0
         self.first_ready = None
@@ -112,6 +112,10 @@ class TunnelStats:
         if elapsed > 0:
             ready = self.status in {"Published", "Listening"}
             self.history.append((now, *self.rates, self.rtt if ready else None, self.active, ready))
+            while self.history and self.history[0][0] <= now - 1200:
+                self.history.popleft()
+            while self.events and self.events[0][0] <= now - 1200:
+                self.events.popleft()
             self.peak_sent = max(self.peak_sent, self.rates[0])
             self.peak_received = max(self.peak_received, self.rates[1])
 
@@ -170,15 +174,15 @@ class TunnelStats:
         activity = "No traffic yet" if self.last_traffic is None else f"Last traffic {int(now - self.last_traffic)}s ago"
         summary.append(f"  ·  {activity}", style="dim")
         elapsed = now - self.started
-        span = 60 if elapsed <= 60 else 300 if elapsed <= 300 else 900 if elapsed <= 900 else 3600
+        span = 60 if elapsed <= 60 else 300 if elapsed <= 300 else 900 if elapsed <= 900 else 1200
         span_label = f"{span}s" if span == 60 else f"{span // 60}m"
         window = [sample for sample in self.history if sample[0] >= now - span]
-        graph_width = max(1, (width - 12) // 2)
+        graph_width = min(120, max(1, (width - 12) // 2))
 
         def graph(title, index, unit, colour, current, peak=None, rows=3):
-            values = [None] * 60
+            values = [None] * graph_width
             for sample in window:
-                slot = max(0, min(59, int((sample[0] - (now - span)) / span * 60)))
+                slot = max(0, min(graph_width - 1, int((sample[0] - (now - span)) / span * graph_width)))
                 value = sample[index]
                 if value is not None:
                     values[slot] = max(value, values[slot] or 0)
@@ -203,10 +207,15 @@ class TunnelStats:
                          f"{self.rtt * 1000:.0f} ms" if self.rtt is not None and self.status in {"Published", "Listening"} else "Awaiting heartbeat", rows=2)),
             Layout(graph("Concurrent TCP streams", 4, lambda v: str(int(v)), "green", f"{self.active} active", rows=2)),
         )
-        events = Text("Connectivity (recent samples): ", style="bold", no_wrap=True, overflow="ellipsis")
-        for sample in window[-max(1, width - 40):]:
-            events.append("●" if sample[5] else "×", style="green" if sample[5] else "yellow")
-        events.append("\n● locally ready  × unavailable  ·  Recent events\n", style="dim")
+        events = Text(f"Connectivity (last {span_label}): ", style="bold", no_wrap=True, overflow="ellipsis")
+        cells = [None] * min(60, max(1, width - 40))
+        for sample in window:
+            slot = max(0, min(len(cells) - 1, int((sample[0] - (now - span)) / span * len(cells))))
+            cells[slot] = sample[5] if cells[slot] is None else cells[slot] and sample[5]
+        for ready in cells:
+            events.append("·" if ready is None else "●" if ready else "×",
+                          style="dim" if ready is None else "green" if ready else "yellow")
+        events.append("\n● ready  × outage  · no sample  | Recent events\n", style="dim")
         for timestamp, kind, detail in list(self.events)[-max(1, height - 25):]:
             events.append(f"{int(timestamp - self.started):>5}s  {kind}: {detail}\n", style=status_style(kind))
         caps = []
