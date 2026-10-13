@@ -27,6 +27,9 @@ from rich.live import Live
 from rich.markup import escape
 from rich.prompt import Prompt
 from rich.table import Table
+from rich.text import Text
+
+from .terminal import THEME, status_style
 
 from . import __version__
 from .api import ApiClient, ApiResponse
@@ -144,7 +147,7 @@ def _tunnel_progress(state: AppContext, event: dict) -> None:
         sys.stdout.write(json.dumps(event) + "\n")
         sys.stdout.flush()
     elif event["event"] in {"published", "listener_started", "reconnecting", "connection_rejected"}:
-        state.console.print(escape(f"{event['event']}: {event.get('name', '')} {event.get('detail', '')}"))
+        state.console.print(Text(f"{event['event']}: {event.get('name', '')} {event.get('detail', '')}", style=status_style(event["event"].replace("_", " "))))
 
 
 def _run_tunnel_command(state: AppContext, name: str, operation: Any, *, session: Any = None, plain: bool = False) -> None:
@@ -1851,7 +1854,7 @@ def main(
             config.save(path)
     if base_url:
         config.base_url = base_url.rstrip("/")
-    console = Console()
+    console = Console(theme=THEME)
     api_client = ApiClient(config, on_token_update=lambda: config.save(path))
     if config.auth_method == "jwt" and config.refresh_token:
         api_client.refresh_session()
@@ -2688,9 +2691,8 @@ def devices_list(
             _device_hash(device),
             _device_name(device),
             "yes" if _device_is_active(device) else "no",
-            status,
+            Text(status, style=status_style(status) if _device_is_active(device) else "yellow"),
             device_class,
-            style="green" if _device_is_online(device) and _device_is_active(device) else "",
         )
     state.console.print(table)
     state.console.print(f"Showing {len(devices)} devices ({active_count} active, {online_count} online).")
@@ -3914,7 +3916,7 @@ def _render_resource_table(state: AppContext, title: str, payload: Any) -> None:
         state.console.print("No results.")
         return
     for row in rows:
-        table.add_row(_resource_key(row), _resource_name(row), _resource_status(row))
+        table.add_row(_resource_key(row), _resource_name(row), Text(_resource_status(row), style=status_style(_resource_status(row))))
     state.console.print(table)
     state.console.print(f"Showing {len(rows)} results.")
 

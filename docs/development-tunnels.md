@@ -92,9 +92,22 @@ organisation capacity. Recent connection errors explain denied access, quota
 exhaustion and local service failures. Data payloads are not inspected for the
 dashboard.
 
-The screen refreshes about once a second. Short charts show the latest samples
-and scale independently for sending and receiving; the numeric rates show actual
-payload bytes per second. Keep the command running to keep the tunnel available.
+The screen refreshes about once a second. Larger terminals show separate coloured
+charts for sending, receiving, heartbeat RTT and concurrent TCP streams.
+The time window expands from 60 seconds to 5 minutes, 15 minutes and one hour
+as the command runs; history is bounded to the latest hour.
+Each chart scales to its own observed maximum; numeric labels show the actual
+values. Empty history and missing RTT readings remain gaps. Columns preserve
+peaks when several observations share a column. Small terminals use a compact
+view. Cyan indicates sending, magenta receiving, and yellow heartbeat RTT.
+
+Session totals, peak sampled send/receive rates, peak simultaneous streams and
+reconnect count stay available for the lifetime of the command. The connectivity
+strip and readiness percentage describe this CLI's observed lifecycle, not a
+server SLA or a test of the local application's health. Downtime starts after
+the first successful publish/listen event; initial startup is excluded. The
+bounded event timeline uses green for ready, yellow for retrying and red for
+failures. Colour supplements text labels; `NO_COLOR` disables colours. Keep the command running to keep the tunnel available.
 Ctrl+C stops it and restores the terminal.
 
 For ordinary event logs in an interactive terminal, use `--plain`:

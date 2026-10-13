@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 from rich.console import Console
+from rich.text import Text
 
 from dataplicity_cli.tunnel_dashboard import TunnelStats, chart, size
 from dataplicity_cli.tunnels import TunnelSession
@@ -32,7 +33,7 @@ def test_rates_are_payload_deltas_and_history_is_bounded():
         stats.sample()
         stats.record({"event": "published", "detail": "ready"})
     assert stats.rates == (0, 0)
-    assert len(stats.send_history) == 30 and len(stats.events) == 6
+    assert len(stats.send_history) == 41 and len(stats.events) == 24
 
 
 def test_counts_states_limits_and_safe_responsive_rendering():
@@ -115,3 +116,87 @@ def test_full_screen_border_stays_fixed_with_events_and_resize():
             assert all(sum(segment.cell_length for segment in line) == width for line in lines)
             assert lines[0][0].text.startswith("╭")
             assert lines[-1][0].text.startswith("╰")
+
+
+def test_observed_availability_reconnects_peaks_and_missing_rtt():
+    now = [0.0]
+    stats = TunnelStats("api", lambda: now[0])
+    assert stats.availability() == (None, 0)
+    now[0] = 5
+    stats.record({"event": "published"})
+    stats.record({"event": "connection_opened"})
+    stats.record({"event": "connection_opened"})
+    stats.record({"event": "bytes_up", "bytes": 100})
+    stats.sample(.03)
+    now[0] = 15
+    stats.record({"event": "reconnecting", "detail": "Retrying"})
+    stats.sample(.03)
+    assert stats.history[-1][3] is None
+    now[0] = 20
+    assert stats.availability() == (100 * 10 / 15, 5)
+    stats.record({"event": "published"})
+    now[0] = 25
+    assert stats.availability() == (75, 5)
+    assert stats.reconnects == 1 and stats.peak_active == 2
+    assert stats.peak_sent == 20 and stats.peak_received == 0
+    assert [sample[5] for sample in stats.history] == [True, False]
+    # Repeated ready notifications must not double-count uptime.
+    stats.record({"event": "published"})
+    assert stats.availability() == (75, 5)
+    for i in range(100):
+        now[0] += 1
+        stats.sample()
+    assert len(stats.history) == 102 and len(stats.send_history) == 60
+    for _ in range(3700):
+        now[0] += 1
+        stats.sample()
+    assert len(stats.history) == 3600
+
+
+def test_full_dashboard_sections_safe_text_and_policy():
+    stats = TunnelStats("[red]literal")
+    stats.mode, stats.local_port = "consumer", 8080
+    stats.update_limits({"limits": {"streams": 32, "bytes_per_second": 1048576}})
+    for status in ("Starting", "Listening", "Reconnecting", "Error"):
+        stats.status = status
+        stats.sample(.024)
+        console = Console(file=io.StringIO(), width=120, height=30)
+        console.print(stats.render("org", 120, 30))
+        text = console.file.getvalue()
+        assert "[red]literal" in text
+        assert "Peak" in text and "Connectivity" in text
+        assert "Concurrent TCP streams" in text and "CLI–relay RTT" in text
+        assert "32 streams" in text and "1.0 MB/s" in text
+        assert "8080" in text and "unknown" in text
+    stats.mode, stats.target_port = "publisher", 3000
+    console = Console(file=io.StringIO(), width=120, height=30)
+    console.print(stats.render("org", 120, 30))
+    assert "3000" in console.file.getvalue()
+
+
+def test_semantic_colours_and_peak_preserving_gap_chart():
+    from dataplicity_cli.terminal import THEME, plot, status_style
+    assert status_style("healthy") == "green"
+    assert status_style("OFFLINE") == "bold red"
+    assert status_style("reconnecting") == "yellow"
+    assert status_style("unrecognised") == "dim"
+    assert plot([], 2, 2, "cyan").plain == "  \n  "
+    assert plot([None, 0], 2, 1, "cyan").plain == " ·"
+    assert plot([0, 100, 0, 0], 2, 1, "cyan").plain == "█·"
+    assert plot([0, 0], 2, 1, "cyan").plain == "··"
+    coloured = Console(file=io.StringIO(), force_terminal=True, color_system="standard", theme=THEME, _environ={"TERM": "xterm"})
+    coloured.print(stats_text := Text("ready", style=status_style("ready")))
+    assert "\x1b[32m" in coloured.file.getvalue()
+    plain = Console(file=io.StringIO(), force_terminal=True, no_color=True, theme=THEME)
+    plain.print(stats_text)
+    assert "\x1b[32m" not in plain.file.getvalue()
+
+
+def test_chart_window_expands_with_session_and_caps_at_one_hour():
+    now = [0.0]
+    stats = TunnelStats("api", lambda: now[0])
+    for elapsed, label in ((60, "60s"), (61, "5m"), (301, "15m"), (901, "60m"), (8000, "60m")):
+        now[0] = elapsed
+        console = Console(file=io.StringIO(), width=120, height=30)
+        console.print(stats.render("org", 120, 30))
+        assert f"−{label}" in console.file.getvalue()
