@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import base64
 import json
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -55,6 +57,27 @@ class ApiClientAuthExpiryTest(unittest.TestCase):
         self.assertIsNone(config.auth_method)
         self.assertIsNone(config.access_token)
         self.assertIsNone(config.refresh_token)
+
+    def test_ensure_fresh_refreshes_expired_access_token(self) -> None:
+        def jwt(exp: int) -> str:
+            body = base64.urlsafe_b64encode(json.dumps({"exp": exp}).encode()).rstrip(b"=").decode()
+            return f"e30.{body}.sig"
+
+        config = Config(
+            base_url="https://example.test",
+            auth_method="jwt",
+            access_token=jwt(int(time.time()) - 5),
+            refresh_token="refresh",
+        )
+        client = ApiClient(config)
+        client.session.post = lambda *args, **kwargs: _FakeHttpResponse(
+            200,
+            {"access": jwt(int(time.time()) + 3600), "refresh": "refresh-2"},
+        )
+
+        self.assertTrue(client.ensure_fresh_access_token(skew_seconds=60))
+        self.assertEqual(config.refresh_token, "refresh-2")
+        self.assertGreater(client.access_token_seconds_remaining() or 0, 3000)
 
 
 class CliAuthExpiryTest(unittest.TestCase):
