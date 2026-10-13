@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -130,8 +131,10 @@ class TunnelDisplayTests(unittest.TestCase):
             if expected_dashboard:
                 self.assertIn('4.0 KB sent', output.getvalue())
                 self.assertIn('\x1b[?25h', output.getvalue())
-                self.assertIn('\x1b[?1049h', output.getvalue())
-                self.assertIn('\x1b[?1049l', output.getvalue())
+                # Rich omits alt-screen CSI (?1049) on Windows even with screen=True.
+                if sys.platform != "win32":
+                    self.assertIn('\x1b[?1049h', output.getvalue())
+                    self.assertIn('\x1b[?1049l', output.getvalue())
             else:
                 self.assertIn('published: api', output.getvalue())
 
@@ -151,7 +154,8 @@ class TunnelDisplayTests(unittest.TestCase):
             self.assertEqual(result.exit_code, 0 if isinstance(failure, asyncio.CancelledError) else 1)
             self.assertNotIn('secret-internal-detail', output.getvalue())
             self.assertIn('\x1b[?25h', output.getvalue())
-            self.assertIn('\x1b[?1049l', output.getvalue())
+            if sys.platform != "win32":
+                self.assertIn('\x1b[?1049l', output.getvalue())
 
 
 if __name__ == "__main__":
