@@ -109,8 +109,7 @@ async def _jwt_keepalive(state: AppContext) -> AsyncIterator[None]:
         yield
     finally:
         task.cancel()
-        with suppress(asyncio.CancelledError):
-            await task
+        await asyncio.gather(task, return_exceptions=True)
 
 
 def _m2m_client(state: AppContext, ws_url: str) -> M2MClient:
@@ -3425,9 +3424,7 @@ def devices_port_forward(
                         event_callback=dashboard.apply_event,
                     )
                 )
-                if state.json_output:
-                    await forward_task
-                else:
+                if not state.json_output:
                     with Live(dashboard.render(), console=state.console, refresh_per_second=4, transient=False) as live:
                         while not forward_task.done():
                             await asyncio.sleep(0.5)
@@ -3435,7 +3432,7 @@ def devices_port_forward(
                             live.update(dashboard.render())
                         dashboard.tick()
                         live.update(dashboard.render())
-                    await forward_task
+                await forward_task
                 return {
                     "ok": True,
                     "device_hash": resolved_hash,
@@ -3591,8 +3588,7 @@ def devices_ssh(
             finally:
                 if forward_task:
                     forward_task.cancel()
-                    with suppress(asyncio.CancelledError):
-                        await forward_task
+                    await asyncio.gather(forward_task, return_exceptions=True)
                 await m2m.close()
 
     try:

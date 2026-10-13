@@ -190,8 +190,8 @@ class ApiClientFullTest(unittest.TestCase):
             task = asyncio.create_task(client.maintain_fresh_access_token(interval_seconds=1.0))
             await asyncio.wait_for(refreshed.wait(), timeout=2.5)
             task.cancel()
-            with self.assertRaises(asyncio.CancelledError):
-                await task
+            results = await asyncio.gather(task, return_exceptions=True)
+            self.assertTrue(results and isinstance(results[0], asyncio.CancelledError))
 
         asyncio.run(run())
 
