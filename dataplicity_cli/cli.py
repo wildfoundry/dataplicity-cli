@@ -14,11 +14,11 @@ import sys
 import threading
 import time
 import webbrowser
-from contextlib import suppress
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Dict, List, NoReturn, Optional, Set, Tuple
+from typing import Any, AsyncIterator, Dict, List, NoReturn, Optional, Set, Tuple
 from urllib.parse import parse_qs, urlparse
 
 import typer
@@ -101,6 +101,20 @@ def _ctx(ctx: typer.Context) -> AppContext:
     return ctx.obj
 
 
+@asynccontextmanager
+async def _jwt_keepalive(state: AppContext) -> AsyncIterator[None]:
+    """Keep SSO/JWT access tokens fresh for the lifetime of a long command."""
+    if state.config.auth_method != "jwt" or not state.config.refresh_token:
+        yield
+        return
+    task = asyncio.create_task(state.api.maintain_fresh_access_token())
+    try:
+        yield
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
 def _m2m_client(state: AppContext, ws_url: str) -> M2MClient:
     return M2MClient(ws_url, extra_headers=identity_headers(state.config.install_id))
 
@@ -170,25 +184,26 @@ def _run_tunnel_command(state: AppContext, name: str, operation: Any, *, session
                 live.update(session.stats.render(session.control.organisation, state.console.width, state.console.height), refresh=True)
                 await asyncio.sleep(1)
         try:
-            with live if live is not None else nullcontext():
-                refresh_task = asyncio.create_task(refresh()) if live is not None else None
-                try:
-                    await operation
-                except asyncio.CancelledError:
-                    if session is not None:
-                        session._emit({"event": "stopped", "name": name})
-                    else:
-                        _tunnel_progress(state, {"event": "stopped", "name": name})
-                except Exception as exc:
-                    if session is not None:
-                        from .tunnels import TunnelError
-                        session.stats.record({"event": "error", "detail": str(exc) if isinstance(exc, TunnelError) else "Tunnel operation failed. Check the local port and connectivity."})
-                    raise
-                finally:
-                    if refresh_task is not None:
-                        refresh_task.cancel()
-                        await asyncio.gather(refresh_task, return_exceptions=True)
-                        live.update(session.stats.render(session.control.organisation, state.console.width, state.console.height), refresh=True)
+            async with _jwt_keepalive(state):
+                with live if live is not None else nullcontext():
+                    refresh_task = asyncio.create_task(refresh()) if live is not None else None
+                    try:
+                        await operation
+                    except asyncio.CancelledError:
+                        if session is not None:
+                            session._emit({"event": "stopped", "name": name})
+                        else:
+                            _tunnel_progress(state, {"event": "stopped", "name": name})
+                    except Exception as exc:
+                        if session is not None:
+                            from .tunnels import TunnelError
+                            session.stats.record({"event": "error", "detail": str(exc) if isinstance(exc, TunnelError) else "Tunnel operation failed. Check the local port and connectivity."})
+                        raise
+                    finally:
+                        if refresh_task is not None:
+                            refresh_task.cancel()
+                            await asyncio.gather(refresh_task, return_exceptions=True)
+                            live.update(session.stats.render(session.control.organisation, state.console.width, state.console.height), refresh=True)
         finally:
             signal.signal(signal.SIGTERM, previous)
 
@@ -1855,9 +1870,22 @@ def main(
     if base_url:
         config.base_url = base_url.rstrip("/")
     console = Console(theme=THEME)
-    api_client = ApiClient(config, on_token_update=lambda: config.save(path))
+
+    def _persist_tokens() -> None:
+        config.save(path)
+
+    def _reload_tokens() -> None:
+        # Pick up refresh-token rotations written by another CLI process so a
+        # long-running command (e.g. tunnel publish) can keep refreshing.
+        fresh = Config.load(path)
+        config.auth_method = fresh.auth_method
+        config.access_token = fresh.access_token
+        config.refresh_token = fresh.refresh_token
+        config.api_key = fresh.api_key
+
+    api_client = ApiClient(config, on_token_update=_persist_tokens, on_config_reload=_reload_tokens)
     if config.auth_method == "jwt" and config.refresh_token:
-        api_client.refresh_session()
+        api_client.ensure_fresh_access_token()
     ctx.obj = AppContext(
         config=config,
         config_path=path,
@@ -3314,20 +3342,21 @@ def devices_terminal(ctx: typer.Context, device_hash: Optional[str] = typer.Argu
     async def runner() -> None:
         from .remote_access import run_terminal_session
 
-        ws_url = await _resolve_m2m_url(state, resolved_hash)
-        m2m = _m2m_client(state, ws_url)
-        await m2m.connect()
-        identity = await m2m.wait_for_identity()
-        response = _open_remote_access_port(
-            state,
-            resolved_hash,
-            {"m2m_identity": identity, "service": "terminal"},
-        )
-        if not response.ok:
-            raise RuntimeError(response.text or "Unable to open terminal")
-        channel_port = await m2m.wait_for_channel_open()
-        await run_terminal_session(m2m, channel_port)
-        await m2m.close()
+        async with _jwt_keepalive(state):
+            ws_url = await _resolve_m2m_url(state, resolved_hash)
+            m2m = _m2m_client(state, ws_url)
+            await m2m.connect()
+            identity = await m2m.wait_for_identity()
+            response = _open_remote_access_port(
+                state,
+                resolved_hash,
+                {"m2m_identity": identity, "service": "terminal"},
+            )
+            if not response.ok:
+                raise RuntimeError(response.text or "Unable to open terminal")
+            channel_port = await m2m.wait_for_channel_open()
+            await run_terminal_session(m2m, channel_port)
+            await m2m.close()
 
     try:
         asyncio.run(runner())
@@ -3383,75 +3412,74 @@ def devices_port_forward(
     async def runner() -> Dict[str, Any]:
         from .remote_access import run_port_forward
 
-        dashboard = _PortForwardDashboard(
-            device_hash=resolved_hash,
-            local_port=local_port,
-            remote_port=remote_port,
-            plan_label=plan_label,
-            allowed_ports=allowed_ports,
-            all_ports_allowed=all_ports_allowed,
-        )
-        ws_url = await _resolve_m2m_url(state, resolved_hash)
-        m2m = _m2m_client(state, ws_url)
-        await m2m.connect()
-        try:
-            identity = await m2m.wait_for_identity()
-            open_channel_lock = asyncio.Lock()
-
-            async def open_redirect_channel() -> int:
-                async with open_channel_lock:
-                    response = await asyncio.to_thread(
-                        _open_remote_access_port,
-                        state,
-                        resolved_hash,
-                        {
-                            "m2m_identity": identity,
-                            "service": "redirect-port",
-                            "port": remote_port,
-                        },
-                    )
-                    if not response.ok:
-                        detail = _friendly_response_message("Unable to open port redirect", response.data, response.text)
-                        raise RuntimeError(detail)
-                    return await m2m.wait_for_channel_open()
-
-            channel_port = await open_redirect_channel()
-            forward_task = asyncio.create_task(
-                run_port_forward(
-                    m2m,
-                    channel_port,
-                    local_port,
-                    channel_factory=open_redirect_channel,
-                    event_callback=dashboard.apply_event,
-                )
+        async with _jwt_keepalive(state):
+            dashboard = _PortForwardDashboard(
+                device_hash=resolved_hash,
+                local_port=local_port,
+                remote_port=remote_port,
+                plan_label=plan_label,
+                allowed_ports=allowed_ports,
+                all_ports_allowed=all_ports_allowed,
             )
-            if state.json_output:
-                await forward_task
-            else:
-                with Live(dashboard.render(), console=state.console, refresh_per_second=4, transient=False) as live:
-                    while not forward_task.done():
-                        await asyncio.sleep(0.5)
+            ws_url = await _resolve_m2m_url(state, resolved_hash)
+            m2m = _m2m_client(state, ws_url)
+            await m2m.connect()
+            try:
+                identity = await m2m.wait_for_identity()
+                open_channel_lock = asyncio.Lock()
+
+                async def open_redirect_channel() -> int:
+                    async with open_channel_lock:
+                        response = await asyncio.to_thread(
+                            _open_remote_access_port,
+                            state,
+                            resolved_hash,
+                            {
+                                "m2m_identity": identity,
+                                "service": "redirect-port",
+                                "port": remote_port,
+                            },
+                        )
+                        if not response.ok:
+                            detail = _friendly_response_message("Unable to open port redirect", response.data, response.text)
+                            raise RuntimeError(detail)
+                        return await m2m.wait_for_channel_open()
+
+                channel_port = await open_redirect_channel()
+                forward_task = asyncio.create_task(
+                    run_port_forward(
+                        m2m,
+                        channel_port,
+                        local_port,
+                        channel_factory=open_redirect_channel,
+                        event_callback=dashboard.apply_event,
+                    )
+                )
+                if not state.json_output:
+                    with Live(dashboard.render(), console=state.console, refresh_per_second=4, transient=False) as live:
+                        while not forward_task.done():
+                            await asyncio.sleep(0.5)
+                            dashboard.tick()
+                            live.update(dashboard.render())
                         dashboard.tick()
                         live.update(dashboard.render())
-                    dashboard.tick()
-                    live.update(dashboard.render())
                 await forward_task
-            return {
-                "ok": True,
-                "device_hash": resolved_hash,
-                "remote_port": remote_port,
-                "local_port": local_port,
-                "plan": plan_label,
-                "allowed_ports": allowed_ports,
-                "all_ports_allowed": all_ports_allowed,
-                "bytes_up": dashboard.up_total_bytes,
-                "bytes_down": dashboard.down_total_bytes,
-                "connections": dashboard.total_connections,
-                "rejected_connections": dashboard.rejected_connections,
-                "protocols": dashboard.protocols_seen,
-            }
-        finally:
-            await m2m.close()
+                return {
+                    "ok": True,
+                    "device_hash": resolved_hash,
+                    "remote_port": remote_port,
+                    "local_port": local_port,
+                    "plan": plan_label,
+                    "allowed_ports": allowed_ports,
+                    "all_ports_allowed": all_ports_allowed,
+                    "bytes_up": dashboard.up_total_bytes,
+                    "bytes_down": dashboard.down_total_bytes,
+                    "connections": dashboard.total_connections,
+                    "rejected_connections": dashboard.rejected_connections,
+                    "protocols": dashboard.protocols_seen,
+                }
+            finally:
+                await m2m.close()
 
     try:
         result = asyncio.run(runner())
@@ -3520,79 +3548,79 @@ def devices_ssh(
     resolved_local_port = _resolve_local_port(local_port)
 
     async def runner() -> None:
-        ws_url = await _resolve_m2m_url(
-            state,
-            resolved_hash,
-            request_timeout=connect_timeout,
-        )
-        m2m = _m2m_client(state, ws_url)
-        await asyncio.wait_for(m2m.connect(), timeout=float(connect_timeout))
-        forward_task: Optional[asyncio.Task] = None
-        listener_ready = asyncio.Event()
+        async with _jwt_keepalive(state):
+            ws_url = await _resolve_m2m_url(
+                state,
+                resolved_hash,
+                request_timeout=connect_timeout,
+            )
+            m2m = _m2m_client(state, ws_url)
+            await asyncio.wait_for(m2m.connect(), timeout=float(connect_timeout))
+            forward_task: Optional[asyncio.Task] = None
+            listener_ready = asyncio.Event()
 
-        def on_forward_event(event: Any) -> None:
-            if getattr(event, "kind", "") == "listener_started":
-                listener_ready.set()
+            def on_forward_event(event: Any) -> None:
+                if getattr(event, "kind", "") == "listener_started":
+                    listener_ready.set()
 
-        try:
-            identity = await m2m.wait_for_identity(timeout=float(connect_timeout))
-            open_channel_lock = asyncio.Lock()
+            try:
+                identity = await m2m.wait_for_identity(timeout=float(connect_timeout))
+                open_channel_lock = asyncio.Lock()
 
-            async def open_redirect_channel() -> int:
-                async with open_channel_lock:
-                    response = await asyncio.to_thread(
-                        _open_remote_access_port,
-                        state,
-                        resolved_hash,
-                        {
-                            "m2m_identity": identity,
-                            "service": "redirect-port",
-                            "port": remote_port,
-                        },
-                    )
-                    if not response.ok:
-                        raise RuntimeError(
-                            _friendly_response_message("Unable to open SSH tunnel.", response.data, response.text)
+                async def open_redirect_channel() -> int:
+                    async with open_channel_lock:
+                        response = await asyncio.to_thread(
+                            _open_remote_access_port,
+                            state,
+                            resolved_hash,
+                            {
+                                "m2m_identity": identity,
+                                "service": "redirect-port",
+                                "port": remote_port,
+                            },
                         )
-                    return await m2m.wait_for_channel_open(timeout=float(connect_timeout))
+                        if not response.ok:
+                            raise RuntimeError(
+                                _friendly_response_message("Unable to open SSH tunnel.", response.data, response.text)
+                            )
+                        return await m2m.wait_for_channel_open(timeout=float(connect_timeout))
 
-            channel_port = await open_redirect_channel()
-            from .remote_access import run_port_forward
+                channel_port = await open_redirect_channel()
+                from .remote_access import run_port_forward
 
-            forward_task = asyncio.create_task(
-                run_port_forward(
-                    m2m,
-                    channel_port,
-                    resolved_local_port,
-                    channel_factory=open_redirect_channel,
-                    event_callback=on_forward_event,
+                forward_task = asyncio.create_task(
+                    run_port_forward(
+                        m2m,
+                        channel_port,
+                        resolved_local_port,
+                        channel_factory=open_redirect_channel,
+                        event_callback=on_forward_event,
+                    )
                 )
-            )
-            await asyncio.wait_for(listener_ready.wait(), timeout=float(connect_timeout))
+                await asyncio.wait_for(listener_ready.wait(), timeout=float(connect_timeout))
 
-            target = f"{user}@127.0.0.1" if user else "127.0.0.1"
-            ssh_cmd: List[str] = ["ssh", "-p", str(resolved_local_port)]
-            if identity_file:
-                ssh_cmd.extend(["-i", str(identity_file.expanduser())])
-            ssh_cmd.extend(_ssh_host_key_options(strict_host_key_checking))
-            ssh_cmd.extend(ssh_arg or [])
-            ssh_cmd.append(target)
-            if remote_command:
-                ssh_cmd.append(remote_command)
+                target = f"{user}@127.0.0.1" if user else "127.0.0.1"
+                ssh_cmd: List[str] = ["ssh", "-p", str(resolved_local_port)]
+                if identity_file:
+                    ssh_cmd.extend(["-i", str(identity_file.expanduser())])
+                ssh_cmd.extend(_ssh_host_key_options(strict_host_key_checking))
+                ssh_cmd.extend(ssh_arg or [])
+                ssh_cmd.append(target)
+                if remote_command:
+                    ssh_cmd.append(remote_command)
 
-            state.console.print(
-                f"[green]SSH tunnel ready:[/green] {target} via localhost:{resolved_local_port} -> device:{remote_port}"
-            )
-            proc = await asyncio.create_subprocess_exec(*ssh_cmd)
-            exit_code = await proc.wait()
-            if exit_code != 0:
-                raise RuntimeError(f"ssh exited with code {exit_code}.")
-        finally:
-            if forward_task:
-                forward_task.cancel()
-                with suppress(asyncio.CancelledError):
-                    await forward_task
-            await m2m.close()
+                state.console.print(
+                    f"[green]SSH tunnel ready:[/green] {target} via localhost:{resolved_local_port} -> device:{remote_port}"
+                )
+                proc = await asyncio.create_subprocess_exec(*ssh_cmd)
+                exit_code = await proc.wait()
+                if exit_code != 0:
+                    raise RuntimeError(f"ssh exited with code {exit_code}.")
+            finally:
+                if forward_task:
+                    forward_task.cancel()
+                    await asyncio.gather(forward_task, return_exceptions=True)
+                await m2m.close()
 
     try:
         asyncio.run(runner())
@@ -3641,30 +3669,31 @@ def devices_remote_file(
     async def runner() -> int:
         from .remote_access import run_remote_file
 
-        ws_url = await _resolve_m2m_url(state, resolved_hash)
-        m2m = _m2m_client(state, ws_url)
-        await m2m.connect()
-        identity = await m2m.wait_for_identity()
-        response = _open_remote_access_port(
-            state,
-            resolved_hash,
-            {
-                "m2m_identity": identity,
-                "service": "remote-file",
-                "path": path,
-            },
-        )
-        if not response.ok:
-            raise RuntimeError(response.text or "Unable to open remote file")
-        channel_port = await m2m.wait_for_channel_open()
-        bytes_written = await run_remote_file(
-            m2m,
-            channel_port,
-            str(output) if output else None,
-            allow_stdout=stdout,
-        )
-        await m2m.close()
-        return bytes_written
+        async with _jwt_keepalive(state):
+            ws_url = await _resolve_m2m_url(state, resolved_hash)
+            m2m = _m2m_client(state, ws_url)
+            await m2m.connect()
+            identity = await m2m.wait_for_identity()
+            response = _open_remote_access_port(
+                state,
+                resolved_hash,
+                {
+                    "m2m_identity": identity,
+                    "service": "remote-file",
+                    "path": path,
+                },
+            )
+            if not response.ok:
+                raise RuntimeError(response.text or "Unable to open remote file")
+            channel_port = await m2m.wait_for_channel_open()
+            bytes_written = await run_remote_file(
+                m2m,
+                channel_port,
+                str(output) if output else None,
+                allow_stdout=stdout,
+            )
+            await m2m.close()
+            return bytes_written
 
     try:
         bytes_written = asyncio.run(runner())
@@ -3729,49 +3758,50 @@ def devices_run(
     async def runner() -> str:
         from .remote_access import run_single_command
 
-        verbose = state.debug and (not state.json_output)
-        if verbose:
-            state.console.print(f"[blue]Connecting to {resolved_hash}...[/blue]")
-        ws_url = await _resolve_m2m_url(
-            state,
-            resolved_hash,
-            request_timeout=connect_timeout,
-        )
-        m2m = _m2m_client(state, ws_url)
-        try:
-            await asyncio.wait_for(m2m.connect(), timeout=float(connect_timeout))
-        except asyncio.TimeoutError as exc:
-            raise RuntimeError(
-                f"Timed out after {connect_timeout}s while opening remote transport."
-            ) from exc
-        try:
+        async with _jwt_keepalive(state):
+            verbose = state.debug and (not state.json_output)
             if verbose:
-                state.console.print("[blue]Authorising remote session...[/blue]")
-            identity = await m2m.wait_for_identity(timeout=float(connect_timeout))
-            response = _open_remote_access_port(
+                state.console.print(f"[blue]Connecting to {resolved_hash}...[/blue]")
+            ws_url = await _resolve_m2m_url(
                 state,
                 resolved_hash,
-                {"m2m_identity": identity, "service": "terminal"},
+                request_timeout=connect_timeout,
             )
-            if not response.ok:
-                raise RuntimeError(response.text or "Unable to open terminal")
-            channel_port = await m2m.wait_for_channel_open(timeout=float(connect_timeout))
-            if verbose:
-                if timeout_seconds is None:
-                    state.console.print("[blue]Running command (no timeout)...[/blue]")
-                else:
-                    state.console.print(f"[blue]Running command (timeout {int(timeout_seconds)}s)...[/blue]")
-            output_bytes = await run_single_command(
-                m2m,
-                channel_port,
-                command,
-                timeout_seconds=timeout_seconds,
-                first_response_timeout_seconds=float(min(connect_timeout, 8)),
-                idle_timeout_seconds=float(min(timeout if not no_timeout else connect_timeout, 8)),
-            )
-            return output_bytes.decode("utf-8", "replace")
-        finally:
-            await m2m.close()
+            m2m = _m2m_client(state, ws_url)
+            try:
+                await asyncio.wait_for(m2m.connect(), timeout=float(connect_timeout))
+            except asyncio.TimeoutError as exc:
+                raise RuntimeError(
+                    f"Timed out after {connect_timeout}s while opening remote transport."
+                ) from exc
+            try:
+                if verbose:
+                    state.console.print("[blue]Authorising remote session...[/blue]")
+                identity = await m2m.wait_for_identity(timeout=float(connect_timeout))
+                response = _open_remote_access_port(
+                    state,
+                    resolved_hash,
+                    {"m2m_identity": identity, "service": "terminal"},
+                )
+                if not response.ok:
+                    raise RuntimeError(response.text or "Unable to open terminal")
+                channel_port = await m2m.wait_for_channel_open(timeout=float(connect_timeout))
+                if verbose:
+                    if timeout_seconds is None:
+                        state.console.print("[blue]Running command (no timeout)...[/blue]")
+                    else:
+                        state.console.print(f"[blue]Running command (timeout {int(timeout_seconds)}s)...[/blue]")
+                output_bytes = await run_single_command(
+                    m2m,
+                    channel_port,
+                    command,
+                    timeout_seconds=timeout_seconds,
+                    first_response_timeout_seconds=float(min(connect_timeout, 8)),
+                    idle_timeout_seconds=float(min(timeout if not no_timeout else connect_timeout, 8)),
+                )
+                return output_bytes.decode("utf-8", "replace")
+            finally:
+                await m2m.close()
 
     try:
         output = asyncio.run(runner())
