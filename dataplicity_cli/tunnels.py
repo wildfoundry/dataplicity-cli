@@ -13,6 +13,7 @@ from .api import ApiClient
 from .client_identity import identity_headers
 from .remote_access import bridge_tcp_channel, run_port_forward, _close_stream_writer
 from .tunnel_transport import TunnelM2MClient
+from .tunnel_dashboard import TunnelStats
 
 
 class TunnelError(RuntimeError):
@@ -55,6 +56,7 @@ class TunnelAPI:
         if not token and (api.config.auth_method != "jwt" or not api.config.access_token):
             raise TunnelError("Run dataplicity auth login, or publish using a scoped token via --token-env or --token-stdin.")
         self.api = api
+        self.organisation = organisation
         self.base = f"/api/organisations/{organisation}/development-tunnels/"
         self.headers = {"Authorization": f"TunnelPublisher {token}"} if token else None
         self._request_lock = threading.Lock()
@@ -104,10 +106,15 @@ class TunnelSession:
     def __init__(self, control: TunnelAPI, name: str, emit: Callable[[dict], None]) -> None:
         self.control = control
         self.name = validate_name(name)
+        self.stats = TunnelStats(self.name)
         self.emit = emit
         self.session: Optional[dict] = None
         self.m2m: Optional[TunnelM2MClient] = None
         self.frame_bytes = 65536
+
+    def _emit(self, event: dict) -> None:
+        self.stats.record(event)
+        self.emit(event)
 
     async def _transport(self, url: str) -> tuple[str, str]:
         self.m2m = TunnelM2MClient(websocket_url(url), identity_headers(self.control.api.config.install_id))
@@ -120,6 +127,7 @@ class TunnelSession:
         while True:
             await asyncio.sleep(min(15, max(1, self.session.get("heartbeat_seconds", 15))))
             renewed = await self.control.call("POST", f"sessions/{self.session['session_id']}/heartbeat/", payload={"generation": self.session["generation"]})
+            self.stats.update_limits(renewed)
             self.frame_bytes = min(self.frame_bytes, frame_limit(renewed))
             if self.m2m is not None:
                 self.m2m.frame_bytes = self.frame_bytes
@@ -149,8 +157,13 @@ class TunnelSession:
             with suppress(TunnelError):
                 await self.control.call("DELETE", f"sessions/{self.session['session_id']}/", params={"generation": self.session["generation"]})
 
+    def _progress(self, event: Any) -> None:
+        self._emit({"event": event.kind, "name": self.name, "bytes": event.bytes_count, "detail": event.detail})
+
     async def publish(self, port: int) -> None:
+        self.stats.mode, self.stats.target_port = "publisher", port
         bootstrap = await self.control.call("GET", "bootstrap/", params={"name": self.name, "mode": "publisher"})
+        self.stats.update_limits(bootstrap)
         self.frame_bytes = frame_limit(bootstrap)
         failures = 0
         try:
@@ -161,11 +174,12 @@ class TunnelSession:
                         self.session = await self.control.call("POST", "publish/", payload={"name": self.name, "port": port, "identity": identity, "challenge": challenge})
                     else:
                         self.session = await self.control.call("POST", f"sessions/{self.session['session_id']}/resume/", payload={"generation": self.session["generation"], "identity": identity, "challenge": challenge})
+                    self.stats.update_limits(self.session)
                     self.frame_bytes = min(self.frame_bytes, frame_limit(self.session))
                     if self.m2m is not None:
                         self.m2m.frame_bytes = self.frame_bytes
                     failures = 0
-                    self.emit({"event": "published", "name": self.name, "target_port": port})
+                    self._emit({"event": "published", "name": self.name, "target_port": port})
                     await self._run_until_closed(self._serve_publisher(port))
                 except (OSError, asyncio.TimeoutError, TunnelError) as exc:
                     if isinstance(exc, TunnelError) and exc.code != "transport_lost":
@@ -176,8 +190,9 @@ class TunnelSession:
                     failures += 1
                     if failures > 5:
                         raise TunnelError("Publisher reconnect failed. Start a fresh command after checking connectivity.") from None
-                    self.emit({"event": "reconnecting", "name": self.name})
-                    await asyncio.sleep(min(8, 2 ** (failures - 1)) * random.uniform(0.75, 1.25))
+                    delay = min(8, 2 ** (failures - 1)) * random.uniform(0.75, 1.25)
+                    self._emit({"event": "reconnecting", "name": self.name, "detail": f"Retrying in {delay:.1f}s"})
+                    await asyncio.sleep(delay)
         finally:
             await self.close()
 
@@ -189,18 +204,20 @@ class TunnelSession:
         async def serve(instruction: dict) -> None:
             channel = int(instruction[b"port"])
             writer = None
+            self._emit({"event": "connection_opened", "name": self.name})
             try:
                 if instruction.get(b"target_port") != port or instruction.get(b"generation") != self.session["generation"]:
                     raise TunnelError("Relay instruction does not match the admitted publisher.")
                 reader, writer = await asyncio.wait_for(asyncio.open_connection("127.0.0.1", port), timeout=10)
-                await bridge_tcp_channel(m2m, channel, reader, writer)
+                await bridge_tcp_channel(m2m, channel, reader, writer, event_callback=self._progress)
             except (OSError, asyncio.TimeoutError, TunnelError):
-                self.emit({"event": "stream_closed", "name": self.name})
+                self._emit({"event": "stream_closed", "name": self.name, "detail": f"Stream ended; check the local service on port {port}."})
             finally:
                 with suppress(Exception):
                     await m2m.close_channel(channel)
                 if writer:
                     await _close_stream_writer(writer)
+                self._emit({"event": "connection_closed", "name": self.name})
 
         try:
             while True:
@@ -217,11 +234,15 @@ class TunnelSession:
             await asyncio.gather(*streams, return_exceptions=True)
 
     async def connect(self, local_port: int) -> None:
+        self.stats.mode, self.stats.local_port = "consumer", local_port
         try:
             bootstrap = await self.control.call("GET", "bootstrap/", params={"name": self.name, "mode": "consumer"})
+            self.stats.update_limits(bootstrap)
             self.frame_bytes = frame_limit(bootstrap)
             identity, challenge = await self._transport(bootstrap["m2m_url"])
             self.session = await self.control.call("POST", "connect/", payload={"name": self.name, "identity": identity, "challenge": challenge})
+            self.stats.target_port = self.session.get("target_port")
+            self.stats.update_limits(self.session)
             assert self.m2m is not None
             self.m2m.frame_bytes = min(self.frame_bytes, frame_limit(self.session))
 
@@ -233,9 +254,6 @@ class TunnelSession:
                     raise TunnelError("Tunnel was replaced. Run connect again to authorise the current publisher.")
                 return int(channel["port"])
 
-            def progress(event: Any) -> None:
-                self.emit({"event": event.kind, "name": self.name, "bytes": event.bytes_count, "detail": event.detail})
-
-            await self._run_until_closed(run_port_forward(self.m2m, None, local_port, channel_factory=channel_factory, half_close=True, event_callback=progress))
+            await self._run_until_closed(run_port_forward(self.m2m, None, local_port, channel_factory=channel_factory, half_close=True, event_callback=self._progress))
         finally:
             await self.close()

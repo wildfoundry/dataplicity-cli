@@ -104,5 +104,52 @@ class TunnelCLITests(unittest.TestCase):
         self.assertTrue(json.loads(result.output)["ok"])
 
 
+class TunnelDisplayTests(unittest.TestCase):
+    setUp = TunnelCLITests.setUp
+    invoke = TunnelCLITests.invoke
+
+    def test_terminal_dashboard_plain_json_and_shutdown(self):
+        import asyncio
+        import io
+        from rich.console import Console
+
+        async def publish(session, port):
+            session.stats.mode, session.stats.target_port = 'publisher', port
+            session._emit({'event': 'published', 'name': session.name, 'target_port': port})
+            session._emit({'event': 'bytes_up', 'name': session.name, 'bytes': 4096})
+            await asyncio.sleep(0.01)
+
+        for extra, expected_dashboard in (([], True), (['--plain'], False)):
+            output = io.StringIO()
+            console = Console(file=output, force_terminal=True, width=80, _environ={"TERM": "xterm"})
+            with patch('dataplicity_cli.cli.Console', return_value=console), \
+                 patch('dataplicity_cli.tunnels.TunnelSession.publish', new=publish):
+                result = self.invoke(['tunnel', 'publish', 'api', '--port', '3000', '--org', 'org-1', *extra])
+            self.assertEqual(result.exit_code, 0, str(result.exception))
+            self.assertEqual('CLI–relay RTT' in output.getvalue(), expected_dashboard)
+            if expected_dashboard:
+                self.assertIn('4.0 KB sent', output.getvalue())
+                self.assertIn('\x1b[?25h', output.getvalue())
+            else:
+                self.assertIn('published: api', output.getvalue())
+
+        with patch('dataplicity_cli.cli.Console', return_value=Console(force_terminal=True, _environ={"TERM": "xterm"})), \
+             patch('dataplicity_cli.tunnels.TunnelSession.publish', new=publish):
+            result = self.invoke(['--json', 'tunnel', 'publish', 'api', '--port', '3000', '--org', 'org-1'])
+        self.assertEqual(result.exit_code, 0, str(result.exception))
+        events = [json.loads(line) for line in result.output.splitlines()]
+        self.assertEqual([event['event'] for event in events], ['published', 'bytes_up'])
+        self.assertEqual(events[1]['bytes'], 4096)
+
+        for failure in (asyncio.CancelledError(), OSError('secret-internal-detail')):
+            output = io.StringIO()
+            with patch('dataplicity_cli.cli.Console', return_value=Console(file=output, force_terminal=True, _environ={"TERM": "xterm"})), \
+                 patch('dataplicity_cli.tunnels.TunnelSession.publish', new=AsyncMock(side_effect=failure)):
+                result = self.invoke(['tunnel', 'publish', 'api', '--port', '3000', '--org', 'org-1'])
+            self.assertEqual(result.exit_code, 0 if isinstance(failure, asyncio.CancelledError) else 1)
+            self.assertNotIn('secret-internal-detail', output.getvalue())
+            self.assertIn('\x1b[?25h', output.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()

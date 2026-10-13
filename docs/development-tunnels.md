@@ -75,3 +75,38 @@ closing unused streams or reviewing the organisation's plan limits. Global
 `--json` produces newline-delimited progress events for long-running commands;
 `tunnel ls --json` returns paginated active inventory and accepts `--search`
 and `--page`.
+
+## Live terminal dashboard
+
+In an interactive terminal, `tunnel publish` and `tunnel connect` display live
+send/receive rates, recent traffic charts, payload byte totals, active/closed
+connection counts, failures, uptime and recent lifecycle events. Publisher
+counters aggregate the streams handled by that CLI process. Totals remain intact
+across publisher reconnections and reset when you start a new command.
+
+**CLI–relay RTT** uses the existing WebSocket heartbeat measurement. It is not
+end-to-end service latency or application response time. Until a heartbeat has
+completed, the dashboard shows that the measurement is pending. Server policy
+limits are displayed when reported; this is not an estimate of remaining shared
+organisation capacity. Recent connection errors explain denied access, quota
+exhaustion and local service failures. Data payloads are not inspected for the
+dashboard.
+
+The screen refreshes about once a second. Short charts show the latest samples
+and scale independently for sending and receiving; the numeric rates show actual
+payload bytes per second. Keep the command running to keep the tunnel available.
+Ctrl+C stops it and restores the terminal.
+
+For ordinary event logs in an interactive terminal, use `--plain`:
+
+```sh
+dataplicity tunnel publish test-api --port 3000 --plain
+dataplicity tunnel connect test-api --local-port 8080 --plain
+```
+
+Redirected output and `TERM=dumb` use event logs automatically. Existing global
+`--json` output remains newline-delimited events with no screen rendering:
+
+```sh
+dataplicity --json tunnel connect test-api --local-port 8080
+```

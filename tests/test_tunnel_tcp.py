@@ -7,6 +7,7 @@ import unittest
 from unittest.mock import Mock
 
 from dataplicity_cli.remote_access import bridge_tcp_channel, run_port_forward
+from dataplicity_cli.tunnel_dashboard import TunnelStats
 
 
 class PairedM2M:
@@ -36,6 +37,9 @@ class SocketTests(unittest.IsolatedAsyncioTestCase):
         publisher = PairedM2M()
         consumer = PairedM2M()
         publisher.other, consumer.other = consumer, publisher
+        publisher_stats, consumer_stats = TunnelStats("test"), TunnelStats("test")
+        def record_publisher(event):
+            publisher_stats.record({"event": event.kind, "bytes": event.bytes_count})
         streams = set()
         service_tasks = set()
 
@@ -68,7 +72,7 @@ class SocketTests(unittest.IsolatedAsyncioTestCase):
             async def publisher_stream():
                 reader, writer = await asyncio.open_connection("127.0.0.1", target_port)
                 try:
-                    await bridge_tcp_channel(publisher, channel, reader, writer)
+                    await bridge_tcp_channel(publisher, channel, reader, writer, event_callback=record_publisher)
                 finally:
                     writer.close()
                     await writer.wait_closed()
@@ -82,6 +86,7 @@ class SocketTests(unittest.IsolatedAsyncioTestCase):
             local_port = probe.getsockname()[1]
         ready = asyncio.Event()
         def progress(event):
+            consumer_stats.record({"event": event.kind, "bytes": event.bytes_count})
             if event.kind == "listener_started":
                 ready.set()
         forward = asyncio.create_task(run_port_forward(consumer, None, local_port, channel_factory=admit, half_close=True, event_callback=progress))
@@ -102,6 +107,10 @@ class SocketTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(responses[0].endswith(b"hello"))
             self.assertEqual(responses[1:], [value[::-1] for value in payloads[1:]])
             self.assertEqual(next_channel, 3)
+            self.assertEqual(consumer_stats.sent, sum(map(len, payloads)))
+            self.assertEqual(consumer_stats.received, sum(map(len, responses)))
+            self.assertEqual(publisher_stats.received, consumer_stats.sent)
+            self.assertEqual(publisher_stats.sent, consumer_stats.received)
         finally:
             forward.cancel()
             await asyncio.gather(forward, return_exceptions=True)

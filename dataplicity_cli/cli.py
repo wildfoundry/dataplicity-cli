@@ -147,18 +147,45 @@ def _tunnel_progress(state: AppContext, event: dict) -> None:
         state.console.print(escape(f"{event['event']}: {event.get('name', '')} {event.get('detail', '')}"))
 
 
-def _run_tunnel_command(state: AppContext, name: str, operation: Any) -> None:
+def _run_tunnel_command(state: AppContext, name: str, operation: Any, *, session: Any = None, plain: bool = False) -> None:
     import signal
 
+    from contextlib import nullcontext
+
+    interactive = bool(session is not None and state.console.is_terminal and not state.console.is_dumb_terminal and not state.json_output and not plain)
     async def run() -> None:
         loop = asyncio.get_running_loop()
         task = asyncio.current_task()
         previous = signal.getsignal(signal.SIGTERM)
         signal.signal(signal.SIGTERM, lambda _signum, _frame: loop.call_soon_threadsafe(task.cancel))
+        live = Live(session.stats.render(session.control.organisation, state.console.width),
+                    console=state.console, auto_refresh=False) if interactive else None
+        async def refresh() -> None:
+            while True:
+                ws = getattr(session.m2m, "ws", None)
+                session.stats.sample(getattr(ws, "latency", 0.0))
+                live.update(session.stats.render(session.control.organisation, state.console.width), refresh=True)
+                await asyncio.sleep(1)
         try:
-            await operation
-        except asyncio.CancelledError:
-            _tunnel_progress(state, {"event": "stopped", "name": name})
+            with live if live is not None else nullcontext():
+                refresh_task = asyncio.create_task(refresh()) if live is not None else None
+                try:
+                    await operation
+                except asyncio.CancelledError:
+                    if session is not None:
+                        session._emit({"event": "stopped", "name": name})
+                    else:
+                        _tunnel_progress(state, {"event": "stopped", "name": name})
+                except Exception as exc:
+                    if session is not None:
+                        from .tunnels import TunnelError
+                        session.stats.record({"event": "error", "detail": str(exc) if isinstance(exc, TunnelError) else "Tunnel operation failed. Check the local port and connectivity."})
+                    raise
+                finally:
+                    if refresh_task is not None:
+                        refresh_task.cancel()
+                        await asyncio.gather(refresh_task, return_exceptions=True)
+                        live.update(session.stats.render(session.control.organisation, state.console.width), refresh=True)
         finally:
             signal.signal(signal.SIGTERM, previous)
 
@@ -204,6 +231,7 @@ def tunnel_publish(
     organisation: Optional[str] = typer.Option(None, "--org", help="Organisation hash"),
     token_env: Optional[str] = typer.Option(None, "--token-env", help="Environment VARIABLE containing a scoped publisher token"),
     token_stdin: bool = typer.Option(False, "--token-stdin", help="Read a scoped publisher token from standard input"),
+    plain: bool = typer.Option(False, "--plain", help="Event logs instead of the live terminal dashboard"),
 ) -> None:
     """Publish localhost TCP privately; Ctrl+C stops the current registration.
 
@@ -226,8 +254,8 @@ def tunnel_publish(
         if (token_env or token_stdin) and (not token or len(token) > 4096 or any(c.isspace() for c in token)):
             raise TunnelError("The publisher token input is empty or invalid.")
         control = _tunnel_control(state, organisation, token)
-        session = TunnelSession(control, name, lambda event: _tunnel_progress(state, event))
-        _run_tunnel_command(state, name, session.publish(port))
+        session = TunnelSession(control, name, lambda event: _tunnel_progress(state, event) if plain or state.json_output or not state.console.is_terminal or state.console.is_dumb_terminal else None)
+        _run_tunnel_command(state, name, session.publish(port), session=session, plain=plain)
     except KeyboardInterrupt:
         _tunnel_progress(state, {"event": "stopped", "name": name})
     except Exception as exc:
@@ -239,6 +267,7 @@ def tunnel_connect(
     ctx: typer.Context,
     name: str = typer.Argument(..., help="Named private service"),
     local_port: int = typer.Option(..., "--local-port", min=1, max=65535, help="Consumer loopback port (127.0.0.1 only)"),
+    plain: bool = typer.Option(False, "--plain", help="Event logs instead of the live terminal dashboard"),
     organisation: Optional[str] = typer.Option(None, "--org", help="Organisation hash"),
 ) -> None:
     """Forward 127.0.0.1:<local-port> to an authorised named service."""
@@ -246,8 +275,8 @@ def tunnel_connect(
 
     state = _ctx(ctx)
     try:
-        session = TunnelSession(_tunnel_control(state, organisation), name, lambda event: _tunnel_progress(state, event))
-        _run_tunnel_command(state, name, session.connect(local_port))
+        session = TunnelSession(_tunnel_control(state, organisation), name, lambda event: _tunnel_progress(state, event) if plain or state.json_output or not state.console.is_terminal or state.console.is_dumb_terminal else None)
+        _run_tunnel_command(state, name, session.connect(local_port), session=session, plain=plain)
     except KeyboardInterrupt:
         _tunnel_progress(state, {"event": "stopped", "name": name})
     except Exception as exc:
