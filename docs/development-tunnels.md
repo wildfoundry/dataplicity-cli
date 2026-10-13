@@ -75,3 +75,55 @@ closing unused streams or reviewing the organisation's plan limits. Global
 `--json` produces newline-delimited progress events for long-running commands;
 `tunnel ls --json` returns paginated active inventory and accepts `--search`
 and `--page`.
+
+## Live terminal dashboard
+
+In an interactive terminal, `tunnel publish` and `tunnel connect` display live
+send/receive rates, recent traffic charts, payload byte totals, active/closed
+connection counts, failures, uptime and recent lifecycle events. Publisher
+counters aggregate the streams handled by that CLI process. Totals remain intact
+across publisher reconnections and reset when you start a new command.
+
+**CLI–relay RTT** uses the existing WebSocket heartbeat measurement. It is not
+end-to-end service latency or application response time. Until a heartbeat has
+completed, the dashboard shows that the measurement is pending. Server policy
+limits are displayed when reported; this is not an estimate of remaining shared
+organisation capacity. Recent connection errors explain denied access, quota
+exhaustion and local service failures. Data payloads are not inspected for the
+dashboard.
+
+The screen refreshes about once a second. Larger terminals show separate coloured
+charts for sending, receiving, heartbeat RTT and concurrent TCP streams.
+The time window expands from 60 seconds to 5 minutes, 15 minutes and 20 minutes
+as the command runs; history is bounded to the latest 20 minutes.
+Each chart scales to its own observed maximum; numeric labels show the actual
+values. Empty history and missing RTT readings remain gaps. Columns preserve
+peaks when several observations share a column; the number of columns follows
+the terminal width and stays bounded. Connectivity cells preserve any observed
+outage within their interval, so brief drops survive compression. Small terminals use a compact
+view. Cyan indicates sending, magenta receiving, and yellow heartbeat RTT.
+
+Session totals, peak sampled send/receive rates, peak simultaneous streams and
+reconnect count stay available for the lifetime of the command. The connectivity
+strip and readiness percentage describe this CLI's observed lifecycle, not a
+server SLA or a test of the local application's health. Downtime starts after
+the first successful publish/listen event; initial startup is excluded. The
+bounded event timeline uses green for ready, yellow for retrying and red for
+failures. Colour supplements text labels; `NO_COLOR` disables colours. Keep the command running to keep the tunnel available.
+Ctrl+C stops it and restores the terminal.
+
+For ordinary event logs in an interactive terminal, use `--plain`:
+
+```sh
+dataplicity tunnel publish test-api --port 3000 --plain
+dataplicity tunnel connect test-api --local-port 8080 --plain
+```
+
+Redirected output and `TERM=dumb` use event logs automatically. Existing global
+`--json` output remains newline-delimited events with no screen rendering:
+
+```sh
+dataplicity --json tunnel connect test-api --local-port 8080
+```
+
+The interactive dashboard fills the terminal using its alternate screen, so incoming events do not add scrollback. It follows terminal resizing and restores the previous screen when stopped.

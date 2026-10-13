@@ -200,7 +200,7 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
         writer = Mock()
         reader = Mock()
         started = asyncio.Event()
-        async def bridge(*args):
+        async def bridge(*args, **kwargs):
             started.set()
             await asyncio.Future()
         with patch("dataplicity_cli.tunnels.asyncio.open_connection", new=AsyncMock(return_value=(reader, writer))), patch("dataplicity_cli.tunnels.bridge_tcp_channel", new=bridge), patch("dataplicity_cli.tunnels._close_stream_writer", new=AsyncMock()) as close:
