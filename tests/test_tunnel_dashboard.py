@@ -11,6 +11,11 @@ from dataplicity_cli.tunnel_dashboard import TunnelStats, chart, size
 from dataplicity_cli.tunnels import TunnelSession
 
 
+def _console(width: int, height: int = 24) -> Console:
+    # legacy_windows shrinks Console.width by one on win32; keep test sizes exact.
+    return Console(file=io.StringIO(), width=width, height=height, legacy_windows=False)
+
+
 def test_rates_are_payload_deltas_and_history_is_bounded():
     now = [0.0]
     stats = TunnelStats("api", lambda: now[0])
@@ -38,7 +43,7 @@ def test_rates_are_payload_deltas_and_history_is_bounded():
 
 def test_counts_states_limits_and_safe_responsive_rendering():
     stats = TunnelStats("api")
-    console = Console(file=io.StringIO(), width=80)
+    console = _console(80)
     console.print(stats.render("org"))
     assert "No traffic yet" in console.file.getvalue()
     stats.mode, stats.target_port = "publisher", 3000
@@ -61,7 +66,7 @@ def test_counts_states_limits_and_safe_responsive_rendering():
     assert "32 streams" in output and "1.0 MB/s" in output
     assert "[red]literal" in output and "\x1b" not in output
     stats.mode, stats.local_port, stats.target_port = "consumer", 8080, 3000
-    narrow = Console(file=io.StringIO(), width=36, height=24, legacy_windows=False)
+    narrow = _console(36)
     narrow.print(stats.render("org", 36, 24))
     assert all(len(line) <= narrow.width for line in narrow.file.getvalue().splitlines())
 
@@ -107,8 +112,7 @@ def test_publisher_bridge_reports_bytes_and_closes_counts():
 def test_full_screen_border_stays_fixed_with_events_and_resize():
     stats = TunnelStats("api")
     for width, height in ((120, 30), (80, 24), (36, 12)):
-        # legacy_windows=False keeps Console.width equal to the requested width on win32.
-        console = Console(file=io.StringIO(), width=width, height=height, legacy_windows=False)
+        console = _console(width, height)
         for count in (0, 1, 20):
             for _ in range(count):
                 stats.record({"event": "reconnecting", "detail": "A long retry message " * 8})
@@ -161,7 +165,7 @@ def test_full_dashboard_sections_safe_text_and_policy():
     for status in ("Starting", "Listening", "Reconnecting", "Error"):
         stats.status = status
         stats.sample(.024)
-        console = Console(file=io.StringIO(), width=120, height=30)
+        console = _console(120, 30)
         console.print(stats.render("org", 120, 30))
         text = console.file.getvalue()
         assert "[red]literal" in text
@@ -172,7 +176,7 @@ def test_full_dashboard_sections_safe_text_and_policy():
         assert "32 streams" in text and "1.0 MB/s" in text
         assert "8080" in text and "unknown" in text
     stats.mode, stats.target_port = "publisher", 3000
-    console = Console(file=io.StringIO(), width=120, height=30)
+    console = _console(120, 30)
     console.print(stats.render("org", 120, 30))
     assert "3000" in console.file.getvalue()
 
@@ -200,7 +204,7 @@ def test_chart_window_expands_with_session_and_caps_at_twenty_minutes():
     stats = TunnelStats("api", lambda: now[0])
     for elapsed, label in ((60, "60s"), (61, "5m"), (301, "15m"), (901, "20m"), (8000, "20m")):
         now[0] = elapsed
-        console = Console(file=io.StringIO(), width=120, height=30)
+        console = _console(120, 30)
         console.print(stats.render("org", 120, 30))
         assert f"−{label}" in console.file.getvalue()
 
@@ -219,10 +223,10 @@ def test_twenty_minute_history_is_bounded_and_outages_survive_compression():
         stats.sample(.024)
     assert len(stats.history) == 1200
     for width, height in ((80, 24), (120, 30), (300, 40)):
-        console = Console(file=io.StringIO(), width=width, height=height)
+        console = _console(width, height)
         lines = console.render_lines(stats.render("org", width, height))
         assert len(lines) == height
-        assert all(sum(part.cell_length for part in line) == width for line in lines)
+        assert all(sum(part.cell_length for part in line) == console.width for line in lines)
         text = "\n".join("".join(part.text for part in line) for line in lines)
         assert "20m" in text and "×" in text
     # A long unsampled pause must expire old readings by age too.
