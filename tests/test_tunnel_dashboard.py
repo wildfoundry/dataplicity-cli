@@ -61,9 +61,9 @@ def test_counts_states_limits_and_safe_responsive_rendering():
     assert "32 streams" in output and "1.0 MB/s" in output
     assert "[red]literal" in output and "\x1b" not in output
     stats.mode, stats.local_port, stats.target_port = "consumer", 8080, 3000
-    narrow = Console(file=io.StringIO(), width=36)
-    narrow.print(stats.render("org", 36))
-    assert all(len(line) <= 36 for line in narrow.file.getvalue().splitlines())
+    narrow = Console(file=io.StringIO(), width=36, height=24, legacy_windows=False)
+    narrow.print(stats.render("org", 36, 24))
+    assert all(len(line) <= narrow.width for line in narrow.file.getvalue().splitlines())
 
 
 def test_units_and_chart_zero_spike_and_window():
@@ -107,13 +107,14 @@ def test_publisher_bridge_reports_bytes_and_closes_counts():
 def test_full_screen_border_stays_fixed_with_events_and_resize():
     stats = TunnelStats("api")
     for width, height in ((120, 30), (80, 24), (36, 12)):
-        console = Console(file=io.StringIO(), width=width, height=height)
+        # legacy_windows=False keeps Console.width equal to the requested width on win32.
+        console = Console(file=io.StringIO(), width=width, height=height, legacy_windows=False)
         for count in (0, 1, 20):
             for _ in range(count):
                 stats.record({"event": "reconnecting", "detail": "A long retry message " * 8})
             lines = console.render_lines(stats.render("org", width, height))
             assert len(lines) == height
-            assert all(sum(segment.cell_length for segment in line) == width for line in lines)
+            assert all(sum(segment.cell_length for segment in line) == console.width for line in lines)
             assert lines[0][0].text.startswith("╭")
             assert lines[-1][0].text.startswith("╰")
 
