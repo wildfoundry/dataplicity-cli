@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import asyncio
+import base64
+import json
+import time
 import unittest
 from unittest.mock import Mock
 
@@ -20,6 +24,12 @@ class _FakeResponse:
         if isinstance(self._payload, Exception):
             raise self._payload
         return self._payload
+
+
+def _unsigned_jwt(payload: dict) -> str:
+    header = base64.urlsafe_b64encode(b'{"alg":"none"}').rstrip(b"=").decode("ascii")
+    body = base64.urlsafe_b64encode(json.dumps(payload, separators=(",", ":")).encode("ascii")).rstrip(b"=").decode("ascii")
+    return f"{header}.{body}.sig"
 
 
 class ApiClientFullTest(unittest.TestCase):
@@ -107,6 +117,96 @@ class ApiClientFullTest(unittest.TestCase):
     def test_refresh_session_only_when_jwt(self) -> None:
         client = ApiClient(Config(auth_method="api_key", api_key="key"))
         self.assertFalse(client.refresh_session())
+
+    def test_jwt_expiry_parsing(self) -> None:
+        self.assertIsNone(ApiClient._jwt_expiry(None))
+        self.assertIsNone(ApiClient._jwt_expiry("not-a-jwt"))
+        self.assertIsNone(ApiClient._jwt_expiry("a.!!!.b"))
+        self.assertIsNone(ApiClient._jwt_expiry(_unsigned_jwt({"exp": True})))
+        self.assertIsNone(ApiClient._jwt_expiry(_unsigned_jwt({"exp": "soon"})))
+        self.assertEqual(ApiClient._jwt_expiry(_unsigned_jwt({"exp": 123})), 123.0)
+
+    def test_ensure_fresh_access_token_refreshes_near_expiry(self) -> None:
+        soon = _unsigned_jwt({"exp": int(time.time()) + 15})
+        fresh = _unsigned_jwt({"exp": int(time.time()) + 3600})
+        cfg = Config(base_url="https://example.test", auth_method="jwt", access_token=soon, refresh_token="ref")
+        client = ApiClient(cfg)
+        client.session.post = Mock(return_value=_FakeResponse(200, {"access": fresh, "refresh": "ref2"}))
+        self.assertTrue(client.ensure_fresh_access_token(skew_seconds=60))
+        self.assertEqual(cfg.access_token, fresh)
+        self.assertEqual(cfg.refresh_token, "ref2")
+
+        cfg.access_token = fresh
+        client.session.post.reset_mock()
+        self.assertTrue(client.ensure_fresh_access_token(skew_seconds=60))
+        client.session.post.assert_not_called()
+
+        self.assertFalse(ApiClient(Config(auth_method="api_key", api_key="k")).ensure_fresh_access_token())
+        self.assertFalse(
+            ApiClient(Config(auth_method="jwt", access_token="opaque", refresh_token="ref")).ensure_fresh_access_token()
+        )
+
+    def test_refresh_reloads_rotated_token_from_disk(self) -> None:
+        cfg = Config(base_url="https://example.test", auth_method="jwt", access_token="old", refresh_token="stale")
+        reloaded = {"refresh": "rotated", "access": "new"}
+
+        def reload() -> None:
+            cfg.refresh_token = reloaded["refresh"]
+
+        client = ApiClient(cfg, on_config_reload=reload)
+        client.session.post = Mock(
+            side_effect=[
+                _FakeResponse(401, {"detail": "Token is invalid or expired"}),
+                _FakeResponse(200, {"access": "new", "refresh": "rotated"}),
+            ]
+        )
+        self.assertTrue(client._refresh_access_token())
+        self.assertEqual(cfg.access_token, "new")
+        self.assertEqual(cfg.refresh_token, "rotated")
+        self.assertEqual(client.session.post.call_count, 2)
+
+    def test_reload_tokens_handles_errors_and_noop(self) -> None:
+        cfg = Config(auth_method="jwt", access_token="a", refresh_token="r")
+        client = ApiClient(cfg)
+        self.assertFalse(client._reload_tokens())
+        client = ApiClient(cfg, on_config_reload=lambda: (_ for _ in ()).throw(RuntimeError("boom")))
+        self.assertFalse(client._reload_tokens())
+        client = ApiClient(cfg, on_config_reload=lambda: None)
+        self.assertFalse(client._reload_tokens())
+
+    def test_maintain_fresh_access_token_loop(self) -> None:
+        async def run() -> None:
+            cfg = Config(auth_method="jwt", access_token="a", refresh_token="r")
+            client = ApiClient(cfg)
+            refreshed = asyncio.Event()
+
+            def mark_refreshed(*, skew_seconds: float = 60.0) -> bool:
+                _ = skew_seconds
+                refreshed.set()
+                return True
+
+            client.ensure_fresh_access_token = mark_refreshed  # type: ignore[method-assign]
+            # maintain_fresh_access_token clamps the interval to at least 1s.
+            task = asyncio.create_task(client.maintain_fresh_access_token(interval_seconds=1.0))
+            await asyncio.wait_for(refreshed.wait(), timeout=2.5)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+        asyncio.run(run())
+
+    def test_request_proactively_refreshes_near_expiry(self) -> None:
+        soon = _unsigned_jwt({"exp": int(time.time()) + 10})
+        fresh = _unsigned_jwt({"exp": int(time.time()) + 3600})
+        cfg = Config(base_url="https://example.test", auth_method="jwt", access_token=soon, refresh_token="ref")
+        client = ApiClient(cfg)
+        client.session.post = Mock(return_value=_FakeResponse(200, {"access": fresh}))
+        client.session.request = Mock(return_value=_FakeResponse(200, {"ok": True}, text='{"ok":true}'))
+        resp = client.get("/x")
+        self.assertTrue(resp.ok)
+        self.assertEqual(cfg.access_token, fresh)
+        auth = client.session.request.call_args.kwargs["headers"]["Authorization"]
+        self.assertEqual(auth, f"Bearer {fresh}")
 
     def test_request_exception_returns_failed_response(self) -> None:
         client = ApiClient(Config(base_url="https://example.test"))
