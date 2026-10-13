@@ -101,3 +101,17 @@ def test_publisher_bridge_reports_bytes_and_closes_counts():
         assert (session.stats.sent, session.stats.received) == (17, 9)
         assert (session.stats.active, session.stats.closed) == (0, 1)
     asyncio.run(run())
+
+
+def test_full_screen_border_stays_fixed_with_events_and_resize():
+    stats = TunnelStats("api")
+    for width, height in ((120, 30), (80, 24), (36, 12)):
+        console = Console(file=io.StringIO(), width=width, height=height)
+        for count in (0, 1, 20):
+            for _ in range(count):
+                stats.record({"event": "reconnecting", "detail": "A long retry message " * 8})
+            lines = console.render_lines(stats.render("org", width, height))
+            assert len(lines) == height
+            assert all(sum(segment.cell_length for segment in line) == width for line in lines)
+            assert lines[0][0].text.startswith("╭")
+            assert lines[-1][0].text.startswith("╰")

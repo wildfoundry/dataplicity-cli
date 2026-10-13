@@ -110,3 +110,5 @@ Redirected output and `TERM=dumb` use event logs automatically. Existing global
 ```sh
 dataplicity --json tunnel connect test-api --local-port 8080
 ```
+
+The interactive dashboard fills the terminal using its alternate screen, so incoming events do not add scrollback. It follows terminal resizing and restores the previous screen when stopped.

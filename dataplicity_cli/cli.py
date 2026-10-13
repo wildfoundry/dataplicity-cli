@@ -158,13 +158,13 @@ def _run_tunnel_command(state: AppContext, name: str, operation: Any, *, session
         task = asyncio.current_task()
         previous = signal.getsignal(signal.SIGTERM)
         signal.signal(signal.SIGTERM, lambda _signum, _frame: loop.call_soon_threadsafe(task.cancel))
-        live = Live(session.stats.render(session.control.organisation, state.console.width),
-                    console=state.console, auto_refresh=False) if interactive else None
+        live = Live(session.stats.render(session.control.organisation, state.console.width, state.console.height),
+                    console=state.console, auto_refresh=False, screen=True, vertical_overflow="crop") if interactive else None
         async def refresh() -> None:
             while True:
                 ws = getattr(session.m2m, "ws", None)
                 session.stats.sample(getattr(ws, "latency", 0.0))
-                live.update(session.stats.render(session.control.organisation, state.console.width), refresh=True)
+                live.update(session.stats.render(session.control.organisation, state.console.width, state.console.height), refresh=True)
                 await asyncio.sleep(1)
         try:
             with live if live is not None else nullcontext():
@@ -185,7 +185,7 @@ def _run_tunnel_command(state: AppContext, name: str, operation: Any, *, session
                     if refresh_task is not None:
                         refresh_task.cancel()
                         await asyncio.gather(refresh_task, return_exceptions=True)
-                        live.update(session.stats.render(session.control.organisation, state.console.width), refresh=True)
+                        live.update(session.stats.render(session.control.organisation, state.console.width, state.console.height), refresh=True)
         finally:
             signal.signal(signal.SIGTERM, previous)
 

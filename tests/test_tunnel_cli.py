@@ -130,6 +130,8 @@ class TunnelDisplayTests(unittest.TestCase):
             if expected_dashboard:
                 self.assertIn('4.0 KB sent', output.getvalue())
                 self.assertIn('\x1b[?25h', output.getvalue())
+                self.assertIn('\x1b[?1049h', output.getvalue())
+                self.assertIn('\x1b[?1049l', output.getvalue())
             else:
                 self.assertIn('published: api', output.getvalue())
 
@@ -149,6 +151,7 @@ class TunnelDisplayTests(unittest.TestCase):
             self.assertEqual(result.exit_code, 0 if isinstance(failure, asyncio.CancelledError) else 1)
             self.assertNotIn('secret-internal-detail', output.getvalue())
             self.assertIn('\x1b[?25h', output.getvalue())
+            self.assertIn('\x1b[?1049l', output.getvalue())
 
 
 if __name__ == "__main__":

@@ -92,7 +92,7 @@ class TunnelStats:
             self.previous, self.sampled = (self.sent, self.received), now
         self.rtt = latency if type(latency) in (float, int) and math.isfinite(latency) and latency > 0 else None
 
-    def render(self, organisation: str, width: int = 80) -> Panel:
+    def render(self, organisation: str, width: int = 80, height: int | None = None) -> Panel:
         now = self.clock()
         table = Table.grid(padding=(0, 2))
         table.add_column()
@@ -120,4 +120,4 @@ class TunnelStats:
         for timestamp, kind, detail in self.events:
             recent.append(f"{int(timestamp - self.started):>4}s  {kind}: {detail}\n", style="")
         return Panel(Group(table, recent, Text("Ctrl+C to stop · Rates are local payload bytes; charts show recent activity.")),
-                     title=Text(f"{self.name} · {self.status}"), expand=True)
+                     title=Text(f"{self.name} · {self.status}"), expand=True, height=height)
