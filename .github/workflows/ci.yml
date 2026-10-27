@@ -11,7 +11,7 @@ permissions:
 jobs:
   unit-tests:
     name: Unit tests
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || vars.GENERAL_RUNNER || 'wf-general' }}
     strategy:
       fail-fast: false
       matrix:
@@ -36,7 +36,7 @@ jobs:
 
   lint-and-smoke:
     name: Compile + help smoke
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ startsWith(matrix.os, 'ubuntu-') && !contains(matrix.os, '-arm') && !github.event.pull_request.head.repo.fork && (vars.GENERAL_RUNNER || 'wf-general') || matrix.os }}
     strategy:
       fail-fast: false
       matrix:
@@ -199,7 +199,7 @@ jobs:
 
   linux-packages-smoke:
     name: Linux packages smoke
-    runs-on: ubuntu-22.04
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || vars.GENERAL_RUNNER || 'wf-general' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -236,7 +236,7 @@ jobs:
 
   no-artifacts-tracked:
     name: No build artifacts tracked
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || vars.GENERAL_RUNNER || 'wf-general' }}
     steps:
       - uses: actions/checkout@v4
         with:

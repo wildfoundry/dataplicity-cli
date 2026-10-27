@@ -264,7 +264,7 @@ jobs:
   release:
     name: Publish GitHub Release
     if: ${{ github.event_name != 'workflow_dispatch' || inputs.qualification_only != true }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || vars.GENERAL_RUNNER || 'wf-general' }}
     needs: build
     permissions:
       contents: write

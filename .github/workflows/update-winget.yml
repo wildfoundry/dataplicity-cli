@@ -20,7 +20,7 @@ concurrency:
 jobs:
   publish-winget:
     name: Publish release to WinGet
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || vars.GENERAL_RUNNER || 'wf-general' }}
     steps:
       - uses: actions/checkout@v4
         with:
