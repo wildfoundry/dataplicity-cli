@@ -3143,7 +3143,7 @@ def devices_connection_quality(ctx: typer.Context, device_hash: Optional[str] = 
         payload = status_response.data
     else:
         detail_response = state.api.get(f"/api/developer/devices/{resolved_hash}/")
-        host_response = state.api.get(f"/api/remote/devices/{resolved_hash}/host/")
+        host_response = state.api.get(_remote_device_api_path(state, resolved_hash, "host"))
         if detail_response.ok and isinstance(detail_response.data, dict):
             detail = detail_response.data
             payload = {
@@ -3278,13 +3278,19 @@ def devices_provisioning_key(
         state.console.print(message)
 
 
+def _remote_device_api_path(state: AppContext, device_hash: str, resource: str) -> str:
+    """Organisation keys and logged-in users use distinct remote-access planes."""
+    prefix = 'developer' if state.config.auth_method == 'api_key' else 'remote'
+    return f"/api/{prefix}/devices/{device_hash}/{resource}/"
+
+
 async def _resolve_m2m_url(
     state: AppContext,
     device_hash: str,
     *,
     request_timeout: Optional[int] = None,
 ) -> str:
-    path = f"/api/remote/devices/{device_hash}/host/"
+    path = _remote_device_api_path(state, device_hash, "host")
     if request_timeout is None:
         response = state.api.get(path)
     else:
@@ -3308,7 +3314,7 @@ async def _resolve_m2m_url(
 
 def _open_remote_access_port(state: AppContext, device_hash: str, payload: Dict[str, Any]) -> Any:
     return state.api.post(
-        f"/api/remote/devices/{device_hash}/ports/",
+        _remote_device_api_path(state, device_hash, "ports"),
         json_data=payload,
     )
 
