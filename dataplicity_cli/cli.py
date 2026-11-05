@@ -3017,9 +3017,9 @@ def devices_history_delete(
     _require_auth(state)
     resolved_hash = _resolve_device_hash_interactive(state, device_hash, action_name="history delete")
     endpoint = f"/api/developer/devices/{resolved_hash}/timeline/{event_id}/"
-    _debug_api_request(state, method="DELETE", path=endpoint)
+    _debug_api_request(state, method="PATCH", path=endpoint)
     response = state.api.request(
-        "DELETE",
+        "PATCH",
         endpoint,
     )
     if not response.ok:
