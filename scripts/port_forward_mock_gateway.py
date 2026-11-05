@@ -199,7 +199,7 @@ class PortForwardMockGateway:
                     ]
                 }
             ).encode("utf-8"), "application/json"
-        if method == "GET" and path.startswith("/api/developer/devices/"):
+        if method == "GET" and path == f"/api/developer/devices/{DEVICE_HASH}":
             return 200, json.dumps(
                 {
                     "hash": DEVICE_HASH,

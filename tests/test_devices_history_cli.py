@@ -195,7 +195,7 @@ class DevicesHistoryCliTest(unittest.TestCase):
             allow_refresh=True,
         ):  # type: ignore[no-untyped-def]
             _ = (params, json_data, data, headers, timeout, allow_refresh)
-            self.assertEqual(method, "DELETE")
+            self.assertEqual(method, "PATCH")
             self.assertEqual(path, f"/api/developer/devices/{self.device_hash}/timeline/777/")
             return ApiResponse(True, 200, deleted_payload, json.dumps(deleted_payload))
 
