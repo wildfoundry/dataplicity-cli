@@ -65,5 +65,5 @@ class CredentialBoundaryTests(unittest.TestCase):
         for suffix in ('dataplicity.com', 'staging.dpenv.com'):
             for alias in ('api', 'app-api', 'gateway'):
                 self.assertEqual(publisher_origin(f'https://{alias}.{suffix}:443/'), f'https://runtime.{suffix}')
-        for origin in ('https://gateway.dataplicity.com:8443', 'https://custom.example/runtime', 'https://gateway.dataplicity.com.attacker.test'):
+        for origin in ('https://gateway.dataplicity.com:8443', 'https://custom.example/runtime', 'https://gateway.dataplicity.com.attacker.test', 'https://gateway.dataplicity.com:invalid', 'https://[invalid'):
             self.assertEqual(publisher_origin(origin), origin)
