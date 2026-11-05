@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional
 
 import requests
+from requests.structures import CaseInsensitiveDict
 
 from .config import Config
 from .client_identity import identity_headers
@@ -140,11 +141,13 @@ class ApiClient:
             return "failed"
         url = self._build_url("/api/token/refresh/")
         try:
-            resp = self.session.post(url, json={"refresh": self.config.refresh_token}, timeout=10)
+            resp = self.session.post(url, json={"refresh": self.config.refresh_token}, timeout=10, allow_redirects=False)
         except Exception:
             return "failed"
         if resp.status_code >= 400:
             return "invalid" if self._response_indicates_invalid_jwt(resp) else "failed"
+        if not 200 <= resp.status_code < 300:
+            return "failed"
         try:
             payload = resp.json()
         except Exception:
@@ -228,17 +231,18 @@ class ApiClient:
         timeout: int = 20,
         allow_refresh: bool = True,
     ) -> ApiResponse:
-        if allow_refresh and self.config.auth_method == "jwt" and self.config.refresh_token:
+        supplied_headers = CaseInsensitiveDict(headers or {})
+        owns_session_auth = "Authorization" not in supplied_headers
+        if allow_refresh and owns_session_auth and self.config.auth_method == "jwt" and self.config.refresh_token:
             self.ensure_fresh_access_token()
 
         url = self._build_url(path)
-        req_headers = {
+        req_headers = CaseInsensitiveDict({
             **identity_headers(self.config.install_id),
             "Accept": "application/json",
             **self._auth_headers(),
-        }
-        if headers:
-            req_headers.update(headers)
+        })
+        req_headers.update(supplied_headers)
         try:
             resp = self.session.request(
                 method.upper(),
@@ -248,12 +252,14 @@ class ApiClient:
                 data=data,
                 headers=req_headers,
                 timeout=timeout,
+                allow_redirects=False,
             )
         except requests.RequestException as exc:
             return ApiResponse(False, 0, None, str(exc))
 
         should_retry_with_refresh = (
             allow_refresh
+            and owns_session_auth
             and self.config.auth_method == "jwt"
             and (resp.status_code == 401 or self._response_indicates_invalid_jwt(resp))
         )
@@ -269,7 +275,9 @@ class ApiClient:
                     timeout=timeout,
                     allow_refresh=False,
                 )
-        if self.config.auth_method == "jwt" and self._response_indicates_invalid_jwt(resp):
+        if (owns_session_auth and self.config.auth_method == "jwt"
+                and req_headers.get("Authorization") == f"Bearer {self.config.access_token}"
+                and self._response_indicates_invalid_jwt(resp)):
             self._invalidate_jwt_session()
 
         text = resp.text or ""

@@ -33,7 +33,7 @@ class ControlTests(unittest.TestCase):
                 websocket_url(url)
 
     def test_auth_separation_and_errors_never_reflect_secrets(self):
-        api = Mock(config=SimpleNamespace(auth_method="jwt", access_token="jwt"))
+        api = Mock(config=SimpleNamespace(auth_method="jwt", access_token="jwt", base_url="https://gateway.dataplicity.com"))
         control = TunnelAPI(api, "org-1")
         api.request.return_value = ApiResponse(True, 200, {"results": []}, "")
         self.assertEqual(control.request("GET", ""), {"results": []})
@@ -57,6 +57,7 @@ class ControlTests(unittest.TestCase):
         machine.request("POST", "publish/", payload={"name": "api"})
         self.assertEqual(api.request.call_args.kwargs["headers"], {"Authorization": "TunnelPublisher machine"})
         self.assertFalse(api.request.call_args.kwargs["allow_refresh"])
+        self.assertEqual(api.request.call_args.args[1], "https://runtime.dataplicity.com/api/organisations/org-1/development-tunnels/publish/")
 
 
 class LifecycleTests(unittest.IsolatedAsyncioTestCase):

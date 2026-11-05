@@ -16,6 +16,25 @@ from .tunnel_transport import TunnelM2MClient
 from .tunnel_dashboard import TunnelStats
 
 
+def publisher_origin(base_url: str) -> str:
+    """Move only known service aliases; explicit private deployments keep theirs."""
+    value = base_url.rstrip('/')
+    try:
+        url = urlsplit(value)
+        if (url.scheme != "https" or url.port not in (None, 443)
+                or url.username is not None or url.password is not None
+                or url.path or url.query or url.fragment):
+            return value
+    except ValueError:
+        return value
+    return {
+        **{f"{host}.dataplicity.com": "https://runtime.dataplicity.com"
+           for host in ("api", "app-api", "gateway")},
+        **{f"{host}.staging.dpenv.com": "https://runtime.staging.dpenv.com"
+           for host in ("api", "app-api", "gateway")},
+    }.get(url.hostname, value)
+
+
 class TunnelError(RuntimeError):
     def __init__(self, message: str, code: str = "tunnel_error") -> None:
         super().__init__(message)
@@ -58,6 +77,8 @@ class TunnelAPI:
         self.api = api
         self.organisation = organisation
         self.base = f"/api/organisations/{organisation}/development-tunnels/"
+        if token:
+            self.base = publisher_origin(api.config.base_url) + self.base
         self.headers = {"Authorization": f"TunnelPublisher {token}"} if token else None
         self._request_lock = threading.Lock()
         self._call_lock: Optional[asyncio.Lock] = None
