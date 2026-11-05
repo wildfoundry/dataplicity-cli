@@ -38,11 +38,7 @@ MFA_WEBAUTHN_ONLY = {
     },
 }
 
-BROWSER_LOGIN_URL = (
-    "https://www.dataplicity.com/login/?cli=1"
-    "&cli_callback=http://127.0.0.1:43111/callback"
-    "&cli_state=one-time-state"
-)
+BROWSER_LOGIN_URL = "https://www.dataplicity.com/login/?native_request=one-time-request"
 
 
 def _mfa_text(payload: dict) -> str:
@@ -52,7 +48,9 @@ def _mfa_text(payload: dict) -> str:
 class _FakeLoopbackListener:
     def __init__(self, payload: dict | None = None) -> None:
         self.callback_url = "http://127.0.0.1:43111/callback"
-        self.payload = payload or {"access": "browser-access", "refresh": "browser-refresh"}
+        self.payload = payload
+        self.login = None
+        self.delivered = False
         self.stopped = False
 
     def start(self) -> bool:
@@ -60,8 +58,10 @@ class _FakeLoopbackListener:
 
     def wait_for_payload(self, timeout_seconds: float) -> dict | None:
         _ = timeout_seconds
-        payload, self.payload = self.payload, None
-        return payload
+        if self.delivered:
+            return None
+        self.delivered = True
+        return self.payload or {"code": "c"*43, "state": self.login.state}
 
     def stop(self) -> None:
         self.stopped = True
@@ -112,11 +112,14 @@ class AuthLoginMfaTest(unittest.TestCase):
         bootstraps: list[dict] = []
 
         def fake_post(path, json_data=None, data=None):
+            if path == "/api/auth/native/token/":
+                return ApiResponse(True, 200, {"access": "browser-access", "refresh": "browser-refresh"}, "")
             _ = data
             if path == "/api/auth/bootstrap/":
                 bootstraps.append(json_data or {})
-                if json_data and json_data.get("callback_url"):
-                    self.assertEqual(json_data.get("cli_callback"), json_data.get("callback_url"))
+                if json_data and json_data.get("native_redirect_uri"):
+                    self.assertEqual(json_data["native_code_challenge_method"], "S256")
+                    self.assertNotIn("cli_callback", json_data)
                     return ApiResponse(
                         True,
                         200,
@@ -140,7 +143,7 @@ class AuthLoginMfaTest(unittest.TestCase):
         mock_open.assert_called_once_with(BROWSER_LOGIN_URL)
         self.assertEqual(saved["access_token"], "browser-access")
         self.assertEqual(saved["preferred_login_method"], "email-password")
-        self.assertTrue(any(item.get("callback_url") for item in bootstraps))
+        self.assertTrue(any(item.get("native_redirect_uri") for item in bootstraps))
         self.assertTrue(listener.stopped)
 
     def test_login_falls_back_to_totp_when_browser_login_url_is_missing(self) -> None:
@@ -256,9 +259,11 @@ class AuthLoginMfaTest(unittest.TestCase):
 
     def test_explicit_webauthn_type_opens_browser_when_login_url_exists(self) -> None:
         def fake_post(path, json_data=None, data=None):
+            if path == "/api/auth/native/token/":
+                return ApiResponse(True, 200, {"access": "browser-access", "refresh": "browser-refresh"}, "")
             _ = data
             if path == "/api/auth/bootstrap/":
-                if json_data and json_data.get("callback_url"):
+                if json_data and json_data.get("native_redirect_uri"):
                     return ApiResponse(
                         True,
                         200,

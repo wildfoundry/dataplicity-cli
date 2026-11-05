@@ -113,6 +113,12 @@ SSO login:
 dataplicity auth sso --email you@example.com
 ```
 
+On remote terminals, use `--no-open-browser` to open the printed sign-in link
+on your workstation, then paste the final code/state callback when prompted.
+The CLI keeps its PKCE verifier locally and exchanges the code at the configured
+HTTPS identity origin. Browser callbacks contain no access or refresh tokens.
+This login flow requires the coordinated native-code backend/frontend release.
+
 Use an organisation API key:
 
 ```
