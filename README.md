@@ -97,6 +97,12 @@ Set the API base URL if you are not using the default:
 dataplicity config set --base-url https://gateway.dataplicity.com
 ```
 
+Use HTTPS for remote API servers; HTTP is supported for loopback development.
+Changing the saved server clears its previous authentication. A one-command
+`--base-url` override uses no credentials saved for a different server; sign in
+to the selected server before using protected commands. An override alone does
+not overwrite the original configuration file.
+
 Login with email/password:
 
 ```

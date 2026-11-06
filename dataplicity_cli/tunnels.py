@@ -10,6 +10,7 @@ from typing import Any, Callable, Optional
 from urllib.parse import urlsplit, urlunsplit
 
 from .api import ApiClient
+from .config import Config
 from .client_identity import identity_headers
 from .remote_access import bridge_tcp_channel, run_port_forward, _close_stream_writer
 from .tunnel_transport import TunnelM2MClient
@@ -78,7 +79,9 @@ class TunnelAPI:
         self.organisation = organisation
         self.base = f"/api/organisations/{organisation}/development-tunnels/"
         if token:
-            self.base = publisher_origin(api.config.base_url) + self.base
+            # A publisher has its own recipient, cookie jar and authentication
+            # state. It cannot reload or invalidate the saved human account.
+            self.api = ApiClient(Config(base_url=publisher_origin(api.config.base_url), install_id=api.config.install_id))
         self.headers = {"Authorization": f"TunnelPublisher {token}"} if token else None
         self._request_lock = threading.Lock()
         self._call_lock: Optional[asyncio.Lock] = None

@@ -36,7 +36,9 @@ class ApiClientFullTest(unittest.TestCase):
     def test_build_url_supports_absolute_and_relative(self) -> None:
         client = ApiClient(Config(base_url="https://example.test/"))
         self.assertEqual(client._build_url("/v1/status"), "https://example.test/v1/status")
-        self.assertEqual(client._build_url("https://other.test/x"), "https://other.test/x")
+        self.assertEqual(client._build_url("https://example.test/x"), "https://example.test/x")
+        with self.assertRaises(ValueError):
+            client._build_url("https://other.test/x")
 
     def test_auth_headers_for_jwt_api_key_and_none(self) -> None:
         jwt_client = ApiClient(Config(auth_method="jwt", access_token="tok"))
@@ -212,7 +214,7 @@ class ApiClientFullTest(unittest.TestCase):
         client = ApiClient(Config(base_url="https://example.test"))
         client.session.request = Mock(side_effect=requests.RequestException("timeout"))
         resp = client.get("/status")
-        self.assertEqual(resp, ApiResponse(False, 0, None, "timeout"))
+        self.assertEqual(resp, ApiResponse(False, 0, None, "The API request failed. Check your connection or sign in again."))
 
     def test_request_retries_once_after_refresh_success(self) -> None:
         cfg = Config(base_url="https://example.test", auth_method="jwt", access_token="old", refresh_token="ref")

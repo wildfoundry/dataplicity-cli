@@ -13,12 +13,22 @@ from requests.structures import CaseInsensitiveDict
 
 from .config import Config
 from .client_identity import identity_headers
+from .api_recipient import INVALID_RECIPIENT, recipient_identity, recipient_url
 
 # Refresh before the access JWT expires so long-running commands (tunnels,
 # terminals, watches) do not wait for a 401 mid-flight.
 ACCESS_TOKEN_REFRESH_SKEW_SECONDS = 60.0
 # How often long-running sessions re-check JWT lifetime while idle.
 ACCESS_TOKEN_KEEPALIVE_INTERVAL_SECONDS = 120.0
+
+
+class _ExplicitApiAuth(requests.auth.AuthBase):
+    """Keep netrc/session Basic auth from replacing explicitly selected proof."""
+    def __call__(self, request):
+        return request
+
+
+_EXPLICIT_API_AUTH = _ExplicitApiAuth()
 
 
 @dataclass
@@ -37,6 +47,7 @@ class ApiClient:
         on_config_reload: Optional[Callable[[], None]] = None,
     ) -> None:
         self.config = config
+        self._configured_base_url = config.base_url
         self.session = requests.Session()
         self.session.headers.update(identity_headers(self.config.install_id))
         self._on_token_update = on_token_update
@@ -44,10 +55,9 @@ class ApiClient:
         self._refresh_lock = threading.Lock()
 
     def _build_url(self, path: str) -> str:
-        if path.startswith("http://") or path.startswith("https://"):
-            return path
-        base = (self.config.base_url or "").rstrip("/")
-        return f"{base}/{path.lstrip('/')}"
+        if recipient_identity(self.config.base_url) != recipient_identity(self._configured_base_url):
+            raise ValueError(INVALID_RECIPIENT)
+        return recipient_url(self._configured_base_url, path)
 
     def _auth_headers(self) -> Dict[str, str]:
         if self.config.auth_method == "jwt" and self.config.access_token:
@@ -114,6 +124,16 @@ class ApiClient:
     def _response_indicates_invalid_jwt(self, response: requests.Response) -> bool:
         if response.status_code not in {400, 401, 403}:
             return False
+        try:
+            payload = response.json()
+        except Exception:
+            payload = None
+        if isinstance(payload, dict):
+            code = payload.get("code") or payload.get("error")
+            if isinstance(payload.get("detail"), dict):
+                code = code or payload["detail"].get("code")
+            if isinstance(code, str) and code in {"session_expired", "token_not_valid", "token_expired", "invalid_token", "token_blacklisted"}:
+                return True
         return self._looks_like_invalid_token_message(self._extract_error_message(response))
 
     def _invalidate_jwt_session(self) -> None:
@@ -139,9 +159,9 @@ class ApiClient:
         """Try one refresh call. Returns 'ok', 'invalid', or 'failed'."""
         if not self.config.refresh_token:
             return "failed"
-        url = self._build_url("/api/token/refresh/")
         try:
-            resp = self.session.post(url, json={"refresh": self.config.refresh_token}, timeout=10, allow_redirects=False)
+            url = self._build_url("/api/token/refresh/")
+            resp = self.session.post(url, json={"refresh": self.config.refresh_token}, timeout=10, allow_redirects=False, auth=_EXPLICIT_API_AUTH)
         except Exception:
             return "failed"
         if resp.status_code >= 400:
@@ -152,11 +172,17 @@ class ApiClient:
             payload = resp.json()
         except Exception:
             return "failed"
+        try:
+            self._build_url("/api/token/refresh/")
+        except ValueError:
+            return "failed"
+        if not isinstance(payload, dict):
+            return "failed"
         access = payload.get("access")
-        if not access:
+        refresh = payload.get("refresh")
+        if not isinstance(access, str) or not access.strip() or (refresh is not None and (not isinstance(refresh, str) or not refresh.strip())):
             return "failed"
         self.config.access_token = access
-        refresh = payload.get("refresh")
         if refresh:
             self.config.refresh_token = refresh
         self.config.auth_method = "jwt"
@@ -233,10 +259,19 @@ class ApiClient:
     ) -> ApiResponse:
         supplied_headers = CaseInsensitiveDict(headers or {})
         owns_session_auth = "Authorization" not in supplied_headers
+        try:
+            url = self._build_url(path)
+        except ValueError:
+            return ApiResponse(False, 0, None, INVALID_RECIPIENT)
+        starting_auth_method = self.config.auth_method
         if allow_refresh and owns_session_auth and self.config.auth_method == "jwt" and self.config.refresh_token:
             self.ensure_fresh_access_token()
-
-        url = self._build_url(path)
+        # A callback must not change the credential recipient during renewal.
+        try:
+            if self._build_url(path) != url or (owns_session_auth and self.config.auth_method != starting_auth_method):
+                return ApiResponse(False, 0, None, "Authentication changed; retry after signing in.")
+        except ValueError:
+            return ApiResponse(False, 0, None, INVALID_RECIPIENT)
         req_headers = CaseInsensitiveDict({
             **identity_headers(self.config.install_id),
             "Accept": "application/json",
@@ -253,9 +288,11 @@ class ApiClient:
                 headers=req_headers,
                 timeout=timeout,
                 allow_redirects=False,
+                auth=_EXPLICIT_API_AUTH,
             )
-        except requests.RequestException as exc:
-            return ApiResponse(False, 0, None, str(exc))
+        except requests.RequestException:
+            # requests exceptions can reflect credential header values or URLs.
+            return ApiResponse(False, 0, None, "The API request failed. Check your connection or sign in again.")
 
         should_retry_with_refresh = (
             allow_refresh

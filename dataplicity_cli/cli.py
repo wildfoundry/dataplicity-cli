@@ -104,12 +104,14 @@ def _ctx(ctx: typer.Context) -> AppContext:
 
 
 @asynccontextmanager
-async def _jwt_keepalive(state: AppContext) -> AsyncIterator[None]:
-    """Keep SSO/JWT access tokens fresh for the lifetime of a long command."""
-    if state.config.auth_method != "jwt" or not state.config.refresh_token:
+async def _jwt_keepalive(state: AppContext, api: Optional[ApiClient] = None) -> AsyncIterator[None]:
+    """Renew only the credential realm actually running the long command."""
+    selected = api if api is not None else state.api
+    selected_config = selected.config if api is not None else state.config
+    if selected_config.auth_method != "jwt" or not selected_config.refresh_token:
         yield
         return
-    task = asyncio.create_task(state.api.maintain_fresh_access_token())
+    task = asyncio.create_task(selected.maintain_fresh_access_token())
     try:
         yield
     finally:
@@ -137,10 +139,6 @@ def _tunnel_control(state: AppContext, organisation: Optional[str], token: Optio
             raise TunnelError("Select an organisation with --org <organisation-hash>.")
         organisation = str(rows[0].get("hash_id") or "")
     api = state.api
-    if token:
-        # Machine credential failure must never refresh or invalidate a human
-        # session saved in the same CLI configuration.
-        api = ApiClient(Config(base_url=state.config.base_url, install_id=state.config.install_id))
     return TunnelAPI(api, organisation, token=token)
 
 
@@ -186,7 +184,7 @@ def _run_tunnel_command(state: AppContext, name: str, operation: Any, *, session
                 live.update(session.stats.render(session.control.organisation, state.console.width, state.console.height), refresh=True)
                 await asyncio.sleep(1)
         try:
-            async with _jwt_keepalive(state):
+            async with _jwt_keepalive(state, session.control.api if session is not None else None):
                 with live if live is not None else nullcontext():
                     refresh_task = asyncio.create_task(refresh()) if live is not None else None
                     try:
@@ -787,6 +785,7 @@ def _apply_tokens_or_none(state: AppContext, payload: Any) -> bool:
     state.config.access_token = access
     state.config.refresh_token = refresh
     state.config.auth_method = "jwt"
+    state.config.clear_api_key()
     state.config.save(state.config_path)
     return True
 
@@ -1847,6 +1846,23 @@ def _normalize_timeline_type_filters(raw_value: Optional[str]) -> List[str]:
     return list(dict.fromkeys(cleaned))
 
 
+def _set_api_recipient(config: Config, base_url: str) -> None:
+    from .api_recipient import recipient_identity
+    selected = base_url.rstrip("/")
+    try:
+        selected_identity = recipient_identity(selected)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc), param_hint="--base-url") from None
+    try:
+        current_identity = recipient_identity(config.base_url)
+    except ValueError:
+        current_identity = None
+    if selected_identity != current_identity:
+        config.clear_tokens()
+        config.clear_api_key()
+    config.base_url = selected
+
+
 @app.callback()
 def main(
     ctx: typer.Context,
@@ -1869,7 +1885,7 @@ def main(
         with suppress(OSError):
             config.save(path)
     if base_url:
-        config.base_url = base_url.rstrip("/")
+        _set_api_recipient(config, base_url)
     console = Console(theme=THEME)
 
     def _persist_tokens() -> None:
@@ -1879,14 +1895,21 @@ def main(
         # Pick up refresh-token rotations written by another CLI process so a
         # long-running command (e.g. tunnel publish) can keep refreshing.
         fresh = Config.load(path)
+        from .api_recipient import recipient_identity
+        try:
+            same_recipient = recipient_identity(fresh.base_url) == recipient_identity(config.base_url)
+        except ValueError:
+            same_recipient = False
+        if not same_recipient:
+            config.clear_tokens()
+            config.clear_api_key()
+            return
         config.auth_method = fresh.auth_method
         config.access_token = fresh.access_token
         config.refresh_token = fresh.refresh_token
         config.api_key = fresh.api_key
 
     api_client = ApiClient(config, on_token_update=_persist_tokens, on_config_reload=_reload_tokens)
-    if config.auth_method == "jwt" and config.refresh_token:
-        api_client.ensure_fresh_access_token()
     ctx.obj = AppContext(
         config=config,
         config_path=path,
@@ -2125,7 +2148,7 @@ def config_set(
     """
     state = _ctx(ctx)
     if base_url:
-        state.config.base_url = base_url.rstrip("/")
+        _set_api_recipient(state.config, base_url)
     state.config.save(state.config_path)
     if state.json_output:
         _print_json({"ok": True, "base_url": state.config.base_url})
@@ -2233,7 +2256,8 @@ def auth_login(
             _print_json({"ok": False, "detail": "Password is required in --json mode. Pass `--password`."})
             raise typer.Exit(code=2)
         password = typer.prompt("Password", hide_input=True)
-    bootstrap = state.api.post("/api/auth/bootstrap/", json_data={"email": email})
+    primary_api = ApiClient(Config(base_url=state.config.base_url, install_id=state.config.install_id))
+    bootstrap = primary_api.post("/api/auth/bootstrap/", json_data={"email": email})
     if bootstrap.ok and isinstance(bootstrap.data, dict) and bootstrap.data.get("status") == "sso_redirect":
         if state.json_output:
             message = "SSO is required for this account. Use `dataplicity auth sso --email ...`."
@@ -2260,7 +2284,7 @@ def auth_login(
         _fail_login(state, _webauthn_unsupported_message(), extra={"error_code": "unsupported_mfa_type"})
 
     payload = _password_login_payload(email, password, mfa_code=mfa_code, mfa_type=mfa_type)
-    response = state.api.post("/api/token/", json_data=payload)
+    response = primary_api.post("/api/token/", json_data=payload)
     if not response.ok and _extract_error_code(response.data) == "mfa_required":
         mfa = _extract_mfa_payload(response.data)
         available = _mfa_available_types(mfa)
@@ -2293,7 +2317,7 @@ def auth_login(
         if has_totp:
             mfa_code = typer.prompt("Authenticator app code")
             payload = _password_login_payload(email, password, mfa_code=mfa_code, mfa_type="TOTP")
-            response = state.api.post("/api/token/", json_data=payload)
+            response = primary_api.post("/api/token/", json_data=payload)
         else:
             _fail_login(state, _webauthn_unsupported_message(), extra=extra)
 
@@ -2320,6 +2344,7 @@ def auth_login(
     state.config.access_token = access
     state.config.refresh_token = refresh
     state.config.auth_method = "jwt"
+    state.config.clear_api_key()
     state.config.last_email = email
     state.config.preferred_login_method = "email-password"
     state.config.save(state.config_path)
@@ -2366,6 +2391,7 @@ def auth_api_key_set(ctx: typer.Context) -> None:
     api_key = typer.prompt("API key", hide_input=True)
     state.config.api_key = api_key.strip()
     state.config.auth_method = "api_key"
+    state.config.clear_tokens()
     state.config.preferred_login_method = "api-key"
     state.config.save(state.config_path)
     if state.json_output:
