@@ -60,6 +60,7 @@ def test_callback_accepts_one_matching_proof_and_never_raw_tokens():
 def test_exchange_uses_pinned_anonymous_issuer_without_refreshing_old_login(tmp_path):
     state = state_for(tmp_path)
     listener = listener_for(state)
+    previous_api = state.api
     captured = []
     def request(method, url, **kwargs):
         captured.append((method, url, kwargs))
@@ -75,8 +76,9 @@ def test_exchange_uses_pinned_anonymous_issuer_without_refreshing_old_login(tmp_
     saved = json.loads(state.config_path.read_text())
     assert saved['access_token'] == 'new-access' and saved['refresh_token'] == 'new-refresh'
     assert listener.login.verifier not in state.config_path.read_text()
-    state.api.get.assert_not_called()
-    state.api.post.assert_not_called()
+    previous_api.get.assert_not_called()
+    assert state.api is not previous_api
+    previous_api.post.assert_not_called()
 
 
 @pytest.mark.parametrize('change', ['origin', 'invalid_origin', 'wrong_state', 'token_payload', 'missing_context'])

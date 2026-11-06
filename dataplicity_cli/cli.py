@@ -23,6 +23,8 @@ from typing import Any, AsyncIterator, Dict, List, NoReturn, Optional, Set, Tupl
 from urllib.parse import parse_qs, urlparse
 
 import typer
+import click
+from typer.core import TyperGroup
 from rich.console import Console
 from rich.live import Live
 from rich.markup import escape
@@ -35,12 +37,22 @@ from .terminal import THEME, status_style
 from . import __version__
 from .api import ApiClient, ApiResponse
 from .client_identity import identity_headers
-from .config import Config, default_config_path
+from .config import Config, ConfigError, default_config_path
 from .native_auth import NativeLogin, identity_origin
 from .m2m import M2MClient
 
 
+class _SafeConfigGroup(TyperGroup):
+    def invoke(self, ctx):
+        try:
+            return super().invoke(ctx)
+        except ConfigError as exc:
+            raise click.ClickException(str(exc)) from None
+
+
 app = typer.Typer(
+    cls=_SafeConfigGroup,
+    pretty_exceptions_show_locals=False,
     add_completion=True,
     invoke_without_command=True,
     help=(
@@ -782,11 +794,9 @@ def _apply_tokens_or_none(state: AppContext, payload: Any) -> bool:
     access, refresh = _extract_sso_tokens(payload)
     if not access:
         return False
-    state.config.access_token = access
-    state.config.refresh_token = refresh
-    state.config.auth_method = "jwt"
-    state.config.clear_api_key()
+    state.config.install_user_tokens(access, refresh)
     state.config.save(state.config_path)
+    state.api = ApiClient(state.config)
     return True
 
 
@@ -1888,28 +1898,7 @@ def main(
         _set_api_recipient(config, base_url)
     console = Console(theme=THEME)
 
-    def _persist_tokens() -> None:
-        config.save(path)
-
-    def _reload_tokens() -> None:
-        # Pick up refresh-token rotations written by another CLI process so a
-        # long-running command (e.g. tunnel publish) can keep refreshing.
-        fresh = Config.load(path)
-        from .api_recipient import recipient_identity
-        try:
-            same_recipient = recipient_identity(fresh.base_url) == recipient_identity(config.base_url)
-        except ValueError:
-            same_recipient = False
-        if not same_recipient:
-            config.clear_tokens()
-            config.clear_api_key()
-            return
-        config.auth_method = fresh.auth_method
-        config.access_token = fresh.access_token
-        config.refresh_token = fresh.refresh_token
-        config.api_key = fresh.api_key
-
-    api_client = ApiClient(config, on_token_update=_persist_tokens, on_config_reload=_reload_tokens)
+    api_client = ApiClient(config)
     ctx.obj = AppContext(
         config=config,
         config_path=path,
@@ -2341,13 +2330,11 @@ def auth_login(
     if not access:
         _fail_login(state, "Login succeeded but no access token was returned.")
 
-    state.config.access_token = access
-    state.config.refresh_token = refresh
-    state.config.auth_method = "jwt"
-    state.config.clear_api_key()
+    state.config.install_user_tokens(access, refresh)
     state.config.last_email = email
     state.config.preferred_login_method = "email-password"
     state.config.save(state.config_path)
+    state.api = ApiClient(state.config)
     if state.json_output:
         _print_json({"ok": True, "detail": "Logged in"})
     else:
@@ -2389,11 +2376,10 @@ def auth_api_key_set(ctx: typer.Context) -> None:
     """
     state = _ctx(ctx)
     api_key = typer.prompt("API key", hide_input=True)
-    state.config.api_key = api_key.strip()
-    state.config.auth_method = "api_key"
-    state.config.clear_tokens()
+    state.config.install_api_key(api_key.strip())
     state.config.preferred_login_method = "api-key"
     state.config.save(state.config_path)
+    state.api = ApiClient(state.config)
     if state.json_output:
         _print_json({"ok": True, "detail": "API key saved"})
     else:

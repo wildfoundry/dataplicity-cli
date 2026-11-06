@@ -216,16 +216,16 @@ class OverrideRecipientTests(unittest.TestCase):
             with self.subTest(target=target), tempfile.TemporaryDirectory() as folder:
                 path = Path(folder)/"cli.json"
                 Config(auth_method="jwt", access_token="old-access", refresh_token="old-refresh", install_id="install").save(path)
-                with patch("dataplicity_cli.cli.ApiClient") as factory:
-                    result = CliRunner().invoke(app, ["--config", str(path), "--json", "auth", "status"])
-                    self.assertEqual(result.exit_code, 0, result.output)
-                    config = factory.call_args.args[0]
-                    reload = factory.call_args.kwargs["on_config_reload"]
-                Config(base_url=target, auth_method="jwt", access_token="foreign-access", refresh_token="foreign-refresh", install_id="install").save(path)
-                reload()
-                self.assertIsNone(config.access_token)
-                self.assertIsNone(config.refresh_token)
-                self.assertIsNone(config.api_key)
+                config = Config.load(path)
+                client = ApiClient(config)
+                client.session.post = Mock(side_effect=AssertionError("foreign account adopted"))
+                replacement = Config.load(path)
+                replacement.base_url = target
+                replacement.access_token = "foreign-access"
+                replacement.refresh_token = "foreign-refresh"
+                replacement.save(path)
+                self.assertFalse(client.refresh_session())
+                client.session.post.assert_not_called()
                 self.assertEqual(Config.load(path).access_token, "foreign-access")
 
     def test_password_signin_uses_no_existing_user_authority_and_discards_an_old_key(self):

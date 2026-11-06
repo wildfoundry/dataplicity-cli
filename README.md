@@ -103,6 +103,12 @@ Changing the saved server clears its previous authentication. A one-command
 to the selected server before using protected commands. An override alone does
 not overwrite the original configuration file.
 
+Commands retain the sign-in they started with. If another process signs in or
+out while a command is waiting, the older command stops using that session and
+asks you to start again. Configuration updates use a private atomic file and a
+short process lock; a delayed renewal cannot overwrite a newer sign-in. A lost
+renewal response can be retried with the saved recovery identifier.
+
 Login with email/password:
 
 ```

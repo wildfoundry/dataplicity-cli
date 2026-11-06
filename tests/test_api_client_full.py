@@ -11,7 +11,7 @@ import requests
 
 from dataplicity_cli.api import ApiClient, ApiResponse
 from dataplicity_cli.client_identity import identity_headers
-from dataplicity_cli.config import Config
+from dataplicity_cli.config import Config, RefreshTicket
 
 
 class _FakeResponse:
@@ -121,6 +121,9 @@ class ApiClientFullTest(unittest.TestCase):
         self.assertFalse(client.refresh_session())
 
     def test_jwt_expiry_parsing(self) -> None:
+        for payload in ([], None, True, "payload", {"exp": float("inf")}, {"exp": 10 ** 400}):
+            with self.subTest(payload=payload):
+                self.assertIsNone(ApiClient._jwt_expiry(_unsigned_jwt(payload)))
         self.assertIsNone(ApiClient._jwt_expiry(None))
         self.assertIsNone(ApiClient._jwt_expiry("not-a-jwt"))
         self.assertIsNone(ApiClient._jwt_expiry("a.!!!.b"))
@@ -153,7 +156,7 @@ class ApiClientFullTest(unittest.TestCase):
         reloaded = {"refresh": "rotated", "access": "new"}
 
         def reload() -> None:
-            cfg.refresh_token = reloaded["refresh"]
+            cfg.commit_rotation(RefreshTicket(cfg.capture_owner(), cfg.access_token, "stale", "00000000-0000-4000-8000-000000000001"), cfg.access_token, reloaded["refresh"])
 
         client = ApiClient(cfg, on_config_reload=reload)
         client.session.post = Mock(
@@ -222,12 +225,12 @@ class ApiClientFullTest(unittest.TestCase):
         first = _FakeResponse(401, {"detail": "Token has expired"}, text="unauthorized")
         second = _FakeResponse(200, {"ok": True}, text='{"ok": true}')
         client.session.request = Mock(side_effect=[first, second])
-        client._refresh_access_token = Mock(return_value=True)  # type: ignore[assignment]
+        client.session.post = Mock(return_value=_FakeResponse(200, {"access": "renewed", "refresh": "rotated"}))
 
         resp = client.request("GET", "/x")
         self.assertTrue(resp.ok)
         self.assertEqual(resp.status_code, 200)
-        client._refresh_access_token.assert_called_once()
+        client.session.post.assert_called_once()
         self.assertEqual(client.session.request.call_count, 2)
 
     def test_request_handles_error_text_fallback_and_invalidation(self) -> None:
