@@ -62,6 +62,17 @@ def test_read_failure_is_safe_and_never_replaces_the_file(tmp_path):
     assert path.read_text() == 'original'
 
 
+def test_cli_reports_configuration_failure_without_a_traceback_or_private_values(tmp_path):
+    from typer.testing import CliRunner
+    from dataplicity_cli.cli import app
+    with patch.object(Path, 'read_bytes', side_effect=PermissionError('private-token-value')):
+        result = CliRunner().invoke(app, ['--config', str(tmp_path/'cli.json'), 'auth', 'status'])
+    assert result.exit_code == 1
+    assert 'Unable to read the configuration' in result.output
+    assert 'private-token-value' not in result.output
+    assert 'Traceback' not in result.output
+
+
 def test_unwitnessed_overwrite_and_file_removal_cannot_restore_old_authentication(tmp_path):
     path = tmp_path/'cli.json'; Config(access_token='original').save(path)
     with pytest.raises(ConfigChangedError): Config(access_token='unwitnessed').save(path)

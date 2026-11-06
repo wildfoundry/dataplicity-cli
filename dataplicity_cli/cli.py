@@ -23,7 +23,6 @@ from typing import Any, AsyncIterator, Dict, List, NoReturn, Optional, Set, Tupl
 from urllib.parse import parse_qs, urlparse
 
 import typer
-import click
 from typer.core import TyperGroup
 from rich.console import Console
 from rich.live import Live
@@ -47,7 +46,8 @@ class _SafeConfigGroup(TyperGroup):
         try:
             return super().invoke(ctx)
         except ConfigError as exc:
-            raise click.ClickException(str(exc)) from None
+            typer.echo(f"Error: {exc}", err=True)
+            raise typer.Exit(code=1) from None
 
 
 app = typer.Typer(
