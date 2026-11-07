@@ -2388,17 +2388,22 @@ def auth_api_key_set(ctx: typer.Context) -> None:
 
 @auth_app.command("logout")
 def auth_logout(ctx: typer.Context) -> None:
-    """Clear saved authentication credentials.
+    """Clear saved credentials and revoke the captured Core account session.
+
+    Core sign-out is account-wide, including other signed-in user clients.
+    Organisation API keys are removed locally without revoking the key.
 
     Examples:
       dataplicity auth logout
     """
     state = _ctx(ctx)
-    state.config.clear_tokens()
-    state.config.clear_api_key()
-    state.config.save(state.config_path)
+    from .account_logout import revoke_account
+    proof = state.config.detach_for_logout(state.config.capture_owner())
+    result = revoke_account(proof)
     if state.json_output:
-        _print_json({"ok": True, "detail": "Logged out"})
+        _print_json({"ok": True, "detail": "Logged out", "server_session_revocation": result})
+    elif result == 'failed':
+        state.console.print('Saved credentials cleared. Account sign-out could not be confirmed.')
     else:
         state.console.print("[green]Logged out.[/green]")
 

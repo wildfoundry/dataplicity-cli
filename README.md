@@ -109,6 +109,14 @@ asks you to start again. Configuration updates use a private atomic file and a
 short process lock; a delayed renewal cannot overwrite a newer sign-in. A lost
 renewal response can be retried with the saved recovery identifier.
 
+`dataplicity auth logout` clears saved credentials before contacting the server.
+For a Core user login it also requests account-wide sign-out, including other
+signed-in user clients. It never renews credentials just to sign out. A delayed
+reply cannot overwrite a replacement login. The CLI reports if server sign-out
+could not be confirmed. Organisation API keys are only removed locally.
+Server revocation requires the matching backend session-authority release;
+an already-consumed refresh is accepted only as revocation proof.
+
 Login with email/password:
 
 ```
