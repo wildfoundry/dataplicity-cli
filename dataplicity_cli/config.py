@@ -59,6 +59,13 @@ class RefreshTicket:
     request_id: str
 
 
+@dataclass(frozen=True)
+class LogoutProof:
+    base_url: str = field(repr=False)
+    access: Optional[str] = field(default=None, repr=False)
+    refresh: Optional[str] = field(default=None, repr=False)
+
+
 _AUTH_FIELDS = {"base_url", "auth_method", "access_token", "refresh_token", "api_key"}
 _SECRET_FIELDS = {"auth_method", "access_token", "refresh_token", "api_key"}
 
@@ -284,6 +291,22 @@ class Config:
             record.clear_tokens()
             self._persist_owned(record)
             return self.capture_owner()
+
+    def detach_for_logout(self, owner):
+        """Capture the latest owned proof and clear it in one file transaction.
+
+        Network work must happen after this returns, without a config reference.
+        A waiting rotation or primary login cannot publish into the old owner.
+        """
+        with self._owned_record(owner) as record:
+            jwt = record.auth_method == 'jwt'
+            proof = LogoutProof(record.base_url,
+                record.access_token if jwt and valid_api_credential(record.access_token) else None,
+                record.refresh_token if jwt and valid_api_credential(record.refresh_token) else None)
+            record.clear_tokens()
+            record.clear_api_key()
+            self._persist_owned(record)
+            return proof
 
     def _new_session(self):
         self.local_session_id = str(uuid.uuid4())
