@@ -7,6 +7,7 @@ import json
 import os
 import queue
 import re
+import secrets
 import shutil
 import shlex
 import socket
@@ -22,6 +23,7 @@ from typing import Any, AsyncIterator, Dict, List, NoReturn, Optional, Set, Tupl
 from urllib.parse import parse_qs, urlparse
 
 import typer
+from typer.core import TyperGroup
 from rich.console import Console
 from rich.live import Live
 from rich.markup import escape
@@ -34,11 +36,23 @@ from .terminal import THEME, status_style
 from . import __version__
 from .api import ApiClient, ApiResponse
 from .client_identity import identity_headers
-from .config import Config, default_config_path
+from .config import Config, ConfigError, default_config_path
+from .native_auth import NativeLogin, identity_origin
 from .m2m import M2MClient
 
 
+class _SafeConfigGroup(TyperGroup):
+    def invoke(self, ctx):
+        try:
+            return super().invoke(ctx)
+        except ConfigError as exc:
+            typer.echo(f"Error: {exc}", err=True)
+            raise typer.Exit(code=1) from None
+
+
 app = typer.Typer(
+    cls=_SafeConfigGroup,
+    pretty_exceptions_show_locals=False,
     add_completion=True,
     invoke_without_command=True,
     help=(
@@ -102,12 +116,14 @@ def _ctx(ctx: typer.Context) -> AppContext:
 
 
 @asynccontextmanager
-async def _jwt_keepalive(state: AppContext) -> AsyncIterator[None]:
-    """Keep SSO/JWT access tokens fresh for the lifetime of a long command."""
-    if state.config.auth_method != "jwt" or not state.config.refresh_token:
+async def _jwt_keepalive(state: AppContext, api: Optional[ApiClient] = None) -> AsyncIterator[None]:
+    """Renew only the credential realm actually running the long command."""
+    selected = api if api is not None else state.api
+    selected_config = selected.config if api is not None else state.config
+    if selected_config.auth_method != "jwt" or not selected_config.refresh_token:
         yield
         return
-    task = asyncio.create_task(state.api.maintain_fresh_access_token())
+    task = asyncio.create_task(selected.maintain_fresh_access_token())
     try:
         yield
     finally:
@@ -135,10 +151,6 @@ def _tunnel_control(state: AppContext, organisation: Optional[str], token: Optio
             raise TunnelError("Select an organisation with --org <organisation-hash>.")
         organisation = str(rows[0].get("hash_id") or "")
     api = state.api
-    if token:
-        # Machine credential failure must never refresh or invalidate a human
-        # session saved in the same CLI configuration.
-        api = ApiClient(Config(base_url=state.config.base_url, install_id=state.config.install_id))
     return TunnelAPI(api, organisation, token=token)
 
 
@@ -184,7 +196,7 @@ def _run_tunnel_command(state: AppContext, name: str, operation: Any, *, session
                 live.update(session.stats.render(session.control.organisation, state.console.width, state.console.height), refresh=True)
                 await asyncio.sleep(1)
         try:
-            async with _jwt_keepalive(state):
+            async with _jwt_keepalive(state, session.control.api if session is not None else None):
                 with live if live is not None else nullcontext():
                     refresh_task = asyncio.create_task(refresh()) if live is not None else None
                     try:
@@ -543,65 +555,20 @@ def _extract_sso_tokens(payload: Any) -> Tuple[Optional[str], Optional[str]]:
     return access, refresh
 
 
-def _decode_json_payload(raw: str) -> Optional[Dict[str, Any]]:
-    try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError:
-        return None
-    if isinstance(parsed, dict):
-        return parsed
-    return None
-
-
-def _extract_sso_payload_from_query(query: Dict[str, List[str]]) -> Optional[Dict[str, Any]]:
-    payload: Dict[str, Any] = {}
-    for key in ("access", "refresh", "code", "state", "token"):
-        values = query.get(key)
-        if values:
-            payload[key] = values[0]
-    for key in ("payload", "json", "data"):
-        values = query.get(key)
-        if not values:
-            continue
-        nested = _decode_json_payload(values[0])
-        if nested:
-            payload.update(nested)
-            break
-    return payload if payload else None
-
-
-def _extract_sso_payload_from_url(url: str) -> Optional[Dict[str, Any]]:
-    parsed = urlparse(url)
-    query_payload = _extract_sso_payload_from_query(parse_qs(parsed.query, keep_blank_values=True))
-    fragment_payload = _extract_sso_payload_from_query(parse_qs(parsed.fragment, keep_blank_values=True))
-    if query_payload and fragment_payload:
-        merged = dict(query_payload)
-        merged.update(fragment_payload)
-        return merged
-    return query_payload or fragment_payload
-
-
-def _parse_sso_user_artifact(raw: str) -> Optional[Dict[str, Any]]:
-    text = raw.strip()
-    if not text:
-        return None
-    payload = _decode_json_payload(text)
-    if payload:
-        return payload
-    if text.startswith("http://") or text.startswith("https://"):
-        return _extract_sso_payload_from_url(text)
-    return _extract_sso_payload_from_query(parse_qs(text, keep_blank_values=True))
-
-
 class _SsoCallbackListener:
     def __init__(self) -> None:
-        self._queue: "queue.Queue[Dict[str, Any]]" = queue.Queue()
+        self._queue: "queue.Queue[Dict[str, Any]]" = queue.Queue(maxsize=1)
         self._server: Optional[ThreadingHTTPServer] = None
         self._thread: Optional[threading.Thread] = None
         self.callback_url: Optional[str] = None
+        self.login: Optional[NativeLogin] = None
+        self._nonce = secrets.token_urlsafe(32)
 
     def start(self) -> bool:
         payload_queue = self._queue
+        listener = self
+        capture_lock = threading.Lock()
+        captured = False
 
         class Handler(BaseHTTPRequestHandler):
             def log_message(self, format: str, *args: Any) -> None:  # pragma: no cover
@@ -754,47 +721,57 @@ class _SsoCallbackListener:
                 self.send_response(status)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Referrer-Policy", "no-referrer")
+                self.send_header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; img-src data:; sandbox")
                 self.end_headers()
                 self.wfile.write(body)
 
-            def _capture_payload(self) -> Optional[Dict[str, Any]]:
-                parsed = urlparse(self.path)
-                query_payload = _extract_sso_payload_from_query(parse_qs(parsed.query, keep_blank_values=True))
-                if query_payload:
-                    return query_payload
-                if self.command != "POST":
-                    return None
-                length = int(self.headers.get("Content-Length") or "0")
-                if length <= 0:
-                    return None
-                raw = self.rfile.read(length).decode("utf-8", "ignore")
-                if "application/json" in (self.headers.get("Content-Type") or ""):
-                    return _decode_json_payload(raw)
-                form_payload = _extract_sso_payload_from_query(parse_qs(raw, keep_blank_values=True))
-                return form_payload
-
             def do_GET(self) -> None:  # noqa: N802
-                payload = self._capture_payload()
-                if payload:
-                    payload_queue.put(payload)
-                    self._write_html(200, "Sign-in complete.")
+                nonlocal captured
+                try:
+                    parsed = urlparse(self.path)
+                except ValueError:
+                    self._write_html(400, "Invalid authentication callback.")
                     return
-                self._write_html(200, "Waiting for authentication callback.")
+                path = "/" + listener._nonce
+                if (len(self.path) > 4096 or parsed.scheme or parsed.netloc or parsed.fragment
+                        or self.headers.get_all("Host") != [f"127.0.0.1:{self.server.server_port}"]):
+                    self._write_html(400, "Invalid authentication callback.")
+                    return
+                if parsed.path == path + "/complete" and not parsed.query and captured:
+                    self._write_html(200, "Sign-in handoff received.")
+                    return
+                values = parse_qs(parsed.query, keep_blank_values=True)
+                if (parsed.path != path or listener.login is None
+                        or any(len(value) != 1 for value in values.values())):
+                    self._write_html(400, "Invalid authentication callback.")
+                    return
+                payload = {key: value[0] for key, value in values.items()}
+                if listener.login.accept_payload(payload) is None:
+                    self._write_html(400, "Invalid authentication callback.")
+                    return
+                with capture_lock:
+                    if captured:
+                        self._write_html(410, "Authentication callback already received.")
+                        return
+                    captured = True
+                    payload_queue.put_nowait(payload)
+                self.send_response(303)
+                self.send_header("Location", path + "/complete")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Referrer-Policy", "no-referrer")
+                self.end_headers()
 
             def do_POST(self) -> None:  # noqa: N802
-                payload = self._capture_payload()
-                if payload:
-                    payload_queue.put(payload)
-                    self._write_html(200, "Sign-in complete.")
-                    return
-                self._write_html(400, "No authentication payload was provided.")
+                self._write_html(405, "Use the browser authentication callback.")
 
         try:
             self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         except OSError:
             return False
         host, port = self._server.server_address[:2]
-        self.callback_url = f"http://{host}:{port}/callback"
+        self.callback_url = f"http://{host}:{port}/{self._nonce}"
         self._thread = threading.Thread(target=self._server.serve_forever, kwargs={"poll_interval": 0.2}, daemon=True)
         self._thread.start()
         return True
@@ -817,11 +794,35 @@ def _apply_tokens_or_none(state: AppContext, payload: Any) -> bool:
     access, refresh = _extract_sso_tokens(payload)
     if not access:
         return False
-    state.config.access_token = access
-    state.config.refresh_token = refresh
-    state.config.auth_method = "jwt"
+    state.config.install_user_tokens(access, refresh)
     state.config.save(state.config_path)
+    state.api = ApiClient(state.config)
     return True
+
+
+def _anonymous_identity_api(state: AppContext, origin: str) -> ApiClient:
+    # Never borrow or rotate an existing account's credentials to complete a
+    # different account's primary login. The callback cannot supply this origin.
+    return ApiClient(Config(base_url=identity_origin(origin), install_id=state.config.install_id))
+
+
+def _exchange_native_callback(state: AppContext, listener: _SsoCallbackListener, payload: Any) -> bool:
+    if listener.login is None:
+        return False
+    try:
+        if identity_origin(state.config.base_url) != listener.login.origin:
+            return False
+    except ValueError:
+        return False
+    fields = listener.login.exchange_fields(payload)
+    if fields is None:
+        return False
+    response = _anonymous_identity_api(state, listener.login.origin).post(
+        "/api/auth/native/token/", json_data=fields,
+    )
+    access, refresh = _extract_sso_tokens(response.data)
+    return bool(response.ok and isinstance(access, str) and access
+                and isinstance(refresh, str) and refresh and _apply_tokens_or_none(state, response.data))
 
 
 def _attempt_sso_auto_complete(
@@ -835,8 +836,8 @@ def _attempt_sso_auto_complete(
     deadline = time.monotonic() + max(timeout_seconds, 1)
     while time.monotonic() < deadline:
         payload = listener.wait_for_payload(timeout_seconds=1.0)
-        if payload and _apply_tokens_or_none(state, payload):
-            return True
+        if payload:
+            return _exchange_native_callback(state, listener, payload)
     return False
 
 
@@ -934,7 +935,7 @@ def _second_factor_login_hint(*, has_totp: bool, browser_login_url: Optional[str
 def _looks_like_cli_login_url(url: str) -> bool:
     parsed = urlparse(url)
     query = parse_qs(parsed.query, keep_blank_values=True)
-    return any(key in query for key in ("cli", "cli_state", "cli_callback", "cli_callback_url"))
+    return any(key in query for key in ("native_request",))
 
 
 def _browser_login_url_from_bootstrap(data: Any) -> Optional[str]:
@@ -943,6 +944,12 @@ def _browser_login_url_from_bootstrap(data: Any) -> Optional[str]:
     status = str(data.get("status") or "").strip()
     url = _first_text(data.get("redirect_url") or data.get("login_url") or data.get("browser_login_url"))
     if not url:
+        return None
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+            return None
+    except ValueError:
         return None
     if status in {"sso_redirect", "cli_browser_login"}:
         return url
@@ -955,13 +962,16 @@ def _bootstrap_cli_login(
     state: AppContext,
     email: str,
     *,
-    callback_url: Optional[str] = None,
+    listener: Optional[_SsoCallbackListener] = None,
 ) -> ApiResponse:
     payload: Dict[str, Any] = {"email": email}
-    if callback_url:
-        payload["callback_url"] = callback_url
-        payload["cli_callback"] = callback_url
-    return state.api.post("/api/auth/bootstrap/", json_data=payload)
+    origin = state.config.base_url
+    if listener is not None and listener.callback_url:
+        if listener.login is None:
+            listener.login = NativeLogin(origin, listener.callback_url)
+        payload.update(listener.login.discovery_fields())
+        origin = listener.login.origin
+    return _anonymous_identity_api(state, origin).post("/api/auth/bootstrap/", json_data=payload)
 
 
 def _start_cli_callback_listener() -> Optional[_SsoCallbackListener]:
@@ -1015,7 +1025,7 @@ def _attempt_password_browser_login(
     timeout_seconds = _coerce_timeout_seconds(timeout)
     listener = _start_cli_callback_listener()
     callback_url = listener.callback_url if listener else None
-    response = _bootstrap_cli_login(state, email, callback_url=callback_url)
+    response = _bootstrap_cli_login(state, email, listener=listener)
     if not response.ok:
         if listener:
             listener.stop()
@@ -1846,6 +1856,23 @@ def _normalize_timeline_type_filters(raw_value: Optional[str]) -> List[str]:
     return list(dict.fromkeys(cleaned))
 
 
+def _set_api_recipient(config: Config, base_url: str) -> None:
+    from .api_recipient import recipient_identity
+    selected = base_url.rstrip("/")
+    try:
+        selected_identity = recipient_identity(selected)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc), param_hint="--base-url") from None
+    try:
+        current_identity = recipient_identity(config.base_url)
+    except ValueError:
+        current_identity = None
+    if selected_identity != current_identity:
+        config.clear_tokens()
+        config.clear_api_key()
+    config.base_url = selected
+
+
 @app.callback()
 def main(
     ctx: typer.Context,
@@ -1868,24 +1895,10 @@ def main(
         with suppress(OSError):
             config.save(path)
     if base_url:
-        config.base_url = base_url.rstrip("/")
+        _set_api_recipient(config, base_url)
     console = Console(theme=THEME)
 
-    def _persist_tokens() -> None:
-        config.save(path)
-
-    def _reload_tokens() -> None:
-        # Pick up refresh-token rotations written by another CLI process so a
-        # long-running command (e.g. tunnel publish) can keep refreshing.
-        fresh = Config.load(path)
-        config.auth_method = fresh.auth_method
-        config.access_token = fresh.access_token
-        config.refresh_token = fresh.refresh_token
-        config.api_key = fresh.api_key
-
-    api_client = ApiClient(config, on_token_update=_persist_tokens, on_config_reload=_reload_tokens)
-    if config.auth_method == "jwt" and config.refresh_token:
-        api_client.ensure_fresh_access_token()
+    api_client = ApiClient(config)
     ctx.obj = AppContext(
         config=config,
         config_path=path,
@@ -2124,7 +2137,7 @@ def config_set(
     """
     state = _ctx(ctx)
     if base_url:
-        state.config.base_url = base_url.rstrip("/")
+        _set_api_recipient(state.config, base_url)
     state.config.save(state.config_path)
     if state.json_output:
         _print_json({"ok": True, "base_url": state.config.base_url})
@@ -2166,89 +2179,48 @@ def _attempt_sso_login(
     open_browser: bool = True,
     timeout: int = 180,
 ) -> bool:
-    """Complete browser SSO when the account supports it.
-
-    Returns False if SSO is not enabled so callers can fall back. Other
-    failures raise ``typer.Exit`` after printing an error.
-    """
+    """Authenticate with a PKCE-bound browser code; keep manual handoffs proof-only."""
     state = _ctx(ctx)
     timeout_seconds = _coerce_timeout_seconds(timeout)
-    listener: Optional[_SsoCallbackListener] = None
-    bootstrap_payload: Dict[str, Any] = {"email": email}
-    if open_browser:
-        listener = _SsoCallbackListener()
-        if listener.start() and listener.callback_url:
-            bootstrap_payload["callback_url"] = listener.callback_url
-            if not state.json_output:
-                state.console.print(f"Listening for SSO callback on [blue]{listener.callback_url}[/blue]")
-        else:
-            listener = None
-
-    response = state.api.post("/api/auth/bootstrap/", json_data=bootstrap_payload)
-    if not response.ok:
-        if listener:
-            listener.stop()
-        message = _friendly_response_message("Unable to start SSO.", response.data, response.text)
-        _fail_login(state, message)
-
-    if not isinstance(response.data, dict) or response.data.get("status") != "sso_redirect":
-        if listener:
-            listener.stop()
-        return False
-
-    redirect_url = response.data.get("redirect_url")
-    if not redirect_url:
-        if listener:
-            listener.stop()
-        _fail_login(state, "SSO redirect URL missing.")
-
+    listener = _start_cli_callback_listener()
     try:
+        response = _bootstrap_cli_login(state, email, listener=listener)
+        if not response.ok:
+            _fail_login(state, "Unable to start SSO. Restart sign-in.")
+        if not isinstance(response.data, dict) or response.data.get("status") != "sso_redirect":
+            return False
+        if listener is None or listener.login is None:
+            _fail_login(state, "Unable to start a private browser callback listener.")
+        redirect_url = _browser_login_url_from_bootstrap(response.data)
+        if redirect_url is None:
+            _fail_login(state, "SSO redirect URL missing or invalid.")
+        completed = False
         if open_browser:
             webbrowser.open(redirect_url)
-        if not state.json_output:
-            state.console.print("Waiting for browser sign-in to complete...")
-        if _attempt_sso_auto_complete(state, listener, timeout_seconds=timeout_seconds):
-            state.config.last_email = email
-            state.config.preferred_login_method = "sso"
-            state.config.save(state.config_path)
+            if not state.json_output:
+                state.console.print("Waiting for browser sign-in to complete...")
+            completed = _attempt_sso_auto_complete(state, listener, timeout_seconds=timeout_seconds)
+        if not completed:
             if state.json_output:
-                _print_json({"ok": True, "detail": "SSO login complete"})
-            else:
-                state.console.print("[green]SSO login complete.[/green]")
-            return True
+                _print_json({"ok": False, "detail": "Browser sign-in did not complete. Restart sign-in, or use interactive SSO without --json for a manual code handoff."})
+                raise typer.Exit(code=2)
+            state.console.print("Open this sign-in URL in your browser:")
+            state.console.print(f"[blue]{redirect_url}[/blue]")
+            raw = typer.prompt("Final callback URL or code/state query", hide_input=True)
+            payload = listener.login.parse_artifact(raw)
+            if payload is None or not _exchange_native_callback(state, listener, payload):
+                _fail_login(state, "The sign-in code was not accepted. Restart sign-in.")
+        state.config.last_email = email
+        state.config.preferred_login_method = "sso"
+        state.config.save(state.config_path)
+        if state.json_output:
+            _print_json({"ok": True, "detail": "SSO login complete"})
+        else:
+            state.console.print("[green]SSO login complete.[/green]")
+        return True
     finally:
-        if listener:
+        if listener is not None:
             listener.stop()
-
-    sso_complete_url = state.api._build_url("/api/auth/sso/complete/")
-    if state.json_output:
-        _print_json(
-            {
-                "ok": False,
-                "detail": "Automatic SSO completion timed out. Complete sign-in in your browser and run `dataplicity auth sso` again.",
-                "sso_complete_url": sso_complete_url,
-            }
-        )
-        raise typer.Exit(code=2)
-
-    state.console.print("[yellow]Automatic callback did not complete in time.[/yellow]")
-    state.console.print("Complete SSO in your browser, then open:")
-    state.console.print(f"[blue]{sso_complete_url}[/blue]")
-    state.console.print("Paste either the final browser URL, query string, or JSON payload below.")
-
-    raw = typer.prompt("SSO response")
-    payload = _parse_sso_user_artifact(raw)
-    if payload is None:
-        _show_error(state.console, "Could not parse SSO response.")
-        raise typer.Exit(code=1)
-    if not _apply_tokens_or_none(state, payload):
-        _show_error(state.console, "No access token found in payload.")
-        raise typer.Exit(code=1)
-    state.config.last_email = email
-    state.config.preferred_login_method = "sso"
-    state.config.save(state.config_path)
-    state.console.print("[green]SSO login complete.[/green]")
-    return True
 
 
 @auth_app.command("login")
@@ -2273,7 +2245,8 @@ def auth_login(
             _print_json({"ok": False, "detail": "Password is required in --json mode. Pass `--password`."})
             raise typer.Exit(code=2)
         password = typer.prompt("Password", hide_input=True)
-    bootstrap = state.api.post("/api/auth/bootstrap/", json_data={"email": email})
+    primary_api = ApiClient(Config(base_url=state.config.base_url, install_id=state.config.install_id))
+    bootstrap = primary_api.post("/api/auth/bootstrap/", json_data={"email": email})
     if bootstrap.ok and isinstance(bootstrap.data, dict) and bootstrap.data.get("status") == "sso_redirect":
         if state.json_output:
             message = "SSO is required for this account. Use `dataplicity auth sso --email ...`."
@@ -2300,7 +2273,7 @@ def auth_login(
         _fail_login(state, _webauthn_unsupported_message(), extra={"error_code": "unsupported_mfa_type"})
 
     payload = _password_login_payload(email, password, mfa_code=mfa_code, mfa_type=mfa_type)
-    response = state.api.post("/api/token/", json_data=payload)
+    response = primary_api.post("/api/token/", json_data=payload)
     if not response.ok and _extract_error_code(response.data) == "mfa_required":
         mfa = _extract_mfa_payload(response.data)
         available = _mfa_available_types(mfa)
@@ -2333,7 +2306,7 @@ def auth_login(
         if has_totp:
             mfa_code = typer.prompt("Authenticator app code")
             payload = _password_login_payload(email, password, mfa_code=mfa_code, mfa_type="TOTP")
-            response = state.api.post("/api/token/", json_data=payload)
+            response = primary_api.post("/api/token/", json_data=payload)
         else:
             _fail_login(state, _webauthn_unsupported_message(), extra=extra)
 
@@ -2357,12 +2330,11 @@ def auth_login(
     if not access:
         _fail_login(state, "Login succeeded but no access token was returned.")
 
-    state.config.access_token = access
-    state.config.refresh_token = refresh
-    state.config.auth_method = "jwt"
+    state.config.install_user_tokens(access, refresh)
     state.config.last_email = email
     state.config.preferred_login_method = "email-password"
     state.config.save(state.config_path)
+    state.api = ApiClient(state.config)
     if state.json_output:
         _print_json({"ok": True, "detail": "Logged in"})
     else:
@@ -2404,10 +2376,10 @@ def auth_api_key_set(ctx: typer.Context) -> None:
     """
     state = _ctx(ctx)
     api_key = typer.prompt("API key", hide_input=True)
-    state.config.api_key = api_key.strip()
-    state.config.auth_method = "api_key"
+    state.config.install_api_key(api_key.strip())
     state.config.preferred_login_method = "api-key"
     state.config.save(state.config_path)
+    state.api = ApiClient(state.config)
     if state.json_output:
         _print_json({"ok": True, "detail": "API key saved"})
     else:
@@ -2416,17 +2388,22 @@ def auth_api_key_set(ctx: typer.Context) -> None:
 
 @auth_app.command("logout")
 def auth_logout(ctx: typer.Context) -> None:
-    """Clear saved authentication credentials.
+    """Clear saved credentials and revoke the captured Core account session.
+
+    Core sign-out is account-wide, including other signed-in user clients.
+    Organisation API keys are removed locally without revoking the key.
 
     Examples:
       dataplicity auth logout
     """
     state = _ctx(ctx)
-    state.config.clear_tokens()
-    state.config.clear_api_key()
-    state.config.save(state.config_path)
+    from .account_logout import revoke_account
+    proof = state.config.detach_for_logout(state.config.capture_owner())
+    result = revoke_account(proof)
     if state.json_output:
-        _print_json({"ok": True, "detail": "Logged out"})
+        _print_json({"ok": True, "detail": "Logged out", "server_session_revocation": result})
+    elif result == 'failed':
+        state.console.print('Saved credentials cleared. Account sign-out could not be confirmed.')
     else:
         state.console.print("[green]Logged out.[/green]")
 

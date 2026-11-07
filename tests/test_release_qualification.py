@@ -76,9 +76,15 @@ def test_entire_release_and_distribution_write_dependency_closure_is_guarded():
     assert 'Verify Windows MSI signature' in blocks['build']
 
 
-def test_all_original_build_sign_upload_and_default_release_bytes_are_preserved():
+def test_original_build_sign_upload_and_release_bytes_except_reviewed_runner_migration():
     source = WORKFLOW.read_text()
     assert source.count(INPUT) == 1 and source.count(GUARD) == 1
-    original = source.replace(INPUT, '', 1).replace(GUARD, '', 1).encode()
+    # GitHub retired macOS 14 on 2026-11-02. Permit only this exact build-runner
+    # replacement; retain the original digest over every other workflow byte.
+    runner = '          - name: macos-universal2\n            os: macos-15-intel\n'
+    assert source.count(runner) == 1
+    assert 'macos-14' not in source
+    original = source.replace(INPUT, '', 1).replace(GUARD, '', 1).replace(
+        runner, runner.replace('macos-15-intel', 'macos-14'), 1).encode()
     digest = hashlib.sha1(b'blob ' + str(len(original)).encode() + b'\0' + original).hexdigest()
     assert digest == 'b88e00dcb2bb4beb7597c2896f726efa808b75c6'

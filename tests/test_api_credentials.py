@@ -16,8 +16,11 @@ class CredentialBoundaryTests(unittest.TestCase):
 
     def test_publisher_uses_runtime_without_human_tokens_or_refresh(self):
         api = self.client()
-        TunnelAPI(api, "org", token="machine-secret").request("GET", "bootstrap/")
-        call = api.session.request.call_args
+        publisher = TunnelAPI(api, "org", token="machine-secret")
+        publisher.api.session.request = Mock(return_value=Mock(status_code=200, text="{}", json=Mock(return_value={})))
+        publisher.request("GET", "bootstrap/")
+        call = publisher.api.session.request.call_args
+        api.session.request.assert_not_called()
         self.assertEqual(call.args[1], "https://runtime.dataplicity.com/api/organisations/org/development-tunnels/bootstrap/")
         self.assertEqual(call.kwargs["headers"]["Authorization"], "TunnelPublisher machine-secret")
         self.assertFalse(call.kwargs["allow_redirects"])
@@ -33,9 +36,10 @@ class CredentialBoundaryTests(unittest.TestCase):
 
     def test_rejected_publisher_does_not_erase_saved_human_tokens(self):
         api = self.client()
-        api.session.request.return_value = Mock(status_code=401, text="invalid token", json=Mock(return_value={"detail": "invalid token"}))
+        publisher = TunnelAPI(api, "org", token="revoked-machine")
+        publisher.api.session.request = Mock(return_value=Mock(status_code=401, text="invalid token", json=Mock(return_value={"detail": "invalid token"})))
         with self.assertRaises(TunnelError):
-            TunnelAPI(api, "org", token="revoked-machine").request("GET", "bootstrap/")
+            publisher.request("GET", "bootstrap/")
         self.assertEqual(api.config.access_token, "human-access")
         self.assertEqual(api.config.refresh_token, "human-refresh")
         api.ensure_fresh_access_token.assert_not_called()
