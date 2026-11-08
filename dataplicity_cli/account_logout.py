@@ -1,4 +1,4 @@
-"""Dedicated Core account revocation, independent of the detached local owner."""
+"""Explicit Core sign-in revocation, independent of the detached local owner."""
 import time
 
 import requests
@@ -8,7 +8,7 @@ from .api_recipient import recipient_url
 from .config import LogoutProof
 
 
-def revoke_account(proof: LogoutProof) -> str:
+def revoke_account(proof: LogoutProof, *, everywhere: bool = False) -> str:
     """Never renew, follow redirects, borrow cookies, or write credentials.
 
     The paired backend accepts a consumed refresh only as revocation proof.
@@ -17,7 +17,8 @@ def revoke_account(proof: LogoutProof) -> str:
     if not proof.access and not proof.refresh:
         return 'unavailable'
     try:
-        url = recipient_url(proof.base_url, '/api/auth/logout/')
+        path = '/api/auth/logout/everywhere/' if everywhere else '/api/auth/logout/'
+        url = recipient_url(proof.base_url, path)
     except ValueError:
         return 'unavailable'
     deadline = time.monotonic() + 3.0
