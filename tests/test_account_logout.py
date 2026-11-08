@@ -1,5 +1,6 @@
 """Sign-out detaches before I/O and can never publish into a replacement owner."""
 import json
+import re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import threading
 from unittest.mock import Mock, patch
@@ -250,5 +251,7 @@ def test_successful_everywhere_command_names_its_scope(tmp_path):
 def test_logout_help_describes_explicit_global_scope():
     result = CliRunner().invoke(app, ['auth', 'logout', '--help'])
     assert result.exit_code == 0
-    assert '--everywhere' in result.output
-    assert 'Other apps/devices remain signed in unless' in ' '.join(result.output.split())
+    # Rich splits option text with ANSI styles on CI's coloured terminal.
+    plain = re.sub(r'\x1b\[[0-9;]*m', '', result.output).replace('│', ' ')
+    assert '--everywhere' in plain
+    assert 'Other apps/devices remain signed in unless' in ' '.join(plain.split())
