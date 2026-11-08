@@ -110,8 +110,11 @@ short process lock; a delayed renewal cannot overwrite a newer sign-in. A lost
 renewal response can be retried with the saved recovery identifier.
 
 `dataplicity auth logout` clears saved credentials before contacting the server.
-For a Core user login it also requests account-wide sign-out, including other
-signed-in user clients. It never renews credentials just to sign out. A delayed
+For a Core user login it revokes only that sign-in and its rotated credentials;
+other apps/devices remain signed in. Use `dataplicity auth logout --everywhere`
+to explicitly revoke all sign-ins on the account. That action exits unsuccessfully
+if server revocation is unavailable or cannot be confirmed, even though local
+credentials have been cleared. Neither action renews credentials to sign out. A delayed
 reply cannot overwrite a replacement login. The CLI reports if server sign-out
 could not be confirmed. Organisation API keys are only removed locally.
 Server revocation requires the matching backend session-authority release;

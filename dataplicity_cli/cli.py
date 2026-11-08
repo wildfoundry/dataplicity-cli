@@ -2387,25 +2387,42 @@ def auth_api_key_set(ctx: typer.Context) -> None:
 
 
 @auth_app.command("logout")
-def auth_logout(ctx: typer.Context) -> None:
-    """Clear saved credentials and revoke the captured Core account session.
+def auth_logout(
+    ctx: typer.Context,
+    everywhere: bool = typer.Option(
+        False, "--everywhere", help="Revoke every Core user sign-in on this account."
+    ),
+) -> None:
+    """Clear saved credentials and revoke this Core user sign-in.
 
-    Core sign-out is account-wide, including other signed-in user clients.
+    Other apps/devices remain signed in unless --everywhere is supplied.
     Organisation API keys are removed locally without revoking the key.
 
     Examples:
       dataplicity auth logout
+      dataplicity auth logout --everywhere
     """
     state = _ctx(ctx)
     from .account_logout import revoke_account
     proof = state.config.detach_for_logout(state.config.capture_owner())
-    result = revoke_account(proof)
+    result = revoke_account(proof, everywhere=everywhere)
     if state.json_output:
-        _print_json({"ok": True, "detail": "Logged out", "server_session_revocation": result})
+        detail = 'Logged out' if not everywhere else (
+            'Logged out everywhere' if result == 'revoked' else 'Logged out locally'
+        )
+        _print_json({"ok": not everywhere or result == 'revoked', "detail": detail,
+            "scope": "account" if everywhere else "sign_in", "server_session_revocation": result})
     elif result == 'failed':
-        state.console.print('Saved credentials cleared. Account sign-out could not be confirmed.')
+        scope = 'Account-wide sign-out' if everywhere else 'Server sign-out'
+        state.console.print(f'Saved credentials cleared. {scope} could not be confirmed.')
+    elif everywhere and result == 'unavailable':
+        state.console.print('Saved credentials cleared. Sign out everywhere requires a Core user sign-in.')
+    elif everywhere:
+        state.console.print("[green]Logged out everywhere.[/green]")
     else:
         state.console.print("[green]Logged out.[/green]")
+    if everywhere and result != 'revoked':
+        raise typer.Exit(1)
 
 
 @auth_app.command("status")
