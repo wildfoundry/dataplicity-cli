@@ -574,7 +574,8 @@ async def _legacy_admitted_channel(client, response, device_identity, diagnostic
             or route != [client.identity, port, device_identity, port]):
         diagnostic['admission_failure'] = 'malformed'
         raise LegacyAdmissionMalformed()
-    opened = await client.wait_for_channel_open()
+    # This probe observes the first notification with its own bounded wait.
+    opened = await asyncio.wait_for(client._channel_open_queue.get(), timeout=20.0)
     diagnostic['expected_channel_match'] = type(opened) is int and opened == port
     if type(opened) is not int or opened != port:
         diagnostic['admission_failure'] = 'mismatch'

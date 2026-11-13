@@ -3313,6 +3313,12 @@ def _open_remote_access_port(state: AppContext, device_hash: str, payload: Dict[
     )
 
 
+async def _wait_for_remote_channel(m2m: M2MClient, response: Any, *, timeout: float = 20.0) -> int:
+    data = response.data
+    expected_port = data.get("port") if isinstance(data, dict) else None
+    return await m2m.wait_for_channel_open(expected_port, timeout=timeout)
+
+
 def _resolve_local_port(preferred: Optional[int]) -> int:
     if preferred is not None:
         return preferred
@@ -3354,7 +3360,7 @@ def devices_terminal(ctx: typer.Context, device_hash: Optional[str] = typer.Argu
             )
             if not response.ok:
                 raise RuntimeError(response.text or "Unable to open terminal")
-            channel_port = await m2m.wait_for_channel_open()
+            channel_port = await _wait_for_remote_channel(m2m, response)
             await run_terminal_session(m2m, channel_port)
             await m2m.close()
 
@@ -3443,7 +3449,7 @@ def devices_port_forward(
                         if not response.ok:
                             detail = _friendly_response_message("Unable to open port redirect", response.data, response.text)
                             raise RuntimeError(detail)
-                        return await m2m.wait_for_channel_open()
+                        return await _wait_for_remote_channel(m2m, response)
 
                 channel_port = await open_redirect_channel()
                 forward_task = asyncio.create_task(
@@ -3583,7 +3589,7 @@ def devices_ssh(
                             raise RuntimeError(
                                 _friendly_response_message("Unable to open SSH tunnel.", response.data, response.text)
                             )
-                        return await m2m.wait_for_channel_open(timeout=float(connect_timeout))
+                        return await _wait_for_remote_channel(m2m, response, timeout=float(connect_timeout))
 
                 channel_port = await open_redirect_channel()
                 from .remote_access import run_port_forward
@@ -3685,7 +3691,7 @@ def devices_remote_file(
             )
             if not response.ok:
                 raise RuntimeError(response.text or "Unable to open remote file")
-            channel_port = await m2m.wait_for_channel_open()
+            channel_port = await _wait_for_remote_channel(m2m, response)
             bytes_written = await run_remote_file(
                 m2m,
                 channel_port,
@@ -3785,7 +3791,7 @@ def devices_run(
                 )
                 if not response.ok:
                     raise RuntimeError(response.text or "Unable to open terminal")
-                channel_port = await m2m.wait_for_channel_open(timeout=float(connect_timeout))
+                channel_port = await _wait_for_remote_channel(m2m, response, timeout=float(connect_timeout))
                 if verbose:
                     if timeout_seconds is None:
                         state.console.print("[blue]Running command (no timeout)...[/blue]")
