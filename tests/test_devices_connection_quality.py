@@ -71,7 +71,7 @@ class DevicesConnectionQualityTest(unittest.TestCase):
                 return ApiResponse(False, 404, {"detail": "Not found."}, '{"detail":"Not found."}')
             if path == f"/api/developer/devices/{self.device_hash}/":
                 return ApiResponse(True, 200, {"status": "online", "last_heartbeat": 1719559200000}, "")
-            if path == f"/api/remote/devices/{self.device_hash}/host/":
+            if path == f"/api/developer/devices/{self.device_hash}/host/":
                 return ApiResponse(True, 200, {"m2m_url": "wss://m2m.dataplicity.com/m2m/"}, "")
             raise AssertionError(f"unexpected GET path: {path}")
 

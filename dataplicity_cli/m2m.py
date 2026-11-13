@@ -149,6 +149,7 @@ class M2MClient:
         self._identity_event = asyncio.Event()
         self._closed_event = asyncio.Event()
         self._channel_open_queue: asyncio.Queue[int] = asyncio.Queue()
+        self._claimed_channels: set[int] = set()
         self._channel_queues: Dict[int, asyncio.Queue[Optional[bytes]]] = {}
 
     async def connect(self) -> None:
@@ -173,8 +174,23 @@ class M2MClient:
             raise RuntimeError("identity not available")
         return self.identity
 
-    async def wait_for_channel_open(self, timeout: float = 20.0) -> int:
-        return await asyncio.wait_for(self._channel_open_queue.get(), timeout=timeout)
+    async def wait_for_channel_open(self, expected_port: int, timeout: float = 20.0) -> int:
+        if isinstance(expected_port, bool) or not isinstance(expected_port, int) or expected_port <= 0:
+            raise ValueError("Remote Access response missing a valid channel port")
+
+        async def wait_for_expected_channel() -> int:
+            while True:
+                port = await self._channel_open_queue.get()
+                if port == expected_port:
+                    if port in self._claimed_channels:
+                        raise RuntimeError("Remote Access channel is already in use")
+                    self._claimed_channels.add(port)
+                    return port
+                # Preserve channels that already belong to active flows.
+                if port not in self._claimed_channels:
+                    await self.close_channel(port)
+
+        return await asyncio.wait_for(wait_for_expected_channel(), timeout=timeout)
 
     def channel_queue(self, port: int) -> asyncio.Queue[Optional[bytes]]:
         if port not in self._channel_queues:
@@ -195,7 +211,10 @@ class M2MClient:
         await self.send_packet("route", [port, data])
 
     async def close_channel(self, port: int) -> None:
-        await self.send_packet("request_close", [port])
+        try:
+            await self.send_packet("request_close", [port])
+        finally:
+            self._claimed_channels.discard(port)
 
     async def _receiver(self) -> None:
         if not self.ws:

@@ -119,7 +119,7 @@ class M2MClientFullTest(unittest.IsolatedAsyncioTestCase):
         await client._receiver()
 
         self.assertEqual(client.identity, "identity-2")
-        port = await client.wait_for_channel_open(timeout=0.1)
+        port = await client.wait_for_channel_open(555, timeout=0.1)
         self.assertEqual(port, 555)
         q = client.channel_queue(555)
         self.assertEqual(await asyncio.wait_for(q.get(), timeout=0.1), b"hello")
@@ -154,6 +154,41 @@ class M2MClientFullTest(unittest.IsolatedAsyncioTestCase):
         client = M2MClient("wss://example.test/m2m/")
         await client.close()
         self.assertTrue(client._closed_event.is_set())
+
+    async def test_channel_open_uses_requested_port(self) -> None:
+        client = M2MClient("wss://example.test/m2m/")
+        client.send_packet = AsyncMock()
+        await client._handle_packet(14, [10])
+        self.assertEqual(await client.wait_for_channel_open(10), 10)
+        for port in (10, 20, 30):
+            await client._handle_packet(14, [port])
+        self.assertEqual(await client.wait_for_channel_open(30), 30)
+        client.send_packet.assert_awaited_once_with("request_close", [20])
+        self.assertEqual(client._claimed_channels, {10, 30})
+
+    async def test_channel_open_validates_requested_port(self) -> None:
+        client = M2MClient("wss://example.test/m2m/")
+        for value in (None, True, False, 0, -1, "7", 7.0):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    await client.wait_for_channel_open(value, timeout=0.1)
+
+    async def test_channel_open_requires_an_available_port(self) -> None:
+        client = M2MClient("wss://example.test/m2m/")
+        await client._handle_packet(14, [7])
+        self.assertEqual(await client.wait_for_channel_open(7), 7)
+        await client._handle_packet(14, [7])
+        with self.assertRaises(RuntimeError):
+            await client.wait_for_channel_open(7, timeout=0.1)
+
+    async def test_channel_close_clears_state_after_send_error(self) -> None:
+        client = M2MClient("wss://example.test/m2m/")
+        await client._handle_packet(14, [7])
+        self.assertEqual(await client.wait_for_channel_open(7), 7)
+        client.send_packet = AsyncMock(side_effect=RuntimeError("send failed"))
+        with self.assertRaises(RuntimeError):
+            await client.close_channel(7)
+        self.assertNotIn(7, client._claimed_channels)
 
 
 if __name__ == "__main__":

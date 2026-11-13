@@ -97,6 +97,29 @@ Set the API base URL if you are not using the default:
 dataplicity config set --base-url https://gateway.dataplicity.com
 ```
 
+Use HTTPS for remote API servers; HTTP is supported for loopback development.
+Changing the saved server clears its previous authentication. A one-command
+`--base-url` override uses no credentials saved for a different server; sign in
+to the selected server before using protected commands. An override alone does
+not overwrite the original configuration file.
+
+Commands retain the sign-in they started with. If another process signs in or
+out while a command is waiting, the older command stops using that session and
+asks you to start again. Configuration updates use a private atomic file and a
+short process lock; a delayed renewal cannot overwrite a newer sign-in. A lost
+renewal response can be retried with the saved recovery identifier.
+
+`dataplicity auth logout` clears saved credentials before contacting the server.
+For a Core user login it revokes only that sign-in and its rotated credentials;
+other apps/devices remain signed in. Use `dataplicity auth logout --everywhere`
+to explicitly revoke all sign-ins on the account. That action exits unsuccessfully
+if server revocation is unavailable or cannot be confirmed, even though local
+credentials have been cleared. Neither action renews credentials to sign out. A delayed
+reply cannot overwrite a replacement login. The CLI reports if server sign-out
+could not be confirmed. Organisation API keys are only removed locally.
+Server revocation requires the matching backend session-authority release;
+an already-consumed refresh is accepted only as revocation proof.
+
 Login with email/password:
 
 ```
@@ -112,6 +135,12 @@ SSO login:
 ```
 dataplicity auth sso --email you@example.com
 ```
+
+On remote terminals, use `--no-open-browser` to open the printed sign-in link
+on your workstation, then paste the final code/state callback when prompted.
+The CLI keeps its PKCE verifier locally and exchanges the code at the configured
+HTTPS identity origin. Browser callbacks contain no access or refresh tokens.
+This login flow requires the coordinated native-code backend/frontend release.
 
 Use an organisation API key:
 

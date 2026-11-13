@@ -10,10 +10,30 @@ from typing import Any, Callable, Optional
 from urllib.parse import urlsplit, urlunsplit
 
 from .api import ApiClient
+from .config import Config
 from .client_identity import identity_headers
 from .remote_access import bridge_tcp_channel, run_port_forward, _close_stream_writer
 from .tunnel_transport import TunnelM2MClient
 from .tunnel_dashboard import TunnelStats
+
+
+def publisher_origin(base_url: str) -> str:
+    """Move only known service aliases; explicit private deployments keep theirs."""
+    value = base_url.rstrip('/')
+    try:
+        url = urlsplit(value)
+        if (url.scheme != "https" or url.port not in (None, 443)
+                or url.username is not None or url.password is not None
+                or url.path or url.query or url.fragment):
+            return value
+    except ValueError:
+        return value
+    return {
+        **{f"{host}.dataplicity.com": "https://runtime.dataplicity.com"
+           for host in ("api", "app-api", "gateway")},
+        **{f"{host}.staging.dpenv.com": "https://runtime.staging.dpenv.com"
+           for host in ("api", "app-api", "gateway")},
+    }.get(url.hostname, value)
 
 
 class TunnelError(RuntimeError):
@@ -58,6 +78,10 @@ class TunnelAPI:
         self.api = api
         self.organisation = organisation
         self.base = f"/api/organisations/{organisation}/development-tunnels/"
+        if token:
+            # A publisher has its own recipient, cookie jar and authentication
+            # state. It cannot reload or invalidate the saved human account.
+            self.api = ApiClient(Config(base_url=publisher_origin(api.config.base_url), install_id=api.config.install_id))
         self.headers = {"Authorization": f"TunnelPublisher {token}"} if token else None
         self._request_lock = threading.Lock()
         self._call_lock: Optional[asyncio.Lock] = None

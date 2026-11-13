@@ -55,7 +55,7 @@ class M2MClientTest(unittest.IsolatedAsyncioTestCase):
         client = M2MClient("wss://example.test/m2m/")
         await client._handle_packet(14, [12345])
 
-        port = await asyncio.wait_for(client.wait_for_channel_open(timeout=0.1), timeout=0.2)
+        port = await asyncio.wait_for(client.wait_for_channel_open(12345, timeout=0.1), timeout=0.2)
         self.assertEqual(port, 12345)
 
     async def test_handle_packet_route_normalizes_to_bytes(self) -> None:
