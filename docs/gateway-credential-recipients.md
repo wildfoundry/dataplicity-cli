@@ -59,29 +59,8 @@ newer rotation or erase its recovery receipt. Transport failure preserves the
 input and receipt; the server's replay policy decides whether recovery remains
 valid. Malformed credentials are refused before installation or transmission.
 
-## Validation and limits
+## Validation
 
-Tests exercise real requests URL/header preparation with synthetic responses,
-foreign/sibling recipients and encoded traversal, netrc/session-auth interference,
-recipient changes during admission/renewal, publisher startup/keepalive, public
-primary sign-in and saved-server changes. The initial unchanged-source recipient
-baseline produced 39 failures with six passing tests and six passing subtests.
-Session regression tests additionally exercise real threads and spawned
-processes, competing sign-ins, late success/denial/error replies, conditional
-revocation, lost responses across restart, atomic-write failure, bounded lock
-contention and preference conflicts. The unchanged-source ownership baseline
-reproduced 13 failures with two passing tests. Native Windows locking still
-requires the Windows CI run; a local primitive test alone is insufficient.
+Run the unit suite with its configured coverage gate, the qualification contract checks, and the platform build and installation checks. Tests use synthetic accounts, temporary configuration and loopback services. Do not use personal credentials or production accounts for tests.
 
-Run the complete unit suite with its configured 100% coverage gate, the three
-qualification contract files selected by CI, compile/help smoke checks, and a
-local wheel build. Local tests redirect the default CLI configuration to a
-temporary directory after coverage starts; they do not use real saved credentials.
-Qualification contract tests include an actual loopback TCP bridge. Their success
-is not evidence that an original installed agent passed a staging campaign.
-
-Actual server logout remains separate required work, including the choice
-between per-session and account-wide revocation. Native platform build/signing,
-installed-client journeys and final
-unchanged-agent staging checks remain held. No production or public package,
-installer, Homebrew, WinGet or client-feed publication is authorised here.
+See the README for supported sign-in and sign-out behaviour and backend compatibility requirements.
