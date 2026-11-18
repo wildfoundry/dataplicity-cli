@@ -1,132 +1,117 @@
-from __future__ import annotations
+"""Every command and alias must call only its own developer API resource."""
 
 import json
-import tempfile
-import unittest
+import os
 from pathlib import Path
+import runpy
+import ssl
 from unittest.mock import patch
 
+import pytest
 from typer.testing import CliRunner
 
-from dataplicity_cli.api import ApiResponse
+from dataplicity_cli import _pyinstaller
+from dataplicity_cli.api import ApiClient, ApiResponse
 from dataplicity_cli.cli import app
+from dataplicity_cli.config import Config
 
 
-class FeatureGatedCommandsTest(unittest.TestCase):
-    def setUp(self) -> None:
-        self.runner = CliRunner()
-        self.org_hash = "org-feature-off"
+@pytest.fixture
+def invoke(tmp_path):
+    path = tmp_path / "cli.json"
+    Config(install_id="tests", auth_method="api_key", api_key="fixture").save(path)
 
-    @staticmethod
-    def _write_authed_config(path: Path) -> None:
-        path.write_text(
-            json.dumps(
-                {
-                    "base_url": "https://gateway.dataplicity.com",
-                    "auth_method": "api_key",
-                    "api_key": "test-key",
-                }
-            ),
-            encoding="utf-8",
-        )
-
-    def _devices_payload(self) -> list[dict[str, str]]:
-        return [{"hash_id": "dev-1", "organisation_hash": self.org_hash, "name": "device-1"}]
-
-    def test_fleet_jobs_list_reports_feature_unavailable_for_org(self) -> None:
-        rules_endpoint = f"/api/organisations/{self.org_hash}/incident-automation/rules/"
-
-        def fake_get(_self, path: str, *, params=None):  # type: ignore[no-untyped-def]
-            _ = params
-            if path == "/api/developer/devices/":
-                return ApiResponse(True, 200, self._devices_payload(), "")
-            if path == rules_endpoint:
-                return ApiResponse(False, 404, {"detail": "Not found."}, '{"detail":"Not found."}')
-            raise AssertionError(f"unexpected GET path: {path}")
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            config_path = Path(temp_dir) / "cli.json"
-            self._write_authed_config(config_path)
-            with patch("dataplicity_cli.cli.ApiClient.get", new=fake_get):
-                result = self.runner.invoke(
-                    app,
-                    ["--json", "--config", str(config_path), "fleet-jobs", "list"],
-                )
-
-        self.assertEqual(result.exit_code, 1, msg=result.output)
-        payload = json.loads(result.output)
-        self.assertEqual(
-            payload.get("detail"),
-            f"Fleet jobs are not available for organisation `{self.org_hash}`.",
-        )
-
-    def test_fleet_jobs_show_keeps_not_found_when_feature_exists(self) -> None:
-        rules_endpoint = f"/api/organisations/{self.org_hash}/incident-automation/rules/"
-        job_endpoint = f"{rules_endpoint}job-123/"
-
-        def fake_get(_self, path: str, *, params=None):  # type: ignore[no-untyped-def]
-            _ = params
-            if path == "/api/developer/devices/":
-                return ApiResponse(True, 200, self._devices_payload(), "")
-            if path == job_endpoint:
-                return ApiResponse(False, 404, {"detail": "Not found."}, '{"detail":"Not found."}')
-            if path == rules_endpoint:
-                return ApiResponse(True, 200, [], "[]")
-            raise AssertionError(f"unexpected GET path: {path}")
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            config_path = Path(temp_dir) / "cli.json"
-            self._write_authed_config(config_path)
-            with patch("dataplicity_cli.cli.ApiClient.get", new=fake_get):
-                result = self.runner.invoke(
-                    app,
-                    ["--json", "--config", str(config_path), "fleet-jobs", "show", "job-123"],
-                )
-
-        self.assertEqual(result.exit_code, 1, msg=result.output)
-        payload = json.loads(result.output)
-        self.assertEqual(payload.get("detail"), "Not found.")
-
-    def test_fleet_jobs_run_reports_feature_unavailable_for_org(self) -> None:
-        simulation_endpoint = f"/api/organisations/{self.org_hash}/incident-automation/rule-simulations/"
-
-        def fake_get(_self, path: str, *, params=None):  # type: ignore[no-untyped-def]
-            _ = params
-            if path == "/api/developer/devices/":
-                return ApiResponse(True, 200, self._devices_payload(), "")
-            raise AssertionError(f"unexpected GET path: {path}")
-
-        def fake_post(_self, path: str, *, json_data=None, data=None):  # type: ignore[no-untyped-def]
-            _ = (json_data, data)
-            if path == simulation_endpoint:
-                return ApiResponse(False, 404, {"detail": "Not found."}, '{"detail":"Not found."}')
-            raise AssertionError(f"unexpected POST path: {path}")
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            config_path = Path(temp_dir) / "cli.json"
-            self._write_authed_config(config_path)
-            with patch("dataplicity_cli.cli.ApiClient.get", new=fake_get):
-                with patch("dataplicity_cli.cli.ApiClient.post", new=fake_post):
-                    result = self.runner.invoke(
-                        app,
-                        [
-                            "--json",
-                            "--config",
-                            str(config_path),
-                            "fleet-jobs",
-                            "run",
-                            "--data",
-                            '{"name":"restart-edge","device_hashes":["abc123"],"command":"restart"}',
-                        ],
-                    )
-
-        self.assertEqual(result.exit_code, 1, msg=result.output)
-        payload = json.loads(result.output)
-        self.assertEqual(
-            payload.get("detail"),
-            f"Fleet jobs are not available for organisation `{self.org_hash}`.",
-        )
+    def run(*args):
+        return CliRunner().invoke(app, ["--config", str(path), "--json", *args])
+    return run
 
 
-if __name__ == "__main__":
-    unittest.main()
+@pytest.mark.parametrize("resource,verbs", [
+    ("fleet-jobs", "list ls show get create run cancel delete"),
+    ("endpoint-monitors", "list ls show get create delete"),
+    ("heartbeat-monitors", "list ls show get create delete"),
+    ("user-impact", "list ls show get"),
+])
+@pytest.mark.parametrize("success", [True, False])
+def test_resource_requests(invoke, resource, verbs, success):
+    root = f"/api/developer/{resource}/"
+    detail = root + "abc123/"
+    body = {"command": "uname -a", "device_hashes": ["test-device"]} if resource == "fleet-jobs" else {"name": "monitor"}
+    for verb in verbs.split():
+        args = [resource, verb]
+        row = {"hash_id": "abc123"}
+        if verb in ("ls", "list"):
+            method, endpoint, result = "GET", root, [row]
+        elif verb in ("get", "show"):
+            args.append("abc123")
+            method, endpoint, result = "GET", detail, row
+        elif verb in ("run", "create"):
+            args.extend(["--data", json.dumps(body)])
+            method, endpoint, result = "POST", root, row
+        else:
+            args.append("abc123")
+            method, endpoint = ("POST", detail + "cancel/") if resource == "fleet-jobs" else ("DELETE", detail)
+            result = {"ok": True}
+        payload = result if success else {"detail": "Access denied."}
+        with patch.object(ApiClient, "request", return_value=ApiResponse(success, 200 if success else 403, payload, "")) as send:
+            outcome = invoke(*args)
+        assert outcome.exit_code == (0 if success else 1), (args, outcome.output, outcome.exception)
+        output = json.loads(outcome.output)
+        if success:
+            assert output == result
+        else:
+            assert output["detail"] == "Access denied."
+        send.assert_called_once()
+        assert send.call_args.args == (method, endpoint)
+        if verb in ("run", "create"):
+            assert send.call_args.kwargs["json_data"] == body
+
+
+def test_hook_includes_shell_and_runtime_certificate_policy(tmp_path, monkeypatch):
+    hook = Path(_pyinstaller.get_hook_dirs()[0]) / "hook-dataplicity_cli.py"
+    monkeypatch.setattr(ssl, "__file__", str(tmp_path / "ssl.py"))
+    policy = tmp_path / "codex-rejected-cas.pem"
+    for expected in ([], [(str(policy), ".")]):
+        data = runpy.run_path(str(hook))
+        assert data["datas"] == expected
+        assert f"shellingham.{os.name}" in data["hiddenimports"]
+        policy.touch()
+
+
+def test_transient_recipient_probe_is_anonymous(invoke):
+    with patch("requests.Session.request") as send:
+        send.return_value.status_code = 200
+        send.return_value.json.return_value = {}
+        outcome = invoke("--base-url", "https://alternate.example", "doctor")
+    assert json.loads(outcome.stdout)["checks"][1]["ok"]
+    assert "Authorization" not in send.call_args.kwargs["headers"]
+
+
+def test_http_sso_reports_the_https_requirement(invoke):
+    outcome = invoke("--base-url", "http://127.0.0.1", "auth", "sso", "--email", "qa@example.test", "--no-open-browser")
+    assert outcome.exit_code == 1
+    assert "HTTPS identity origin" in json.loads(outcome.stdout)["detail"]
+
+
+def test_signed_timeline_ids_and_soft_deletion(invoke):
+    event_id = ".signed:event_id-7"
+    row = {"id": event_id, "message": "fixture", "is_invalid": True}
+    with patch.object(ApiClient, "request", return_value=ApiResponse(True, 200, row, "")) as send:
+        result = invoke("devices", "history", "delete", "device", "--event-id", event_id)
+    assert json.loads(result.stdout)["is_deleted"] is True
+    assert send.call_args.args == ("PATCH", f"/api/developer/devices/device/timeline/{event_id}/")
+    data = {"results": [row], "count": 1}
+    with patch.object(ApiClient, "request", return_value=ApiResponse(True, 200, data, "")):
+        assert json.loads(invoke("devices", "history", "list", "device").stdout)["count"] == 0
+        shown = invoke("devices", "history", "show", "device", "--event-id", event_id)
+        assert json.loads(shown.stdout)["id"] == event_id
+        hidden = invoke("devices", "history", "show", "device", "--event-id", event_id, "--exclude-deleted")
+        assert hidden.exit_code == 2
+
+
+@pytest.mark.parametrize("verb", ["get", "post", "request"])
+def test_raw_http_errors_keep_the_response_and_fail(invoke, verb):
+    with patch.object(ApiClient, "request", return_value=ApiResponse(False, 404, {"detail": "missing"}, "")):
+        result = invoke("api", verb, "/api/missing/")
+    assert result.exit_code == 1
+    assert json.loads(result.stdout) == {"detail": "missing"}

@@ -204,10 +204,10 @@ Forward device port 22 to local port 2022:
 dataplicity devices port-forward <device-hash> --remote-port 22 --local-port 2022
 ```
 
-Read a remote file:
+Read a file relative to the device remote-file root, normally `/home/dataplicity/remote`:
 
 ```
-dataplicity devices remote-file <device-hash> --path /etc/os-release --output ./os-release.txt
+dataplicity devices remote-file <device-hash> --path logs/app.log --output ./app.log
 ```
 
 Output JSON for scripting:
@@ -231,7 +231,7 @@ dataplicity user-impact list --unresolved-only
 Run a fleet job:
 
 ```
-dataplicity fleet-jobs run --data '{"name":"restart-edge","device_hashes":["abc123"],"command":"restart"}'
+dataplicity fleet-jobs run --data '{"prompt":"System information","device_hashes":["abc123"],"command":"uname -a"}'
 ```
 
 Query logs:
@@ -263,7 +263,7 @@ dataplicity whoami
 Install shell completion:
 
 ```
-dataplicity --install-completion zsh
+dataplicity --install-completion
 ```
 
 ## Notes

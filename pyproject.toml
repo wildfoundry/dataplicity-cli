@@ -26,6 +26,9 @@ test = [
   "pytest-cov>=7.0.0",
 ]
 
+[project.entry-points.pyinstaller40]
+hook-dirs = "dataplicity_cli._pyinstaller:get_hook_dirs"
+
 [project.scripts]
 dataplicity = "dataplicity_cli.cli:app"
 
