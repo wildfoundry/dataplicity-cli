@@ -144,7 +144,7 @@ jobs:
           updated = re.sub(r'^\s*version\s+"[^"]+"\s*$', f'  version "{version}"', updated, flags=re.MULTILINE)
           path.write_text(updated, encoding="utf-8")
           PY
-          if git diff --quiet -- "${FORMULA_PATH}"; then
+          if git -C homebrew-tap diff --quiet -- "${FORMULA_PATH#homebrew-tap/}"; then
             echo "changed=false" >>"${GITHUB_OUTPUT}"
             echo "Formula is already up to date; skipping PR creation."
           else
