@@ -77,6 +77,15 @@ If you do have Python available and prefer `pipx`:
 pipx install dataplicity-cli
 ```
 
+### macOS installer signing in CI
+
+The Release workflow signs the direct-download package with MachineForest Ltd’s
+Developer ID Installer identity and checks the trusted signature and publisher
+before generating checksums. Configure `MAC_INSTALLER_P12_BASE64` (the encrypted
+PKCS#12 identity encoded as base64) and `MAC_INSTALLER_P12_PASSWORD` in the
+protected `release-signing` environment. A qualification-only run performs the
+same check. A failed signing or verification step blocks publication.
+
 ## Quick start
 
 Guided setup (recommended):

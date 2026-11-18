@@ -159,6 +159,14 @@ jobs:
           chmod +x build/macos/build_pkg.sh
           ./build/macos/build_pkg.sh "${VERSION}" "${{ matrix.macos_arch }}"
 
+      - name: Sign and verify macOS installer
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          MAC_INSTALLER_P12_BASE64: ${{ secrets.MAC_INSTALLER_P12_BASE64 }}
+          MAC_INSTALLER_P12_PASSWORD: ${{ secrets.MAC_INSTALLER_P12_PASSWORD }}
+        run: bash build/macos/sign_installer.sh "dist/dataplicity-cli-${VERSION}-macos-${{ matrix.macos_arch }}.pkg"
+
       - name: Stage macOS release artifacts
         if: runner.os == 'macOS'
         shell: bash
