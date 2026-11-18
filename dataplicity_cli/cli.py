@@ -321,7 +321,7 @@ def tunnel_token_create(
     organisation: Optional[str] = typer.Option(None, "--org"),
     label: Optional[str] = typer.Option(None, "--label"),
     replace: bool = typer.Option(False, "--allow-replace", help="Permit replacing this exact name's current publisher"),
-    expires_at: Optional[str] = typer.Option(None, "--expires-at", help="Optional ISO-8601 expiry"),
+    expires_at: Optional[str] = typer.Option(None, "--expires-at", help="ISO-8601 expiry (defaults to 24 hours)"),
 ) -> None:
     """Issue a scoped credential. Its secret is written to stdout exactly once."""
     from .tunnels import validate_name
@@ -330,8 +330,7 @@ def tunnel_token_create(
     try:
         control = _tunnel_control(state, organisation)
         payload = {"name": validate_name(name), "ports": port, "label": label or name, "can_replace": replace}
-        if expires_at:
-            payload["expires_at"] = expires_at
+        payload["expires_at"] = expires_at or (dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=1)).isoformat()
         issued = control.request("POST", "credentials/", payload=payload)
     except Exception as exc:
         _tunnel_failure(state, exc)
@@ -521,6 +520,7 @@ SENSITIVE_KEYS = {
     "mfa_credential",
     "private_key",
     "provisioning_key",
+    "verification_token",
 }
 
 
@@ -965,7 +965,12 @@ def _bootstrap_cli_login(
     listener: Optional[_SsoCallbackListener] = None,
 ) -> ApiResponse:
     payload: Dict[str, Any] = {"email": email}
-    origin = state.config.base_url
+    try:
+        origin = identity_origin(state.config.base_url)
+    except ValueError as exc:
+        if listener is not None:
+            listener.stop()
+        _fail_login(state, str(exc))
     if listener is not None and listener.callback_url:
         if listener.login is None:
             listener.login = NativeLogin(origin, listener.callback_url)
@@ -1127,57 +1132,6 @@ def _debug_api_request(
     if data:
         payload["data"] = _sanitize_payload(data)
     sys.stderr.write(f"[debug] API request {json.dumps(payload, sort_keys=True)}\n")
-
-
-def _incident_automation_org_hash(endpoint: str) -> str:
-    match = re.search(r"/api/organisations/([^/]+)/", endpoint)
-    if not match:
-        return ""
-    return str(match.group(1) or "").strip()
-
-
-def _is_incident_automation_endpoint(endpoint: str) -> bool:
-    return "/incident-automation/" in endpoint
-
-
-def _is_incident_automation_collection_endpoint(endpoint: str) -> bool:
-    trimmed = endpoint.strip().rstrip("/")
-    match = re.search(r"/incident-automation/([^/]+)$", trimmed)
-    return match is not None
-
-
-def _incident_automation_collection_endpoint(endpoint: str) -> str:
-    if not _is_incident_automation_endpoint(endpoint):
-        return endpoint
-    base = endpoint.split("/incident-automation/", 1)[0]
-    suffix = endpoint.split("/incident-automation/", 1)[1]
-    resource = suffix.strip("/").split("/", 1)[0]
-    return f"{base}/incident-automation/{resource}/"
-
-
-def _incident_automation_feature_unavailable_message(endpoint: str, *, feature_name: str) -> str:
-    org_hash = _incident_automation_org_hash(endpoint)
-    if org_hash:
-        return f"{feature_name} are not available for organisation `{org_hash}`."
-    return f"{feature_name} are not available for this organisation."
-
-
-def _endpoint_error_message(
-    state: AppContext,
-    *,
-    endpoint: str,
-    response: ApiResponse,
-    default_message: str,
-    feature_name: Optional[str] = None,
-) -> str:
-    if response.status_code == 404 and feature_name and _is_incident_automation_endpoint(endpoint):
-        if _is_incident_automation_collection_endpoint(endpoint):
-            return _incident_automation_feature_unavailable_message(endpoint, feature_name=feature_name)
-        probe_endpoint = _incident_automation_collection_endpoint(endpoint)
-        probe = state.api.get(probe_endpoint)
-        if probe.status_code == 404:
-            return _incident_automation_feature_unavailable_message(endpoint, feature_name=feature_name)
-    return _friendly_response_message(default_message, response.data, response.text)
 
 
 def _normalize_email(value: Optional[str]) -> str:
@@ -1809,17 +1763,16 @@ def _extract_timeline_rows(payload: Any) -> List[Dict[str, Any]]:
     return []
 
 
-def _timeline_event_id(row: Dict[str, Any]) -> Optional[int]:
+def _timeline_deleted(row: Dict[str, Any]) -> bool:
+    return bool(row.get("is_invalid") or row.get("is_deleted"))
+
+
+def _timeline_event_id(row: Dict[str, Any]) -> Optional[str]:
     raw = row.get("id")
-    if isinstance(raw, int):
-        return raw
-    if isinstance(raw, str):
-        with suppress(ValueError):
-            return int(raw)
-    return None
+    return str(raw) if isinstance(raw, (str, int)) else None
 
 
-def _timeline_entry_not_found_message(event_id: int) -> str:
+def _timeline_entry_not_found_message(event_id: str) -> str:
     return (
         f"History entry `{event_id}` was not found in the latest device timeline window. "
         "Use `devices history list --limit 500 --include-deleted` to inspect more rows."
@@ -1856,7 +1809,7 @@ def _normalize_timeline_type_filters(raw_value: Optional[str]) -> List[str]:
     return list(dict.fromkeys(cleaned))
 
 
-def _set_api_recipient(config: Config, base_url: str) -> None:
+def _set_api_recipient(config: Config, base_url: str) -> bool:
     from .api_recipient import recipient_identity
     selected = base_url.rstrip("/")
     try:
@@ -1871,6 +1824,7 @@ def _set_api_recipient(config: Config, base_url: str) -> None:
         config.clear_tokens()
         config.clear_api_key()
     config.base_url = selected
+    return selected_identity != current_identity
 
 
 @app.callback()
@@ -1894,11 +1848,13 @@ def main(
     if config.ensure_install_id():
         with suppress(OSError):
             config.save(path)
-    if base_url:
-        _set_api_recipient(config, base_url)
+    changed_recipient = bool(base_url and _set_api_recipient(config, base_url))
     console = Console(theme=THEME)
 
-    api_client = ApiClient(config)
+    # Requests to an explicitly overridden recipient start anonymous. Keep the
+    # loaded config for compare-and-save if the user explicitly signs in there.
+    api_config = Config(base_url=config.base_url, install_id=config.install_id) if changed_recipient else config
+    api_client = ApiClient(api_config)
     ctx.obj = AppContext(
         config=config,
         config_path=path,
@@ -2538,39 +2494,6 @@ def _resolve_primary_org_hash(state: AppContext) -> str:
     raise typer.Exit(code=1)
 
 
-def _incident_automation_endpoint(state: AppContext, resource: str) -> str:
-    org_hash = _resolve_primary_org_hash(state)
-    suffix = resource.strip("/")
-    return f"/api/organisations/{org_hash}/incident-automation/{suffix}/"
-
-
-def _show_item_from_list_payload(
-    state: AppContext,
-    payload: Any,
-    *,
-    resource_id: str,
-    label: str,
-) -> None:
-    rows = _extract_objects(payload)
-    item = next((row for row in rows if str(row.get("id") or row.get("hash_id") or "") == resource_id), None)
-    if not item:
-        message = f"{label.title()} `{resource_id}` not found."
-        if state.json_output:
-            _print_json({"ok": False, "detail": message})
-        else:
-            _show_error(state.console, message)
-        raise typer.Exit(code=2)
-    if state.json_output:
-        _print_json(item)
-        return
-    table = Table(title=f"{label.title()} {resource_id}")
-    table.add_column("Key")
-    table.add_column("Value")
-    for key, value in item.items():
-        table.add_row(str(key), json.dumps(_sanitize_payload(value)))
-    state.console.print(table)
-
-
 @orgs_app.command("show")
 def orgs_show(
     ctx: typer.Context,
@@ -2681,6 +2604,14 @@ def devices_list(
 
     payload = response.data or []
     if state.json_output:
+        if online_only:
+            if isinstance(payload, dict):
+                payload = dict(payload)
+                for key in ("devices", "limited_devices", "results"):
+                    if isinstance(payload.get(key), list):
+                        payload[key] = [row for row in payload[key] if isinstance(row, dict) and _device_is_online(row)]
+            else:
+                payload = [row for row in _extract_devices(payload) if isinstance(row, dict) and _device_is_online(row)]
         _print_json(payload)
         return
 
@@ -2762,8 +2693,8 @@ def devices_show(ctx: typer.Context, device_hash: Optional[str] = typer.Argument
     table.add_column("Key")
     table.add_column("Value")
     if isinstance(response.data, dict):
-        for key, value in response.data.items():
-            table.add_row(str(key), json.dumps(_sanitize_payload(value)))
+        for key, value in _sanitize_payload(response.data).items():
+            table.add_row(str(key), json.dumps(value))
     state.console.print(table)
 
 
@@ -2823,11 +2754,14 @@ def devices_history_list(
         raise typer.Exit(code=1)
 
     payload = response.data or {}
+    rows = _extract_timeline_rows(payload)
+    if not include_deleted:
+        rows = [row for row in rows if not _timeline_deleted(row)]
     if state.json_output:
-        _print_json(payload)
+        result = {**payload, "results": rows, "count": len(rows)} if isinstance(payload, dict) else rows
+        _print_json(result)
         return
 
-    rows = _extract_timeline_rows(payload)
     table = Table(title=f"Device history: {resolved_hash}")
     table.add_column("ID", style="cyan")
     table.add_column("Timestamp")
@@ -2843,7 +2777,7 @@ def devices_history_list(
         entry_type = str(row.get("type") or "")
         author = str(row.get("author_display") or row.get("author_username") or "")
         message = str(row.get("message") or "")
-        deleted = bool(row.get("is_deleted"))
+        deleted = _timeline_deleted(row)
         table.add_row(
             str(event_id or ""),
             timestamp,
@@ -2862,7 +2796,7 @@ def devices_history_list(
 def devices_history_show(
     ctx: typer.Context,
     device_hash: Optional[str] = typer.Argument(None),
-    event_id: int = typer.Option(..., "--event-id", "-e", help="Timeline event ID"),
+    event_id: str = typer.Option(..., "--event-id", "-e", help="Timeline event ID"),
     include_deleted: bool = typer.Option(True, "--include-deleted/--exclude-deleted", help="Include deleted comments"),
 ) -> None:
     """Show one history entry for a device.
@@ -2889,7 +2823,7 @@ def devices_history_show(
         raise typer.Exit(code=1)
 
     rows = _extract_timeline_rows(response.data or {})
-    row = next((item for item in rows if _timeline_event_id(item) == event_id), None)
+    row = next((item for item in rows if _timeline_event_id(item) == event_id and (include_deleted or not _timeline_deleted(item))), None)
     if not row:
         message = _timeline_entry_not_found_message(event_id)
         if state.json_output:
@@ -2999,7 +2933,7 @@ def devices_history_comment(
 def devices_history_delete(
     ctx: typer.Context,
     device_hash: Optional[str] = typer.Argument(None),
-    event_id: int = typer.Option(..., "--event-id", "-e", help="Timeline event ID"),
+    event_id: str = typer.Option(..., "--event-id", "-e", help="Timeline event ID"),
 ) -> None:
     """Mark a history comment as deleted (soft delete).
 
@@ -3010,7 +2944,7 @@ def devices_history_delete(
     state = _ctx(ctx)
     _require_auth(state)
     resolved_hash = _resolve_device_hash_interactive(state, device_hash, action_name="history delete")
-    endpoint = f"/api/developer/devices/{resolved_hash}/timeline/{event_id}/"
+    endpoint = f"/api/developer/devices/{resolved_hash}/timeline/{_resource_id(event_id)}/"
     _debug_api_request(state, method="PATCH", path=endpoint)
     response = state.api.request(
         "PATCH",
@@ -3024,7 +2958,9 @@ def devices_history_delete(
             _show_error(state.console, message)
         raise typer.Exit(code=1)
 
-    row = response.data if isinstance(response.data, dict) else {"id": event_id, "is_deleted": True}
+    row = dict(response.data) if isinstance(response.data, dict) else {"id": event_id, "is_deleted": True}
+    if "is_invalid" in row:
+        row["is_deleted"] = _timeline_deleted(row)
     if state.json_output:
         _print_json(row)
         return
@@ -3043,7 +2979,7 @@ def devices_history_delete(
 def devices_history_mark_deleted(
     ctx: typer.Context,
     device_hash: Optional[str] = typer.Argument(None),
-    event_id: int = typer.Option(..., "--event-id", "-e", help="Timeline event ID"),
+    event_id: str = typer.Option(..., "--event-id", "-e", help="Timeline event ID"),
 ) -> None:
     """Alias for `devices history delete`."""
     devices_history_delete(ctx, device_hash=device_hash, event_id=event_id)
@@ -3071,22 +3007,10 @@ def devices_wormhole_status(ctx: typer.Context, device_hash: Optional[str] = typ
     state = _ctx(ctx)
     _require_auth(state)
     resolved_hash = _resolve_device_hash_interactive(state, device_hash, action_name="wormhole status")
-    detail_response = state.api.get(f"/api/developer/devices/{resolved_hash}/")
-    payload = {}
-    if detail_response.ok and isinstance(detail_response.data, dict):
-        detail = detail_response.data
-        payload = {
-            "wormhole_enabled": bool(detail.get("wormhole_enabled")),
-            "wormhole_disabled_by_admin": bool(detail.get("wormhole_disabled_by_admin")),
-            "slug": detail.get("wormhole_slug"),
-            "probe_status": "unknown",
-            "last_access": None,
-            "request_count": None,
-            "error_count": None,
-            "top_paths": [],
-        }
-    if not payload:
-        message = _friendly_response_message("Unable to fetch wormhole status.", detail_response.data, detail_response.text)
+    response = state.api.get(f"/api/developer/devices/{_resource_id(resolved_hash)}/wormhole/status/")
+    payload = response.data
+    if not response.ok or not isinstance(payload, dict):
+        message = _friendly_response_message("Unable to fetch wormhole status.", response.data, response.text)
         if state.json_output:
             _print_json({"ok": False, "detail": message})
         else:
@@ -3104,8 +3028,8 @@ def devices_wormhole_status(ctx: typer.Context, device_hash: Optional[str] = typ
     table.add_row("slug", str(payload.get("slug") or ""))
     table.add_row("probe_status", str(payload.get("probe_status") or ""))
     table.add_row("last_access", str(payload.get("last_access") or ""))
-    table.add_row("request_count", str(payload.get("request_count") or 0))
-    table.add_row("error_count", str(payload.get("error_count") or 0))
+    table.add_row("request_count", str(payload["request_count"]) if payload.get("request_count") is not None else "unknown")
+    table.add_row("error_count", str(payload["error_count"]) if payload.get("error_count") is not None else "unknown")
     state.console.print(table)
 
     top_paths = payload.get("top_paths")
@@ -3223,16 +3147,10 @@ def devices_reboot(ctx: typer.Context, device_hash: Optional[str] = typer.Argume
     """
     state = _ctx(ctx)
     _require_auth(state)
-    _resolve_device_hash_interactive(state, device_hash, action_name="reboot")
-    message = (
-        "Device reboot API is not published on this gateway. "
-        "Use `dataplicity devices run --command \"sudo reboot\"` if your device policy allows shell reboot."
-    )
-    if state.json_output:
-        _print_json({"ok": False, "detail": message})
-    else:
-        _show_error(state.console, message)
-    raise typer.Exit(code=2)
+    device = _resolve_device_hash_interactive(state, device_hash, action_name="reboot")
+    response = state.api.post(f"/api/developer/devices/{_resource_id(device)}/execute_command/",
+                              json_data={"command": "restart"})
+    _write_api_response(state, response)
 
 
 @devices_app.command("provisioning-key")
@@ -3646,11 +3564,11 @@ def devices_remote_file(
     output: Optional[Path] = typer.Option(None, "--output", help="Write file content to a path"),
     stdout: bool = typer.Option(False, "--stdout", help="Write file content to stdout"),
 ) -> None:
-    """Read a remote file via secure relay.
+    """Read a file under the device remote-file root (/home/dataplicity/remote).
 
     Examples:
-      dataplicity devices remote-file --path /etc/os-release --stdout
-      dataplicity devices remote-file <device-hash> --path /var/log/syslog --output ./syslog.txt
+      dataplicity devices remote-file --path qa-marker.txt --stdout
+      dataplicity devices remote-file <device-hash> --path logs/app.log --output ./app.log
     """
     state = _ctx(ctx)
     _require_auth(state)
@@ -3862,6 +3780,15 @@ def top_level_connect(ctx: typer.Context, device_hash: Optional[str] = typer.Arg
     devices_terminal(ctx, device_hash=device_hash)
 
 
+def _write_api_response(state: AppContext, response: ApiResponse) -> None:
+    value = response.data
+    if value is None:
+        value = {"ok": response.ok} if state.json_output else response.text
+    _print_json(value)
+    if not response.ok:
+        raise typer.Exit(code=1)
+
+
 def _parse_kv_pairs(items: Optional[List[str]]) -> Dict[str, Any]:
     payload: Dict[str, Any] = {}
     for item in items or []:
@@ -3904,7 +3831,7 @@ def _extract_objects(payload: Any) -> List[Dict[str, Any]]:
 
 
 def _resource_key(item: Dict[str, Any]) -> str:
-    for key in ("hash_id", "id", "uuid", "slug", "name"):
+    for key in ("job_id", "hash_id", "id", "uuid", "slug", "name"):
         value = item.get(key)
         if value is not None:
             text = str(value).strip()
@@ -3957,33 +3884,44 @@ def _render_resource_table(state: AppContext, title: str, payload: Any) -> None:
     state.console.print(f"Showing {len(rows)} results.")
 
 
+def _resource_id(value: str) -> str:
+    if not re.fullmatch(r"[A-Za-z0-9_.:-]+", value) or value in {".", ".."}:
+        raise typer.BadParameter("Expected a resource identifier.")
+    return value
+
+
 def _list_resource(
     state: AppContext,
     *,
     endpoint: str,
     title: str,
+    limit: int,
+    search: Optional[str] = None,
+    status: Optional[str] = None,
+    unresolved_only: bool = False,
     params: Optional[Dict[str, Any]] = None,
-    feature_name: Optional[str] = None,
 ) -> None:
     _require_auth(state)
     response = state.api.get(endpoint, params=params)
     if not response.ok:
-        message = _endpoint_error_message(
-            state,
-            endpoint=endpoint,
-            response=response,
-            default_message=f"Unable to list {title.lower()}.",
-            feature_name=feature_name,
-        )
+        message = _friendly_response_message(f"Unable to list {title.lower()}.", response.data, response.text)
         if state.json_output:
             _print_json({"ok": False, "detail": message})
         else:
             _show_error(state.console, message)
         raise typer.Exit(code=1)
+    rows = _extract_objects(response.data)
+    if search:
+        rows = [row for row in rows if search.casefold() in json.dumps(row).casefold()]
+    if status:
+        rows = [row for row in rows if _resource_status(row).casefold() == status.casefold()]
+    if unresolved_only:
+        rows = [row for row in rows if row.get("last_error")]
+    rows = rows[:limit]
     if state.json_output:
-        _print_json(response.data or [])
+        _print_json(rows)
         return
-    _render_resource_table(state, title, response.data or [])
+    _render_resource_table(state, title, rows)
 
 
 def _show_resource(
@@ -3992,19 +3930,12 @@ def _show_resource(
     endpoint: str,
     resource_id: str,
     not_found_label: str,
-    feature_name: Optional[str] = None,
 ) -> None:
     _require_auth(state)
-    request_endpoint = f"{endpoint}{resource_id}/"
+    request_endpoint = f"{endpoint}{_resource_id(resource_id)}/"
     response = state.api.get(request_endpoint)
     if not response.ok:
-        message = _endpoint_error_message(
-            state,
-            endpoint=request_endpoint,
-            response=response,
-            default_message=f"Unable to fetch {not_found_label}.",
-            feature_name=feature_name,
-        )
+        message = _friendly_response_message(f"Unable to fetch {not_found_label}.", response.data, response.text)
         if state.json_output:
             _print_json({"ok": False, "detail": message})
         else:
@@ -4017,8 +3948,8 @@ def _show_resource(
     table.add_column("Key")
     table.add_column("Value")
     if isinstance(response.data, dict):
-        for key, value in response.data.items():
-            table.add_row(str(key), json.dumps(_sanitize_payload(value)))
+        for key, value in _sanitize_payload(response.data).items():
+            table.add_row(str(key), json.dumps(value))
     state.console.print(table)
 
 
@@ -4028,19 +3959,12 @@ def _create_resource(
     endpoint: str,
     data: str,
     label: str,
-    feature_name: Optional[str] = None,
 ) -> None:
     _require_auth(state)
     payload = _parse_json_payload_or_exit(state, data)
     response = state.api.post(endpoint, json_data=payload)
     if not response.ok:
-        message = _endpoint_error_message(
-            state,
-            endpoint=endpoint,
-            response=response,
-            default_message=f"Unable to create {label}.",
-            feature_name=feature_name,
-        )
+        message = _friendly_response_message(f"Unable to create {label}.", response.data, response.text)
         if state.json_output:
             _print_json({"ok": False, "detail": message})
         else:
@@ -4058,19 +3982,12 @@ def _delete_resource(
     endpoint: str,
     resource_id: str,
     label: str,
-    feature_name: Optional[str] = None,
 ) -> None:
     _require_auth(state)
-    request_endpoint = f"{endpoint}{resource_id}/"
+    request_endpoint = f"{endpoint}{_resource_id(resource_id)}/"
     response = state.api.request("DELETE", request_endpoint)
     if not response.ok:
-        message = _endpoint_error_message(
-            state,
-            endpoint=request_endpoint,
-            response=response,
-            default_message=f"Unable to delete {label}.",
-            feature_name=feature_name,
-        )
+        message = _friendly_response_message(f"Unable to delete {label}.", response.data, response.text)
         if state.json_output:
             _print_json({"ok": False, "detail": message})
         else:
@@ -4094,32 +4011,8 @@ def endpoint_monitors_list(
       dataplicity endpoint-monitors list
       dataplicity endpoint-monitors list --search production
     """
-    state = _ctx(ctx)
-    _require_auth(state)
-    endpoint = _incident_automation_endpoint(state, "signals")
-    response = state.api.get(endpoint)
-    if not response.ok:
-        message = _endpoint_error_message(
-            state,
-            endpoint=endpoint,
-            response=response,
-            default_message="Unable to list endpoint monitors.",
-            feature_name="Endpoint monitors",
-        )
-        if state.json_output:
-            _print_json({"ok": False, "detail": message})
-        else:
-            _show_error(state.console, message)
-        raise typer.Exit(code=1)
-    rows = [row for row in _extract_objects(response.data or []) if str(row.get("kind") or "").lower() == "service"]
-    if search:
-        search_lower = search.lower()
-        rows = [row for row in rows if search_lower in json.dumps(row).lower()]
-    rows = rows[:page_size]
-    if state.json_output:
-        _print_json(rows)
-        return
-    _render_resource_table(state, "Endpoint monitors", rows)
+    _list_resource(_ctx(ctx), endpoint="/api/developer/endpoint-monitors/", title="Endpoint monitors",
+                   limit=page_size, search=search)
 
 
 @endpoint_monitors_app.command("ls")
@@ -4139,25 +4032,8 @@ def endpoint_monitors_show(ctx: typer.Context, monitor_id: str = typer.Argument(
     Examples:
       dataplicity endpoint-monitors show <monitor-id>
     """
-    state = _ctx(ctx)
-    _require_auth(state)
-    endpoint = _incident_automation_endpoint(state, "signals")
-    response = state.api.get(endpoint)
-    if not response.ok:
-        message = _endpoint_error_message(
-            state,
-            endpoint=endpoint,
-            response=response,
-            default_message="Unable to fetch endpoint monitor.",
-            feature_name="Endpoint monitors",
-        )
-        if state.json_output:
-            _print_json({"ok": False, "detail": message})
-        else:
-            _show_error(state.console, message)
-        raise typer.Exit(code=1)
-    rows = [row for row in _extract_objects(response.data or []) if str(row.get("kind") or "").lower() == "service"]
-    _show_item_from_list_payload(state, rows, resource_id=monitor_id, label="endpoint monitor")
+    _show_resource(_ctx(ctx), endpoint="/api/developer/endpoint-monitors/", resource_id=monitor_id,
+                   not_found_label="endpoint monitor")
 
 
 @endpoint_monitors_app.command("get")
@@ -4176,29 +4052,7 @@ def endpoint_monitors_create(
     Examples:
       dataplicity endpoint-monitors create --data '{"name":"api-check","url":"https://example.com/health"}'
     """
-    state = _ctx(ctx)
-    _require_auth(state)
-    payload = _parse_json_payload_or_exit(state, data)
-    payload.setdefault("kind", "service")
-    endpoint = _incident_automation_endpoint(state, "rules")
-    response = state.api.post(endpoint, json_data=payload)
-    if not response.ok:
-        message = _endpoint_error_message(
-            state,
-            endpoint=endpoint,
-            response=response,
-            default_message="Unable to create endpoint monitor.",
-            feature_name="Endpoint monitors",
-        )
-        if state.json_output:
-            _print_json({"ok": False, "detail": message})
-        else:
-            _show_error(state.console, message)
-        raise typer.Exit(code=1)
-    if state.json_output:
-        _print_json(response.data or {"ok": True})
-    else:
-        state.console.print("[green]Endpoint monitor created.[/green]")
+    _create_resource(_ctx(ctx), endpoint="/api/developer/endpoint-monitors/", data=data, label="endpoint monitor")
 
 
 @endpoint_monitors_app.command("delete")
@@ -4208,14 +4062,8 @@ def endpoint_monitors_delete(ctx: typer.Context, monitor_id: str = typer.Argumen
     Examples:
       dataplicity endpoint-monitors delete <monitor-id>
     """
-    state = _ctx(ctx)
-    _delete_resource(
-        state,
-        endpoint=_incident_automation_endpoint(state, "rules"),
-        resource_id=monitor_id,
-        label="endpoint monitor",
-        feature_name="Endpoint monitors",
-    )
+    _delete_resource(_ctx(ctx), endpoint="/api/developer/endpoint-monitors/", resource_id=monitor_id,
+                     label="endpoint monitor")
 
 
 @user_impact_app.command("list")
@@ -4230,31 +4078,8 @@ def user_impact_list(
       dataplicity user-impact list
       dataplicity user-impact list --unresolved-only
     """
-    state = _ctx(ctx)
-    _require_auth(state)
-    endpoint = _incident_automation_endpoint(state, "signals")
-    response = state.api.get(endpoint)
-    if not response.ok:
-        message = _endpoint_error_message(
-            state,
-            endpoint=endpoint,
-            response=response,
-            default_message="Unable to list user impact.",
-            feature_name="User impact signals",
-        )
-        if state.json_output:
-            _print_json({"ok": False, "detail": message})
-        else:
-            _show_error(state.console, message)
-        raise typer.Exit(code=1)
-    payload = [row for row in _extract_objects(response.data or []) if str(row.get("kind") or "").lower() == "user-impact"]
-    if unresolved_only:
-        payload = [row for row in payload if str(row.get("sentiment") or "").strip().lower() not in {"ok", "healthy", "resolved"}]
-    payload = payload[:page_size]
-    if state.json_output:
-        _print_json(payload)
-        return
-    _render_resource_table(state, "User impact", payload)
+    _list_resource(_ctx(ctx), endpoint="/api/developer/user-impact/", title="User impact",
+                   limit=page_size, unresolved_only=unresolved_only)
 
 
 @user_impact_app.command("ls")
@@ -4274,25 +4099,8 @@ def user_impact_show(ctx: typer.Context, impact_id: str = typer.Argument(...)) -
     Examples:
       dataplicity user-impact show <impact-id>
     """
-    state = _ctx(ctx)
-    _require_auth(state)
-    endpoint = _incident_automation_endpoint(state, "signals")
-    response = state.api.get(endpoint)
-    if not response.ok:
-        message = _endpoint_error_message(
-            state,
-            endpoint=endpoint,
-            response=response,
-            default_message="Unable to fetch user impact item.",
-            feature_name="User impact signals",
-        )
-        if state.json_output:
-            _print_json({"ok": False, "detail": message})
-        else:
-            _show_error(state.console, message)
-        raise typer.Exit(code=1)
-    rows = [row for row in _extract_objects(response.data or []) if str(row.get("kind") or "").lower() == "user-impact"]
-    _show_item_from_list_payload(state, rows, resource_id=impact_id, label="user impact item")
+    _show_resource(_ctx(ctx), endpoint="/api/developer/user-impact/", resource_id=impact_id,
+                   not_found_label="user impact item")
 
 
 @user_impact_app.command("get")
@@ -4313,32 +4121,8 @@ def heartbeat_monitors_list(
       dataplicity heartbeat-monitors list
       dataplicity heartbeat-monitors list --search cron
     """
-    state = _ctx(ctx)
-    _require_auth(state)
-    endpoint = _incident_automation_endpoint(state, "signals")
-    response = state.api.get(endpoint)
-    if not response.ok:
-        message = _endpoint_error_message(
-            state,
-            endpoint=endpoint,
-            response=response,
-            default_message="Unable to list heartbeat monitors.",
-            feature_name="Heartbeat monitors",
-        )
-        if state.json_output:
-            _print_json({"ok": False, "detail": message})
-        else:
-            _show_error(state.console, message)
-        raise typer.Exit(code=1)
-    payload = [row for row in _extract_objects(response.data or []) if str(row.get("kind") or "").lower() == "heartbeat"]
-    if search:
-        search_lower = search.lower()
-        payload = [row for row in payload if search_lower in json.dumps(row).lower()]
-    payload = payload[:page_size]
-    if state.json_output:
-        _print_json(payload)
-        return
-    _render_resource_table(state, "Heartbeat monitors", payload)
+    _list_resource(_ctx(ctx), endpoint="/api/developer/heartbeat-monitors/", title="Heartbeat monitors",
+                   limit=page_size, search=search)
 
 
 @heartbeat_monitors_app.command("ls")
@@ -4358,25 +4142,8 @@ def heartbeat_monitors_show(ctx: typer.Context, monitor_id: str = typer.Argument
     Examples:
       dataplicity heartbeat-monitors show <monitor-id>
     """
-    state = _ctx(ctx)
-    _require_auth(state)
-    endpoint = _incident_automation_endpoint(state, "signals")
-    response = state.api.get(endpoint)
-    if not response.ok:
-        message = _endpoint_error_message(
-            state,
-            endpoint=endpoint,
-            response=response,
-            default_message="Unable to fetch heartbeat monitor.",
-            feature_name="Heartbeat monitors",
-        )
-        if state.json_output:
-            _print_json({"ok": False, "detail": message})
-        else:
-            _show_error(state.console, message)
-        raise typer.Exit(code=1)
-    rows = [row for row in _extract_objects(response.data or []) if str(row.get("kind") or "").lower() == "heartbeat"]
-    _show_item_from_list_payload(state, rows, resource_id=monitor_id, label="heartbeat monitor")
+    _show_resource(_ctx(ctx), endpoint="/api/developer/heartbeat-monitors/", resource_id=monitor_id,
+                   not_found_label="heartbeat monitor")
 
 
 @heartbeat_monitors_app.command("get")
@@ -4395,29 +4162,7 @@ def heartbeat_monitors_create(
     Examples:
       dataplicity heartbeat-monitors create --data '{"name":"daily-job","interval_seconds":86400}'
     """
-    state = _ctx(ctx)
-    _require_auth(state)
-    payload = _parse_json_payload_or_exit(state, data)
-    payload.setdefault("kind", "heartbeat")
-    endpoint = _incident_automation_endpoint(state, "rules")
-    response = state.api.post(endpoint, json_data=payload)
-    if not response.ok:
-        message = _endpoint_error_message(
-            state,
-            endpoint=endpoint,
-            response=response,
-            default_message="Unable to create heartbeat monitor.",
-            feature_name="Heartbeat monitors",
-        )
-        if state.json_output:
-            _print_json({"ok": False, "detail": message})
-        else:
-            _show_error(state.console, message)
-        raise typer.Exit(code=1)
-    if state.json_output:
-        _print_json(response.data or {"ok": True})
-    else:
-        state.console.print("[green]Heartbeat monitor created.[/green]")
+    _create_resource(_ctx(ctx), endpoint="/api/developer/heartbeat-monitors/", data=data, label="heartbeat monitor")
 
 
 @heartbeat_monitors_app.command("delete")
@@ -4427,14 +4172,8 @@ def heartbeat_monitors_delete(ctx: typer.Context, monitor_id: str = typer.Argume
     Examples:
       dataplicity heartbeat-monitors delete <monitor-id>
     """
-    state = _ctx(ctx)
-    _delete_resource(
-        state,
-        endpoint=_incident_automation_endpoint(state, "rules"),
-        resource_id=monitor_id,
-        label="heartbeat monitor",
-        feature_name="Heartbeat monitors",
-    )
+    _delete_resource(_ctx(ctx), endpoint="/api/developer/heartbeat-monitors/", resource_id=monitor_id,
+                     label="heartbeat monitor")
 
 
 @fleet_jobs_app.command("list")
@@ -4449,17 +4188,8 @@ def fleet_jobs_list(
       dataplicity fleet-jobs list
       dataplicity fleet-jobs list --status running
     """
-    state = _ctx(ctx)
-    params: Dict[str, Any] = {"page_size": page_size}
-    if status:
-        params["status"] = status
-    _list_resource(
-        state,
-        endpoint=_incident_automation_endpoint(state, "rules"),
-        title="Fleet jobs",
-        params=params,
-        feature_name="Fleet jobs",
-    )
+    _list_resource(_ctx(ctx), endpoint="/api/developer/fleet-jobs/", title="Fleet jobs",
+                   limit=page_size, status=status, params={"limit": page_size})
 
 
 @fleet_jobs_app.command("ls")
@@ -4479,14 +4209,8 @@ def fleet_jobs_show(ctx: typer.Context, job_id: str = typer.Argument(...)) -> No
     Examples:
       dataplicity fleet-jobs show <job-id>
     """
-    state = _ctx(ctx)
-    _show_resource(
-        state,
-        endpoint=_incident_automation_endpoint(state, "rules"),
-        resource_id=job_id,
-        not_found_label="fleet job",
-        feature_name="Fleet jobs",
-    )
+    _show_resource(_ctx(ctx), endpoint="/api/developer/fleet-jobs/", resource_id=job_id,
+                   not_found_label="fleet job")
 
 
 @fleet_jobs_app.command("get")
@@ -4503,17 +4227,9 @@ def fleet_jobs_run(
     """Create and start a fleet job.
 
     Examples:
-      dataplicity fleet-jobs run --data '{"name":"restart-edge","device_hashes":["abc123"],"command":"restart"}'
+      dataplicity fleet-jobs run --data '{"prompt":"System information","device_hashes":["abc123"],"command":"uname -a"}'
     """
-    state = _ctx(ctx)
-    endpoint = _incident_automation_endpoint(state, "rule-simulations")
-    _create_resource(
-        state,
-        endpoint=endpoint,
-        data=data,
-        label="fleet job simulation",
-        feature_name="Fleet jobs",
-    )
+    _create_resource(_ctx(ctx), endpoint="/api/developer/fleet-jobs/", data=data, label="fleet job")
 
 
 @fleet_jobs_app.command("create")
@@ -4534,30 +4250,8 @@ def fleet_jobs_cancel(ctx: typer.Context, job_id: str = typer.Argument(...)) -> 
     """
     state = _ctx(ctx)
     _require_auth(state)
-    rules_endpoint = _incident_automation_endpoint(state, "rules")
-    job_endpoint = f"{rules_endpoint}{job_id}/"
-    response = state.api.request(
-        "PATCH",
-        job_endpoint,
-        json_data={"enabled": False},
-    )
-    if not response.ok:
-        message = _endpoint_error_message(
-            state,
-            endpoint=job_endpoint,
-            response=response,
-            default_message="Unable to cancel fleet job.",
-            feature_name="Fleet jobs",
-        )
-        if state.json_output:
-            _print_json({"ok": False, "detail": message})
-        else:
-            _show_error(state.console, message)
-        raise typer.Exit(code=1)
-    if state.json_output:
-        _print_json(response.data if response.data is not None else {"ok": True})
-    else:
-        state.console.print("[green]Fleet job cancellation requested.[/green]")
+    response = state.api.post(f"/api/developer/fleet-jobs/{_resource_id(job_id)}/cancel/")
+    _write_api_response(state, response)
 
 
 @fleet_jobs_app.command("delete")
@@ -4995,10 +4689,7 @@ def api_get(
     state = _ctx(ctx)
     _require_auth(state)
     response = state.api.get(path, params=_parse_kv_pairs(params))
-    if state.json_output:
-        _print_json(response.data if response.data is not None else {"ok": response.ok})
-    else:
-        _print_json(response.data if response.data is not None else response.text)
+    _write_api_response(state, response)
 
 
 @api_app.command("post")
@@ -5026,10 +4717,7 @@ def api_post(
                 _show_error(state.console, message)
             raise typer.Exit(code=1)
     response = state.api.post(path, json_data=json_data)
-    if state.json_output:
-        _print_json(response.data if response.data is not None else {"ok": response.ok})
-    else:
-        _print_json(response.data if response.data is not None else response.text)
+    _write_api_response(state, response)
 
 
 @api_app.command("request")
@@ -5065,7 +4753,4 @@ def api_request(
         params=_parse_kv_pairs(params),
         json_data=json_data,
     )
-    if state.json_output:
-        _print_json(response.data if response.data is not None else {"ok": response.ok})
-    else:
-        _print_json(response.data if response.data is not None else response.text)
+    _write_api_response(state, response)
