@@ -76,14 +76,22 @@ def test_entire_release_and_distribution_write_dependency_closure_is_guarded():
     assert 'Verify Windows MSI signature' in blocks['build']
 
 
-def test_original_build_sign_upload_and_release_bytes_except_reviewed_runner_migration():
+def test_original_build_sign_upload_and_release_bytes_except_reviewed_macos_changes():
     source = WORKFLOW.read_text()
     assert source.count(INPUT) == 1 and source.count(GUARD) == 1
     # GitHub retired macOS 14 on 2026-11-02. Permit only this exact build-runner
-    # replacement; retain the original digest over every other workflow byte.
+    # replacement and the installer signing step; pin the other workflow bytes.
     runner = '          - name: macos-universal2\n            os: macos-15-intel\n'
     assert source.count(runner) == 1
     assert 'macos-14' not in source
+    signing_start = source.index('      - name: Sign and verify macOS installer')
+    staging_start = source.index('      - name: Stage macOS release artifacts')
+    assert source.index('      - name: Build macOS pkg') < signing_start < staging_start
+    signing = source[signing_start:staging_start]
+    assert signing.splitlines()[1].strip() == "if: runner.os == 'macOS'"
+    assert 'continue-on-error' not in signing
+    assert 'run: bash build/macos/sign_installer.sh' in signing
+    source = source[:signing_start] + source[staging_start:]
     original = source.replace(INPUT, '', 1).replace(GUARD, '', 1).replace(
         runner, runner.replace('macos-15-intel', 'macos-14'), 1).encode()
     digest = hashlib.sha1(b'blob ' + str(len(original)).encode() + b'\0' + original).hexdigest()
