@@ -71,16 +71,17 @@ def test_entire_release_and_distribution_write_dependency_closure_is_guarded():
     # Signing/upload jobs remain runnable; no skipped publish job is needed by them.
     assert re.search(r'^    if:', blocks['build'], re.MULTILINE) is None
     assert re.search(r'^    needs:', blocks['build'], re.MULTILINE) is None
-    assert 'uses: actions/upload-artifact@v4' in blocks['build']
+    assert 'uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4' in blocks['build']
     assert 'Verify Windows executable signature' in blocks['build']
     assert 'Verify Windows MSI signature' in blocks['build']
 
 
-def test_original_build_sign_upload_and_release_bytes_except_reviewed_macos_changes():
+def test_build_sign_upload_and_release_bytes_match_reviewed_baseline():
     source = WORKFLOW.read_text()
     assert source.count(INPUT) == 1 and source.count(GUARD) == 1
     # GitHub retired macOS 14 on 2026-11-02. Permit only this exact build-runner
-    # replacement and the installer signing step; pin the other workflow bytes.
+    # replacement and the installer signing step. The reviewed baseline also
+    # includes immutable Actions and the frozen FPM toolchain.
     runner = '          - name: macos-universal2\n            os: macos-15-intel\n'
     assert source.count(runner) == 1
     assert 'macos-14' not in source
@@ -95,4 +96,4 @@ def test_original_build_sign_upload_and_release_bytes_except_reviewed_macos_chan
     original = source.replace(INPUT, '', 1).replace(GUARD, '', 1).replace(
         runner, runner.replace('macos-15-intel', 'macos-14'), 1).encode()
     digest = hashlib.sha1(b'blob ' + str(len(original)).encode() + b'\0' + original).hexdigest()
-    assert digest == 'b88e00dcb2bb4beb7597c2896f726efa808b75c6'
+    assert digest == '55b29ebac2c5f2b9ac82500bfb07aeb3199c53c9'

@@ -30,7 +30,7 @@ jobs:
     name: Open tap PR
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
 
@@ -112,7 +112,7 @@ jobs:
           scripts/verify-release-bot-token.sh TAP_TOKEN "${EXPECTED_BOT}"
 
       - name: Checkout tap repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: ${{ steps.tap.outputs.tap_repository }}
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}

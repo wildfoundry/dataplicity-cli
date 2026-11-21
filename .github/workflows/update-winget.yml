@@ -20,9 +20,9 @@ concurrency:
 jobs:
   publish-winget:
     name: Publish release to WinGet
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
 
@@ -39,10 +39,53 @@ jobs:
           fi
           scripts/verify-release-bot-token.sh WINGET_TOKEN "${EXPECTED_BOT}"
 
-      - name: Publish to WinGet
-        uses: vedantmgoyal9/winget-releaser@7bd472be23763def6e16bd06cc8b1cdfab0e2fd5
-        with:
-          identifier: Wildfoundry.DataplicityCLI
-          release-tag: ${{ github.event.release.tag_name || inputs.release_tag }}
-          installers-regex: '\.msi$'
-          token: ${{ secrets.WINGET_TOKEN }}
+      - name: Download and verify Microsoft WinGetCreate
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          Invoke-WebRequest https://github.com/microsoft/winget-create/releases/download/v1.28.1.0/wingetcreate.exe -OutFile wingetcreate.exe -UseBasicParsing
+          $expected = "63d980ba79e97042395bd6eb5992c2db9e01e9e7a8a22958a95c288f27310413"
+          if ((Get-FileHash wingetcreate.exe -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expected) {
+            throw "WinGetCreate SHA-256 mismatch"
+          }
+
+      - name: Prepare manifest from published release
+        id: prepare
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.release_tag }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          if ($env:RELEASE_TAG -notmatch '^v(\d+\.\d+\.\d+(?:\.\d+)?)$') {
+            throw "Release tag must use vX.Y.Z or vX.Y.Z.W."
+          }
+          $version = $Matches[1]
+          $release = gh api "repos/$env:GITHUB_REPOSITORY/releases/tags/$env:RELEASE_TAG" | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { throw "Could not read published release" }
+          $assetName = "dataplicity-cli-$version-windows-x64.msi"
+          $asset = $release.assets | Where-Object { $_.name -eq $assetName } | Select-Object -First 1
+          if (-not $asset) { throw "Published release is missing $assetName" }
+          $downloadPath = Join-Path $env:RUNNER_TEMP $assetName
+          Invoke-WebRequest $asset.browser_download_url -OutFile $downloadPath -UseBasicParsing
+          $sha256 = (Get-FileHash $downloadPath -Algorithm SHA256).Hash
+          $outputRoot = Join-Path $env:RUNNER_TEMP "winget-manifests"
+          $manifestOutput = python build/winget/prepare_manifest.py `
+            --source-dir "build/winget/manifests/w/Wildfoundry/DataplicityCLI/0.1.6" `
+            --output-root $outputRoot `
+            --version $version `
+            --installer-url $asset.browser_download_url `
+            --installer-sha256 $sha256 `
+            --release-date (([DateTime]$release.published_at).ToString("yyyy-MM-dd"))
+          if ($LASTEXITCODE -ne 0) { throw "Manifest generation failed" }
+          "manifest_path=$(($manifestOutput | Select-Object -Last 1).Trim())" >> $env:GITHUB_OUTPUT
+
+      - name: Submit WinGet package update
+        shell: pwsh
+        env:
+          WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
+          MANIFEST_PATH: ${{ steps.prepare.outputs.manifest_path }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          ./wingetcreate.exe submit --token $env:WINGET_TOKEN --no-open $env:MANIFEST_PATH
+          if ($LASTEXITCODE -ne 0) { throw "WinGet submission failed" }
