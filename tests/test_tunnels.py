@@ -44,6 +44,11 @@ class ControlTests(unittest.TestCase):
                 control.request("POST", "publish/")
             self.assertNotIn("secret", str(error.exception))
             self.assertEqual(error.exception.code, "fenced")
+        for status, code in [(403, "monthly_budget_exhausted"), (429, "quota_exhausted")]:
+            api.request.return_value = ApiResponse(False, status, {"error": code}, "")
+            with self.assertRaisesRegex(TunnelError, "review plans under Networking → Tunnels") as limit:
+                control.request("POST", "publish/")
+            self.assertEqual(limit.exception.code, code)
         api.request.return_value = ApiResponse(False, 403, None, "secret")
         with self.assertRaises(TunnelError):
             control.request("GET", "")

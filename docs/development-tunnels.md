@@ -1,7 +1,7 @@
 # Private development tunnels
 
 Development tunnels connect a local TCP service privately between Dataplicity
-CLI instances in a paying organisation. Install the ordinary Dataplicity CLI
+CLI instances in the same organisation. Free includes one active named tunnel, one simultaneous connection and 1 GB of monthly relay traffic. Install the ordinary Dataplicity CLI
 on Windows, macOS or Linux and sign in with `dataplicity auth login`.
 
 On the computer running the service:

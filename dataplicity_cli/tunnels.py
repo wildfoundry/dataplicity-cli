@@ -110,7 +110,9 @@ class TunnelAPI:
                 "session_fenced": "Tunnel was replaced. Start a fresh authorised command to use the current publisher.",
                 "session_expired": "Tunnel authority expired. Start a fresh authorised command.",
                 "publisher_revoked": "Publisher authority was revoked. Ask your administrator to review the credential and name policy.",
-                "paid_plan_required": "Development tunnels require an eligible paid organisation plan.",
+                "paid_plan_required": "Tunnels are unavailable for this organisation. Check its plan with your organisation owner.",
+                "monthly_budget_exhausted": "Monthly relay allowance reached. Wait for the next month or review plans under Networking → Tunnels, then retry this command.",
+                "quota_exhausted": "Tunnel capacity reached. Stop an unused publisher or connection, or review plans under Networking → Tunnels, then retry this command.",
             }
             # Error bodies and transport exceptions are never dumped: they may
             # contain infrastructure details or a reflected credential.
